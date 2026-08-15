@@ -87,12 +87,8 @@ export function resolveSpec(config: Config): ResolvedSpec {
 /** Permission bits outside the owner; a credentials document must have none of them. */
 const GROUP_OTHER_BITS = 0o077
 
-/**
- * Host-only references last changed privately by providers in this process,
- * grouped by their shared document. Reconciliation may observe another
- * provider's write, but it must never announce one of these references.
- */
-const privateReferencesByDocument = new Map<string, Set<CredentialRef>>()
+/** Suffix for the owner-only metadata file that records privately changed references. */
+const PRIVATE_REFERENCES_SUFFIX = '.private-references.json'
 
 /**
  * Reject a credentials document other OS users can read, before its contents
@@ -131,6 +127,43 @@ async function assertOwnerOnly(filename: string): Promise<void> {
 /** Whether a filesystem error means absence; every non-ENOENT failure must surface. */
 function isENOENT(error: unknown): boolean {
   return (error as NodeJS.ErrnoException | null)?.code === 'ENOENT'
+}
+
+/**
+ * Read the private-reference metadata. It contains identifiers only, never
+ * values, and must be owner-only for the same reason as the credentials file.
+ * @param filename - absolute metadata file path.
+ * @returns references whose reconciliation updates must stay private.
+ */
+async function readPrivateReferences(filename: string): Promise<Set<CredentialRef>> {
+  await assertOwnerOnly(filename)
+  let text: string
+  try {
+    text = await readFile(filename, 'utf8')
+  } catch (error) {
+    if (isENOENT(error)) return new Set<CredentialRef>()
+    throw error
+  }
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(text)
+  } catch {
+    throw new Error(`credentials-local: invalid private reference metadata at ${filename}`)
+  }
+  if (!Array.isArray(parsed) || parsed.some(ref => typeof ref !== 'string')) {
+    throw new TypeError(`credentials-local: private reference metadata at ${filename} must be a string array`)
+  }
+  return new Set(parsed.map(ref => credentialRef(ref)))
+}
+
+/**
+ * Atomically persist private-reference metadata with owner-only permissions.
+ * @param filename - absolute metadata file path.
+ * @param refs - current private references for the matching credentials file.
+ */
+async function writePrivateReferences(filename: string, refs: Set<CredentialRef>): Promise<void> {
+  await assertOwnerOnly(filename)
+  await writeFileAtomic(filename, `${JSON.stringify([...refs])}\n`, { mode: 0o600, dirMode: 0o700 })
 }
 
 /**
@@ -223,6 +256,8 @@ export class LocalCredentialProvider extends CredentialProvider {
   })
 
   private readonly spec: ResolvedSpec
+  /** Owner-only metadata for private reference visibility, paired with {@link spec.filename}. */
+  private readonly privateReferencesFilename: string
   /**
    * Raw text of the last read or persisted document; `undefined` while the
    * file is absent. Watcher events whose content equals this cache are no-ops,
@@ -251,6 +286,7 @@ export class LocalCredentialProvider extends CredentialProvider {
     // Programmatic construction may bypass Schemastery normalization; resolve
     // the same defaults in one explicit step either way.
     this.spec = resolveSpec(config)
+    this.privateReferencesFilename = `${this.spec.filename}${PRIVATE_REFERENCES_SUFFIX}`
   }
 
   /** The inherited-environment value for a reference, or `undefined` when empty or unset. */
@@ -428,33 +464,30 @@ export class LocalCredentialProvider extends CredentialProvider {
     value: string | undefined,
     visibility: CredentialMutationVisibility,
   ): Promise<boolean> {
-    if (this.values.get(ref) === value) return false
+    const previousPrivateRefs = await readPrivateReferences(this.privateReferencesFilename)
+    const nextPrivateRefs = new Set(previousPrivateRefs)
+    if (visibility === 'private') nextPrivateRefs.add(ref)
+    else nextPrivateRefs.delete(ref)
+    const privateRefsChanged = nextPrivateRefs.size !== previousPrivateRefs.size
+    if (this.values.get(ref) === value) {
+      if (privateRefsChanged) await writePrivateReferences(this.privateReferencesFilename, nextPrivateRefs)
+      return false
+    }
     const nextText = renderDocument(this.text, ref, value)
-    // 0600: a document holding secrets is never world-readable.
-    await writeFileAtomic(this.spec.filename, nextText, { mode: 0o600, dirMode: 0o700 })
+    // Mark the visibility before changing the document: a peer that sees the
+    // new text can then classify it even when it runs in another process.
+    if (privateRefsChanged) await writePrivateReferences(this.privateReferencesFilename, nextPrivateRefs)
+    try {
+      // 0600: a document holding secrets is never world-readable.
+      await writeFileAtomic(this.spec.filename, nextText, { mode: 0o600, dirMode: 0o700 })
+    } catch (error) {
+      if (privateRefsChanged) await writePrivateReferences(this.privateReferencesFilename, previousPrivateRefs)
+      throw error
+    }
     this.text = nextText
     if (value === undefined) this.values.delete(ref)
     else this.values.set(ref, value)
-    this.recordMutationVisibility(ref, visibility)
     return true
-  }
-
-  /** Record whether peers may publish future reconciliations for this reference. */
-  private recordMutationVisibility(ref: CredentialRef, visibility: CredentialMutationVisibility): void {
-    const refs = privateReferencesByDocument.get(this.spec.filename)
-    if (visibility === 'public') {
-      refs?.delete(ref)
-      if (refs?.size === 0) privateReferencesByDocument.delete(this.spec.filename)
-      return
-    }
-    const privateRefs = refs ?? new Set<CredentialRef>()
-    privateRefs.add(ref)
-    privateReferencesByDocument.set(this.spec.filename, privateRefs)
-  }
-
-  /** Whether a reconciled reference may reach the credentials update stream. */
-  private mayPublishReconciled(ref: CredentialRef): boolean {
-    return !privateReferencesByDocument.get(this.spec.filename)?.has(ref)
   }
 
   /**
@@ -530,11 +563,12 @@ export class LocalCredentialProvider extends CredentialProvider {
     }
     if (text === this.text || this.isClosed()) return
     const next = text === undefined ? new Map<string, string>() : parseCredentialsDocument(text, this.spec.filename)
+    const privateRefs = await readPrivateReferences(this.privateReferencesFilename)
     const changed = this.changedRefs(this.values, next)
     this.text = text
     this.values = next
     for (const ref of changed) {
-      if (this.mayPublishReconciled(ref)) this.notifyUpdated(ref)
+      if (!privateRefs.has(ref)) this.notifyUpdated(ref)
     }
   }
   /* jscpd:ignore-end */
