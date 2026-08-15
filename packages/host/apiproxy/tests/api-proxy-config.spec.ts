@@ -18,7 +18,12 @@ import type { GenerateOptions, LlmModelInfo, LlmProviderInfo, StreamChunk } from
 import { SettingsProvider, settingsNamespace } from '@deepseek-ai/dsh-settings'
 import type { SettingsNamespace } from '@deepseek-ai/dsh-settings'
 import { CredentialProvider } from '@deepseek-ai/dsh-credentials'
-import type { CredentialInfo, CredentialRef, ResolvedCredential } from '@deepseek-ai/dsh-credentials'
+import type {
+  CredentialInfo,
+  CredentialMutation,
+  CredentialRef,
+  ResolvedCredential,
+} from '@deepseek-ai/dsh-credentials'
 import type { HostFrame } from '../src/api/index.ts'
 import type { RpcRequest, RpcResponse } from '../src/api/rpc.ts'
 import { RpcId } from '../src/api/rpc.ts'
@@ -90,6 +95,7 @@ class MemorySettings extends SettingsProvider {
 /** In-memory credential provider with an env-shadow double for the rejection path. */
 class MemoryCredentials extends CredentialProvider {
   private readonly values = new Map<string, string>()
+  private operations: Promise<void> = Promise.resolve()
 
   constructor(ctx: ConstructorParameters<typeof CredentialProvider>[0], options?: { shadowed?: string[] }) {
     super(ctx)
@@ -111,21 +117,33 @@ class MemoryCredentials extends CredentialProvider {
   }
 
   set(ref: CredentialRef, value: string): Promise<void> {
-    if (this.shadowed.has(ref)) {
-      return Promise.reject(new Error(`credentials: ${ref} is shadowed by the read-only environment`))
-    }
-    this.values.set(ref, value)
-    this.ctx.emit('credentials/updated', ref)
-    return Promise.resolve()
+    return this.modify(ref, async () => ({ value, result: undefined, visibility: 'public' }))
   }
 
   unset(ref: CredentialRef): Promise<void> {
-    if (this.shadowed.has(ref)) {
-      return Promise.reject(new Error(`credentials: ${ref} is shadowed by the read-only environment`))
-    }
-    this.values.delete(ref)
-    this.ctx.emit('credentials/updated', ref)
-    return Promise.resolve()
+    return this.modify(ref, async () => ({ value: undefined, result: undefined, visibility: 'public' }))
+  }
+
+  modify<T>(
+    ref: CredentialRef,
+    mutate: (current: string | undefined) => Promise<CredentialMutation<T>>,
+  ): Promise<T> {
+    const task = this.operations.then(async () => {
+      if (this.shadowed.has(ref)) {
+        throw new Error(`credentials: ${ref} is shadowed by the read-only environment`)
+      }
+      const before = this.values.get(ref)
+      const mutation = await mutate(before)
+      if (mutation.value === '') throw new Error('credentials: an empty value cannot be stored')
+      if (mutation.value !== before) {
+        if (mutation.value === undefined) this.values.delete(ref)
+        else this.values.set(ref, mutation.value)
+        if (mutation.visibility === 'public') this.ctx.emit('credentials/updated', ref)
+      }
+      return mutation.result
+    })
+    this.operations = task.then(() => undefined, () => undefined)
+    return task
   }
 }
 

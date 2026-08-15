@@ -48,8 +48,10 @@ interface Deferred<T> {
 interface LoginAttempt {
   ownerId: string
   abort: AbortController
-  startup: Deferred<LlmOAuthDeviceCode | undefined>
+  startup: Deferred<LlmOAuthStart>
   deviceCode?: LlmOAuthDeviceCode
+  ownsLease: boolean
+  phase: 'setup' | 'polling' | 'settled'
   done: Promise<void>
 }
 
@@ -167,6 +169,11 @@ export class OpenAICodexOAuthController implements LlmOAuthController {
   /** Return the current detached redacted connection. */
   private connection(): LlmOAuthConnection {
     return { provider: PROVIDER, status: this.connectionStatus }
+  }
+
+  /** Return the setup/polling state without mutating the last published state. */
+  private connectingConnection(): LlmOAuthConnection {
+    return { provider: PROVIDER, status: 'connecting' }
   }
 
   /** Commit and broadcast one status transition. */
@@ -305,7 +312,11 @@ export class OpenAICodexOAuthController implements LlmOAuthController {
       ...event.expiresInSeconds === undefined ? {} : { expiresInSeconds: event.expiresInSeconds },
     }
     attempt.deviceCode = deviceCode
-    attempt.startup.resolve(deviceCode)
+    attempt.startup.resolve({
+      kind: 'device-code',
+      connection: this.connectingConnection(),
+      deviceCode,
+    })
   }
 
   /** Derive the terminal redacted state after login cancellation or failure. */
@@ -321,10 +332,55 @@ export class OpenAICodexOAuthController implements LlmOAuthController {
     }
   }
 
-  /** Run pi-ai login, renewal, state publication, and matching release to settlement. */
-  private async runAttempt(attempt: LoginAttempt): Promise<void> {
-    const renewal = this.renewUntilSettled(attempt)
+  /** Refuse setup or polling after local cancellation/disposal wins. */
+  private assertActive(attempt: LoginAttempt): void {
+    if (this.disposed || attempt.abort.signal.aborted) throw oauthFailure()
+  }
+
+  /** Read current cross-process state without the local-attempt shortcut. */
+  private async inspectStatus(): Promise<LlmOAuthConnection> {
     try {
+      const lease = await this.readLease()
+      if (lease !== undefined && lease.expiresAt > this.now()) return this.publish('connecting')
+      if (this.reconnectRequired) return this.publish('reconnect-required')
+      const credential = await this.options.credentialStore.read(PROVIDER)
+      return this.publish(credential === undefined ? 'missing' : 'connected')
+    } catch {
+      return this.publish('reconnect-required')
+    }
+  }
+
+  /** Run setup, pi-ai login, renewal, and matching release to settlement. */
+  private async runAttempt(attempt: LoginAttempt): Promise<void> {
+    let renewal: Promise<void> | undefined
+    try {
+      const current = await this.inspectStatus()
+      this.assertActive(attempt)
+      if (current.status === 'connected') {
+        attempt.phase = 'settled'
+        attempt.startup.resolve({ kind: 'connected', connection: current })
+        return
+      }
+      if (current.status === 'connecting') {
+        attempt.phase = 'settled'
+        attempt.startup.resolve({ kind: 'already-connecting', connection: current })
+        return
+      }
+
+      attempt.ownsLease = await this.claimLease(attempt.ownerId)
+      this.assertActive(attempt)
+      if (!attempt.ownsLease) {
+        attempt.phase = 'settled'
+        attempt.startup.resolve({
+          kind: 'already-connecting',
+          connection: this.publish('connecting'),
+        })
+        return
+      }
+
+      this.publish('connecting')
+      attempt.phase = 'polling'
+      renewal = this.renewUntilSettled(attempt)
       const interaction: AuthInteraction = {
         signal: attempt.abort.signal,
         prompt: prompt => this.prompt(attempt, prompt),
@@ -334,19 +390,23 @@ export class OpenAICodexOAuthController implements LlmOAuthController {
       if (attempt.abort.signal.aborted) throw oauthFailure()
       if (await this.options.credentialStore.read(PROVIDER) === undefined) throw oauthFailure()
       this.reconnectRequired = false
-      this.publish('connected')
-      attempt.startup.resolve(undefined)
+      attempt.phase = 'settled'
+      const connection = this.publish('connected')
+      attempt.startup.resolve({ kind: 'connected', connection })
     } catch {
+      attempt.phase = 'settled'
       this.publish(await this.failedAttemptStatus(attempt.ownerId))
       attempt.startup.reject(oauthFailure())
     } finally {
       delete attempt.deviceCode
       attempt.abort.abort('OpenAI Codex login settled')
-      await renewal
-      try {
-        await this.releaseLease(attempt.ownerId)
-      } catch {
-        attempt.startup.reject(oauthFailure())
+      if (renewal !== undefined) await renewal
+      if (attempt.ownsLease) {
+        try {
+          await this.releaseLease(attempt.ownerId)
+        } catch {
+          attempt.startup.reject(oauthFailure())
+        }
       }
       if (this.attempt === attempt) this.attempt = undefined
     }
@@ -362,43 +422,36 @@ export class OpenAICodexOAuthController implements LlmOAuthController {
 
   /** Read current cross-process lease and credential state. */
   async status(): Promise<LlmOAuthConnection> {
-    if (this.attempt !== undefined && this.connectionStatus === 'connecting') return this.connection()
-    try {
-      const lease = await this.readLease()
-      if (lease !== undefined && lease.expiresAt > this.now()) return this.publish('connecting')
-      if (this.reconnectRequired) return this.publish('reconnect-required')
-      const credential = await this.options.credentialStore.read(PROVIDER)
-      return this.publish(credential === undefined ? 'missing' : 'connected')
-    } catch {
-      return this.publish('reconnect-required')
+    if (this.attempt !== undefined) {
+      return this.attempt.phase === 'settled' ? this.connection() : this.connectingConnection()
     }
+    return this.inspectStatus()
   }
 
-  /** Claim the lease and begin pi-ai's device-code flow without awaiting completion. */
-  async start(): Promise<LlmOAuthStart> {
-    if (this.disposed) throw oauthFailure()
-    const current = await this.status()
-    if (current.status === 'connected') return { kind: 'connected', connection: current }
-    if (current.status === 'connecting') return { kind: 'already-connecting', connection: current }
-
-    const ownerId = this.createOwnerId()
-    if (!await this.claimLease(ownerId)) {
-      return { kind: 'already-connecting', connection: this.publish('connecting') }
+  /** Own setup cancellation before beginning any awaited cross-process operation. */
+  start(): Promise<LlmOAuthStart> {
+    if (this.disposed) return Promise.reject(oauthFailure())
+    if (this.attempt !== undefined) {
+      if (this.attempt.phase === 'settled' && this.connectionStatus === 'connected') {
+        return Promise.resolve({ kind: 'connected', connection: this.connection() })
+      }
+      return Promise.resolve({
+        kind: 'already-connecting',
+        connection: this.connectingConnection(),
+      })
     }
+
     const attempt: LoginAttempt = {
-      ownerId,
+      ownerId: this.createOwnerId(),
       abort: new AbortController(),
-      startup: deferred<LlmOAuthDeviceCode | undefined>(),
+      startup: deferred<LlmOAuthStart>(),
+      ownsLease: false,
+      phase: 'setup',
       done: Promise.resolve(),
     }
     this.attempt = attempt
-    this.publish('connecting')
     attempt.done = this.runAttempt(attempt)
-    const deviceCode = await attempt.startup.promise
-    if (deviceCode !== undefined) {
-      return { kind: 'device-code', connection: this.connection(), deviceCode }
-    }
-    return { kind: 'connected', connection: this.connection() }
+    return attempt.startup.promise
   }
 
   /** Cancel and settle a locally owned login attempt. */

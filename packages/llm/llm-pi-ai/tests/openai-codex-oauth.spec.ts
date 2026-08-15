@@ -39,6 +39,19 @@ function deferred<T>(): Deferred<T> {
 class SharedCredentials extends CredentialProvider {
   private readonly values = new Map<CredentialRef, string>()
   private operations: Promise<void> = Promise.resolve()
+  private operationCount = 0
+  private pause: {
+    operation: number
+    reached: Deferred<undefined>
+    release: Deferred<undefined>
+  } | undefined
+
+  pauseOperation(operation: number): { reached: Promise<undefined>; release: () => void } {
+    const reached = deferred<undefined>()
+    const release = deferred<undefined>()
+    this.pause = { operation, reached, release }
+    return { reached: reached.promise, release: () => { release.resolve(undefined) } }
+  }
 
   override resolve(ref: CredentialRef): Promise<ResolvedCredential | undefined> {
     const value = this.values.get(ref)
@@ -62,6 +75,13 @@ class SharedCredentials extends CredentialProvider {
     mutate: (current: string | undefined) => Promise<CredentialMutation<T>>,
   ): Promise<T> {
     const task = this.operations.then(async () => {
+      this.operationCount += 1
+      if (this.pause?.operation === this.operationCount) {
+        const pause = this.pause
+        pause.reached.resolve(undefined)
+        await pause.release.promise
+        if (this.pause === pause) this.pause = undefined
+      }
       const mutation = await mutate(this.values.get(ref))
       if (mutation.value === undefined) this.values.delete(ref)
       else this.values.set(ref, mutation.value)
@@ -334,6 +354,85 @@ describe('OpenAICodexOAuthController', () => {
     cleanup.resolve(undefined)
     await disposal
     expect(disposed).toBe(true)
+  })
+
+  it('disposal waits for setup status and prevents a later poller or event', async () => {
+    const credentials = new SharedCredentials(new Context())
+    const setup = credentials.pauseOperation(1)
+    const models = new DeviceCodeModels(new OpenAICodexCredentialStore(() => credentials))
+    const events: LlmOAuthConnection[] = []
+    const controller = controllerOf(credentials, models, events, { value: 0 })
+    const starting = controller.start()
+    await setup.reached
+
+    let disposed = false
+    const disposal = controller.dispose().then(() => { disposed = true })
+    try {
+      await Promise.resolve()
+      expect(disposed).toBe(false)
+      setup.release()
+      await disposal
+      await expect(starting).rejects.toMatchObject({ code: 'OPENAI_CODEX_OAUTH' })
+      expect(models.loginCount).toBe(0)
+      expect(events).toEqual([])
+    } finally {
+      setup.release()
+      await starting.catch(() => undefined)
+      await controller.cancel()
+    }
+  })
+
+  it('disposal settles a claimed setup lease without starting its poller', async () => {
+    const credentials = new SharedCredentials(new Context())
+    const setup = credentials.pauseOperation(3)
+    const models = new DeviceCodeModels(new OpenAICodexCredentialStore(() => credentials))
+    const events: LlmOAuthConnection[] = []
+    const controller = controllerOf(credentials, models, events, { value: 0 })
+    const starting = controller.start()
+    await setup.reached
+
+    const disposal = controller.dispose()
+    try {
+      setup.release()
+      await disposal
+      await expect(starting).rejects.toMatchObject({ code: 'OPENAI_CODEX_OAUTH' })
+      expect(models.loginCount).toBe(0)
+      expect(events).toEqual([])
+
+      const replacementModels = new DeviceCodeModels(new OpenAICodexCredentialStore(() => credentials))
+      const replacement = controllerOf(credentials, replacementModels, [], { value: 0 })
+      await expect(replacement.start()).resolves.toMatchObject({ kind: 'device-code' })
+      expect(replacementModels.loginCount).toBe(1)
+    } finally {
+      setup.release()
+      await starting.catch(() => undefined)
+      await controller.cancel()
+    }
+  })
+
+  it('returns already-connecting for a second start while setup is pending', async () => {
+    const credentials = new SharedCredentials(new Context())
+    const setup = credentials.pauseOperation(1)
+    const models = new DeviceCodeModels(new OpenAICodexCredentialStore(() => credentials))
+    const controller = controllerOf(credentials, models, [], { value: 0 })
+    const first = controller.start()
+    await setup.reached
+
+    const second = controller.start()
+    try {
+      await expect(Promise.race([
+        second,
+        Promise.resolve({ kind: 'still-pending' as const }),
+      ])).resolves.toMatchObject({ kind: 'already-connecting' })
+      setup.release()
+      await expect(first).resolves.toMatchObject({ kind: 'device-code' })
+      expect(models.loginCount).toBe(1)
+    } finally {
+      setup.release()
+      await first.catch(() => undefined)
+      await second.catch(() => undefined)
+      await controller.cancel()
+    }
   })
 
   it('rejects every prompt other than pi-ai device-code selection', async () => {

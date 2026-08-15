@@ -56,6 +56,8 @@
  */
 
 import type { Context } from '@deepseek-ai/cordis'
+import { createModels } from '@earendil-works/pi-ai'
+import type { Models, MutableModels } from '@earendil-works/pi-ai'
 import { launchEnvironmentOf } from '@deepseek-ai/dsh-launch-environment'
 import { assertUsableApiKey, LlmError } from '@deepseek-ai/dsh-llm'
 import type {
@@ -217,17 +219,28 @@ export function apply(ctx: Context, config: Config): void {
   }
 
   const credentialStore = new OpenAICodexCredentialStore(() => ctx.get('credentials'))
+  // OAuth lifecycle operations use a composition-private current-profile
+  // collection. The public adapter never returns raw pi-ai Models, while this
+  // cache still replaces its immutable collection on dynamic profile reload.
+  let controllerModelsSnapshot: {
+    profiles: ReadonlyMap<string, ResolvedPiAiProviderProfile>
+    models: Models
+  } | undefined
+  const controllerModels = (): Models => {
+    const resolved = profiles()
+    if (controllerModelsSnapshot?.profiles === resolved) return controllerModelsSnapshot.models
+    const models: MutableModels = createModels({ credentials: credentialStore })
+    for (const profile of resolved.values()) models.setProvider(profile.piProvider)
+    controllerModelsSnapshot = { profiles: resolved, models }
+    return models
+  }
   let oauthStatus: LlmOAuthConnectionStatus = 'missing'
   let oauthLifecycleActive = true
   let ensureRegistrationFacts: () => void = () => {}
-  const adapterRef: { current?: PiAiAdapter } = {}
   const oauthController = new OpenAICodexOAuthController({
     credentials: () => ctx.get('credentials'),
     credentialStore,
-    models: () => {
-      if (adapterRef.current === undefined) throw new Error('llm-pi-ai adapter is not ready')
-      return adapterRef.current.modelsSnapshot()
-    },
+    models: controllerModels,
     loginLeaseTtlMs: () => resolveOAuthConfig(current().oauth).loginLeaseTtlMs,
     emitConnectionUpdated: (connection) => {
       oauthStatus = connection.status
@@ -246,7 +259,6 @@ export function apply(ctx: Context, config: Config): void {
     oauthController,
     resolveAttachments: () => ctx.get('attachments'),
   })
-  adapterRef.current = adapter
   // The full installed catalog is configurable from the moment the plugin
   // mounts — dormant or not — so configuration surfaces can offer every
   // pi-ai provider before any route exists. Hand-declared routes join it as

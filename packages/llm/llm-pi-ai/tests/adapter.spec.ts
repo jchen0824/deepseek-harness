@@ -62,6 +62,7 @@ function adapterOf(
 class MemoryOAuthStore implements CredentialStore {
   credential: Credential | undefined
   reads = 0
+  failReadAt: number | undefined
   private operation: Promise<void> = Promise.resolve()
 
   constructor(credential: Credential | undefined) {
@@ -70,6 +71,9 @@ class MemoryOAuthStore implements CredentialStore {
 
   read(providerId: string): Promise<Credential | undefined> {
     this.reads += 1
+    if (this.reads === this.failReadAt) {
+      return Promise.reject(new Error('provider credential-store detail after preflight'))
+    }
     return Promise.resolve(providerId === 'openai-codex' ? this.credential : undefined)
   }
 
@@ -124,23 +128,59 @@ beforeEach(() => {
 })
 
 describe('PiAiAdapter provider routing', () => {
+  it('does not expose raw pi-ai Models through the adapter API', () => {
+    const adapter = new PiAiAdapter({
+      profiles: () => resolveProfiles({}),
+      resolveApiKey: () => Promise.resolve(undefined),
+    })
+
+    expect((adapter as unknown as { modelsSnapshot?: unknown }).modelsSnapshot).toBeUndefined()
+  })
+
   it('replaces immutable model snapshots while retaining one credential store', async () => {
     const store = new MemoryOAuthStore(oauthCredential(Date.now() + 60_000))
-    let profiles = resolveProfiles({ 'openai-codex': {} })
+    const firstResolved = resolveProfiles({ 'openai-codex': {} }).get('openai-codex')
+    const secondResolved = resolveProfiles({
+      'openai-codex': { displayName: 'Codex subscription' },
+    }).get('openai-codex')
+    if (firstResolved === undefined || secondResolved === undefined) throw new Error('expected Codex profiles')
+    let firstStreams = 0
+    let secondStreams = 0
+    const firstProfile = {
+      ...firstResolved,
+      piProvider: {
+        ...firstResolved.piProvider,
+        streamSimple: () => {
+          firstStreams += 1
+          throw new Error('first provider stream stop')
+        },
+      },
+    }
+    const secondProfile = {
+      ...secondResolved,
+      piProvider: {
+        ...secondResolved.piProvider,
+        streamSimple: () => {
+          secondStreams += 1
+          throw new Error('second provider stream stop')
+        },
+      },
+    }
+    let profiles = new Map([['openai-codex', firstProfile]])
     const adapter = new PiAiAdapter({
       profiles: () => profiles,
       resolveApiKey: () => Promise.resolve(undefined),
       credentialStore: store,
     })
 
-    const first = adapter.modelsSnapshot()
-    await first.checkAuth('openai-codex')
-    profiles = resolveProfiles({ 'openai-codex': { displayName: 'Codex subscription' } })
-    const second = adapter.modelsSnapshot()
-    await second.checkAuth('openai-codex')
+    await drainCodex(adapter, firstResolved.piProvider.getModels()[0]!.id)
+    const readsAfterFirst = store.reads
+    profiles = new Map([['openai-codex', secondProfile]])
+    await drainCodex(adapter, secondResolved.piProvider.getModels()[0]!.id)
 
-    expect(second).not.toBe(first)
-    expect(store.reads).toBe(2)
+    expect(firstStreams).toBe(1)
+    expect(secondStreams).toBe(1)
+    expect(store.reads).toBeGreaterThan(readsAfterFirst)
   })
 
   it('never asks for or passes an API-key override on the native Codex OAuth profile', async () => {
@@ -152,6 +192,7 @@ describe('PiAiAdapter provider routing', () => {
     }
     const profile = { ...resolved, piProvider: provider }
     let keyResolutions = 0
+    let reconnects = 0
     const adapter = new PiAiAdapter({
       profiles: () => new Map([['openai-codex', profile]]),
       resolveApiKey: () => {
@@ -159,15 +200,26 @@ describe('PiAiAdapter provider routing', () => {
         return Promise.resolve('legacy-override')
       },
       credentialStore: new MemoryOAuthStore(oauthCredential(Date.now() + 60_000)),
+      oauthController: { markReconnectRequired: () => { reconnects += 1 } },
     })
 
-    for await (const _chunk of adapter.stream({
+    const chunkTypes: string[] = []
+    let finishCode: string | undefined
+    for await (const chunk of adapter.stream({
       provider: 'openai-codex',
       model: resolved.piProvider.getModels()[0]!.id,
       messages: [],
-    })) { /* drain the fake terminal provider error */ }
+    })) {
+      chunkTypes.push(chunk.type)
+      if (chunk.type === 'finish' && chunk.reason.kind === 'error') {
+        finishCode = chunk.reason.failure.code
+      }
+    }
 
     expect(keyResolutions).toBe(0)
+    expect(reconnects).toBe(0)
+    expect(chunkTypes).toEqual(['usage', 'finish'])
+    expect(finishCode).toBe('PI_AI_ERROR')
   })
 
   it('normalizes a failed OAuth refresh before provider text reaches the stream', async () => {
@@ -223,6 +275,35 @@ describe('PiAiAdapter provider routing', () => {
       message: 'OpenAI Codex connection needs to be reconnected',
     })
     expect(reconnects).toBe(1)
+  })
+
+  it('normalizes an OAuth auth failure raised only by pi-ai lazy stream setup', async () => {
+    const resolved = resolveProfiles({ 'openai-codex': {} }).get('openai-codex')
+    if (resolved === undefined) throw new Error('expected Codex profile')
+    const store = new MemoryOAuthStore(oauthCredential(Date.now() + 60_000))
+    store.failReadAt = 2
+    let reconnects = 0
+    const adapter = new PiAiAdapter({
+      profiles: () => new Map([['openai-codex', resolved]]),
+      resolveApiKey: () => Promise.resolve(undefined),
+      credentialStore: store,
+      oauthController: { markReconnectRequired: () => { reconnects += 1 } },
+    })
+    const chunkTypes: string[] = []
+    const consume = async (): Promise<void> => {
+      for await (const chunk of adapter.stream({
+        provider: 'openai-codex',
+        model: resolved.piProvider.getModels()[0]!.id,
+        messages: [],
+      })) chunkTypes.push(chunk.type)
+    }
+
+    await expect(consume()).rejects.toMatchObject({
+      code: OAUTH_RECONNECT_REQUIRED_CODE,
+      message: 'OpenAI Codex connection needs to be reconnected',
+    })
+    expect(reconnects).toBe(1)
+    expect(chunkTypes).toEqual([])
   })
 
   it('resolves a catalog model dynamically and uses a private endpoint', async () => {
