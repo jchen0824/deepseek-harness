@@ -4,7 +4,7 @@ English | [中文](README.zh.md)
 
 Generic multi-provider adapter for the harness LLM seam backed by [`@earendil-works/pi-ai`](https://www.npmjs.com/package/@earendil-works/pi-ai). One plugin instance owns a dict of provider profiles keyed by route; every request selects a profile with `GenerateOptions.provider` and resolves `GenerateOptions.model` against that route's configured catalog. A route naming an installed pi-ai provider inherits its endpoint, wire protocol, and model catalog as defaults and overrides them field by field; a route pi-ai does not ship is declared outright, so an OpenAI-compatible gateway, a self-hosted server, or a provider newer than the installed catalog is configuration rather than a code change.
 
-The package root exposes the Cordis plugin contract, `PiAiAdapter`, and `supportedProtocols()`; profile resolution, catalog materialization, provider construction, replay conversion, and stream conversion remain package-internal.
+The package root exposes the Cordis plugin contract, `PiAiAdapter`, `supportedProtocols()`, and the Host integration classes for the OpenAI Codex OAuth controller and credential store; profile resolution, catalog materialization, provider construction, replay conversion, and stream conversion remain package-internal.
 
 ## Config
 
@@ -117,6 +117,34 @@ Supported profile fields are `apiKeyEnv`, `displayName`, `api`, `baseURL`, `mode
 
 The adapter forces pi-ai's SDK `maxRetries` to zero so one `stream()` call makes one provider request. The removed profile fields `maxRetries` and `maxRetryDelayMs` fail load instead of silently multiplying or hiding the separately composed agent-level retry budget. Idle expiry aborts the SDK's stable request signal and surfaces `TIMEOUT`; an earlier caller abort remains `ABORTED`.
 
+## OpenAI Codex subscription OAuth
+
+`openai-codex` is always present in the configurable-provider directory with OAuth authentication metadata, but its model route stays dormant until its profile is connected. The Web Models page creates the empty profile and starts the connection; after the controller reports `connected`, the adapter registers the ordinary pi-ai catalog route, so the normal model picker, defaults, per-session selection, reasoning metadata, and request path remain authoritative. OpenAI controls which catalog models the connected subscription may use; catalog membership is not an entitlement check.
+
+The controller accepts only pi-ai's OpenAI Codex device-code selector. The initiating Host call receives the verification URL and one-time code; browser-callback, manual-code, secret, pasted-token, and other prompts fail with the package's redacted OAuth error. Device-code data lives only for that initiating interaction and is cleared on settlement or cancellation. Connection broadcasts contain only `provider` and `status`.
+
+One host-lifetime `OpenAICodexCredentialStore` is shared by the controller and every immutable pi-ai model collection. It stores the versioned OAuth record through `CredentialProvider.modify()` as a private atomic mutation, so refreshes from different model snapshots and Harness processes serialize on the local credential provider's cross-process lock. The fixed private credential reference never appears in plugin configuration, provider profiles, settings, events, logs, or browser data, and private mutations do not emit `credentials/updated`.
+
+Login uses a second fixed private record as an expiring cross-process lease. Exactly one process claims and renews it while pi-ai polls; another process reports `already-connecting`, and an expired lease can be taken over. Cancellation and orderly plugin disposal abort the owned poller and release only the matching lease. `oauth.loginLeaseTtlMs` is a positive bounded top-level plugin setting, defaults to 30 seconds, and supplies both expiry and renewal timing:
+
+```yaml
+- id: llm
+  name: '@deepseek-ai/dsh-llm-pi-ai'
+  config:
+    oauth:
+      loginLeaseTtlMs: 30000
+```
+
+Disconnect calls pi-ai logout and removes the stored OAuth record. A revoked credential, failed refresh, unreadable record, or missing credential provider becomes the redacted `reconnect-required` lifecycle and `OAUTH_RECONNECT_REQUIRED` request failure; a native OAuth profile never falls through to an API key, process environment, or another provider. An existing profile that explicitly names `apiKeyEnv` remains a separate legacy key-auth route and does not become the fallback for OAuth.
+
+The Web and Headless profiles share the connection when they use the same Harness home. Headless never starts interactive login: it consumes an already-connected profile and the same credential store, or keeps the route unavailable. The implementation-owned OAuth record and lease references are never fields a user copies into `settings.yaml` or `cordis.yml`.
+
+The opt-in personal-subscription smoke uses a process-local credential provider, disconnects after the check, and makes no model request or persistent fixture. It prints only the provider's verification URL and one-time device code, then asserts redacted connection status, `checkAuth()`, and the local catalog. CI runs the file without the flag and therefore skips it:
+
+```sh
+DSH_OPENAI_CODEX_OAUTH_SMOKE=1 pnpm exec vitest run --config vitest.e2e.config.ts packages/llm/llm-pi-ai/tests/openai-codex-oauth.e2e.ts
+```
+
 ## Endpoint interrogation
 
 The plugin offers `ctx.llm.registerModelDiscovery('llm-pi-ai', …)`, which answers "which models can this provider serve?" for a route a configuration surface is editing or drafting. It is deliberately *not* a catalog refresh: nothing is stored, and the reply is candidates the surface offers for adoption. `settings.yaml` remains the only thing that decides what a route serves.
@@ -133,7 +161,7 @@ Most listings disclose an id and nothing else; `context_window`/`context_length`
 
 Each resolution produces one **immutable** snapshot — the profiles plus a `createModels()` collection holding the `Provider` each route built — and every operation captures a whole snapshot before its first `await`. A configuration change builds a *new* collection rather than mutating the one in use: `Models.streamSimple()` resolves its provider lazily, when the stream is first consumed, which is after the credential await, so a mutated collection would let a request that started under one configuration finish under another or fail on a provider that no longer exists. This is what makes the seam's per-step call freeze (`llm.prepareCall()`) hold end to end — switching models mid-reply takes effect on the next step, never inside the one in flight. Requests reach their provider through `Models.streamSimple()`. A catalog route that keeps its catalog protocol **reuses** the installed provider with its model list replaced, because that provider owns API implementations this package cannot reconstruct — Bedrock loads its Smithy module through a separate entry point — so rebuilding it from parts would silently narrow which providers work. Every other route is built by `createProvider()` over the protocol table behind `supportedProtocols()`, whose entries are the same factories pi-ai's own provider factories use.
 
-Credentials never enter that collection. The harness resolves a route's key through its own seam before the request reaches pi-ai and passes it as the request's `apiKey` option, which pi-ai treats as the highest-priority auth override; `Models` therefore holds no credential store, and the harness keeps its fail-loud reference semantics. A route naming no credential resolves as configured-but-keyless and leaves the requirement to the protocol, which is where it actually lives.
+Credential values never enter a profile or provider definition. The harness resolves an API-key route's key through its own seam before the request reaches pi-ai and passes it as the request's `apiKey` option, which pi-ai treats as the highest-priority auth override; the harness therefore keeps its fail-loud reference semantics. Native `openai-codex` OAuth is the deliberate exception at the collection level: every immutable collection receives the shared private credential store, which resolves and refreshes only that provider's OAuth record at authentication time. A non-OAuth route naming no credential still resolves as configured-but-keyless and leaves the requirement to the protocol, which is where it actually lives.
 
 The selected model descriptor supplies the protocol implementation. This includes native API differences such as OpenAI models whose descriptor uses the Responses API rather than Chat Completions; the harness adapter does not hardcode endpoint selection by model name.
 
@@ -189,7 +217,7 @@ Recorded response content appends to the next request and does not invalidate it
 
 ## Known Limitations and Deferred Work
 
-- **A provider that authenticates through OAuth alone is not offered** — pi-ai resolves OAuth from a *stored* OAuth credential, and this adapter builds its `Models` collection with no credential store and runs no login flow, so every request on such a route fails `Provider is not configured` before it goes out. The configurable-provider directory withholds them; `openai-codex` is the only one the installed catalog ships. A route a settings document already names keeps its entry so a configuration surface can edit or delete it, and `apiKeyEnv` still authenticates it with that key — which for Codex is a token that expires with nothing here to refresh it.
+- **The Codex catalog is not subscription entitlement discovery** — connecting proves that pi-ai can authenticate the account and makes the installed `openai-codex` catalog selectable, but OpenAI still controls which listed models the subscription may use. The adapter does not probe models with billable requests during connection or catalog listing.
 - **Provider-native discovery reads the process environment only** — a route naming no credential defers to the catalog provider's own resolution, which interrogates environment variables (`AZURE_OPENAI_API_KEY`, `AWS_PROFILE`, `AWS_ACCESS_KEY_ID`, and each provider's own set). It reads no local credential directory, so `~/.aws/credentials` without an exported `AWS_PROFILE` resolves as unconfigured, and a value held by the harness credential seam is invisible to it unless the process environment carries it too.
 - **Settings can add or override routes, not remove composition routes** — the user layer merges over the composition `base`, so deleting a `cordis.yml`-provided provider is a composition change; `replace` on the namespace only resets the user layer.
 - **The layered merge has no delete for dict keys** — the settings seam merges the composition `base` and the user layer per key, recursively, so a `reasoningEfforts` level, `modelOverrides` entry, or `compat` field the base declares cannot be removed by the user layer, only overridden — and for `reasoningEfforts` absence *is* the meaning ("not offered"), so a base-declared level stays offered. This only triggers when a `cordis.yml` entry config declares per-model reasoning fields for the same model the user layer edits; the supported posture is to leave those to the settings document (the shipped composition mounts the adapter dormant), and a `models` list is an array replacing wholesale, which is the in-band escape.

@@ -16,7 +16,20 @@ Keys are write-only. The page receives a redacted descriptor after saving, never
 
 Choose **Add provider**, select a provider such as Anthropic or OpenAI, enter its API key, and save. The installed catalog supplies the endpoint, protocol, and model list.
 
-Providers with native authentication need their native credentials instead. Bedrock, Vertex, Azure, and Codex use AWS credentials and a region, an ADC project, an `api-version`, and OAuth respectively; filling only the API-key field does not configure them.
+Providers with native authentication need their native credentials instead. Bedrock, Vertex, and Azure use AWS credentials and a region, an ADC project, and an `api-version` respectively; filling only the API-key field does not configure them. OpenAI Codex uses the ChatGPT connection below.
+
+## Connect OpenAI Codex with ChatGPT
+
+1. Open **Settings → Models**.
+2. Choose **Connect ChatGPT** for OpenAI Codex.
+3. Open the verification page, enter the displayed code, and complete sign-in.
+4. Select a connected `openai-codex` model in the normal picker.
+
+The page supports device-code sign-in only. It keeps the code in the current page while authorization is pending and stores the completed OAuth connection in the Harness credential store. Personal access and refresh tokens, account data, and the implementation-owned private references never enter `settings.yaml`, `cordis.yml`, provider configuration, browser events, or snapshots. Do not paste personal OAuth tokens into configuration files.
+
+**Disconnect** removes the saved OAuth connection but keeps the provider configuration, so **Connect ChatGPT** can start a new sign-in. A revoked connection or failed refresh shows **Reconnect** and never falls back to an API key, environment credential, or another provider. **Delete** disconnects first and then removes the provider configuration; if deletion fails after disconnecting, the card remains configured but disconnected so you can retry safely.
+
+OpenAI controls which catalog models a subscription may use; a connected account does not guarantee access to every listed model. A Headless run cannot start the interactive login, but the Web and Headless profiles consume the same successful connection when they use the same Harness home. Keep the `openai-codex` provider configuration and model selection in that home, connect through the Web UI once, and then run Headless normally.
 
 ## Add a custom provider
 

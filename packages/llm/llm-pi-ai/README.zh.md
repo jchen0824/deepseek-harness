@@ -4,7 +4,7 @@
 
 基于 [`@earendil-works/pi-ai`](https://www.npmjs.com/package/@earendil-works/pi-ai) 的 harness LLM（大语言模型）seam 通用多提供方适配器。一个插件实例拥有一份以路由为键的提供方 profile 字典；每个请求使用 `GenerateOptions.provider` 选择 profile，并针对该路由已配置的 catalog 解析 `GenerateOptions.model`。点名了已安装 pi-ai 提供方的路由会继承其端点、协议格式（wire format）与模型 catalog 作为默认值，并逐字段覆盖；pi-ai 未提供的路由则整体声明出来，因此接入 OpenAI 兼容网关、自建服务，或比已安装 catalog 更新的提供方，都属于配置而非改代码。
 
-包根入口导出 Cordis 插件约定、`PiAiAdapter` 与 `supportedProtocols()`；profile 解析、catalog 物化、提供方构造、回放转换和流转换保留在包内部。
+包根入口导出 Cordis 插件约定、`PiAiAdapter`、`supportedProtocols()`，以及 OpenAI Codex OAuth 控制器与凭据存储所需的 Host 集成类；profile 解析、catalog 物化、提供方构造、回放转换和流转换保留在包内部。
 
 ## 配置
 
@@ -118,6 +118,34 @@ profile 的 `models` 列表是*替换*该路由已安装 catalog，而不是扩�
 
 适配器强制 pi-ai SDK `maxRetries` 为零，因此一次 `stream()` 调用只会发起一次提供方请求。已移除 profile 字段 `maxRetries` 和 `maxRetryDelayMs` 会使加载失败，而不是静默倍增或隐藏单独组合的 agent（智能体）级重试预算。空闲超时会 abort SDK 的稳定请求信号，并以 `TIMEOUT` 呈现；较早的调用方 abort 仍为 `ABORTED`。
 
+## OpenAI Codex 订阅 OAuth
+
+`openai-codex` 始终以 OAuth 认证元数据出现在可配置提供方目录中，但其模型路由在 profile 完成连接之前保持休眠。Web 模型页会创建空 profile 并发起连接；控制器报告 `connected` 后，适配器注册普通 pi-ai catalog 路由，因此普通模型选择器、默认值、会话级选择、推理元数据和请求路径仍然具有权威性。已连接订阅能使用 catalog 中哪些模型由 OpenAI 控制；catalog 成员身份不是授权检查。
+
+控制器只接受 pi-ai 的 OpenAI Codex 设备码选择器。发起调用的 Host 会收到验证 URL 与一次性验证码；浏览器回调、手动输入码、secret、粘贴 token 和其他提示词都会以本包的脱敏 OAuth 错误失败。设备码数据只在发起交互期间存在，并在完成或取消时清除。连接广播只包含 `provider` 与 `status`。
+
+一个 Host 生命周期内只有一个 `OpenAICodexCredentialStore`，由控制器和每个不可变 pi-ai 模型集合共享。它通过 `CredentialProvider.modify()` 以私有原子修改方式存储带版本的 OAuth 记录，因此来自不同模型快照与 Harness 进程的刷新操作会在本地凭据提供方的跨进程锁上串行执行。固定的私有凭据引用绝不会出现在插件配置、提供方 profile、settings、事件、日志或浏览器数据中，私有修改也不会发出 `credentials/updated`。
+
+登录把另一条固定私有记录用作会过期的跨进程租约。pi-ai 轮询期间，只允许一个进程声明并续订它；其他进程报告 `already-connecting`，已过期的租约可以被接管。取消和有序插件资源释放会中止自身持有的轮询器，并且只释放所有者匹配的租约。`oauth.loginLeaseTtlMs` 是正数且有上限的顶层插件设置，默认为 30 秒，同时决定过期与续订时序：
+
+```yaml
+- id: llm
+  name: '@deepseek-ai/dsh-llm-pi-ai'
+  config:
+    oauth:
+      loginLeaseTtlMs: 30000
+```
+
+断开连接会调用 pi-ai logout 并移除存储的 OAuth 记录。凭据被撤销、刷新失败、记录不可读或凭据提供方缺失时，生命周期会进入脱敏的 `reconnect-required` 状态，请求则以 `OAUTH_RECONNECT_REQUIRED` 失败；原生 OAuth profile 绝不会回退到 API 密钥、进程环境或其他提供方。已经显式点名 `apiKeyEnv` 的既有 profile 仍是一条独立的旧式密钥认证路由，不会变成 OAuth 的回退路径。
+
+Web 与 Headless profile 使用同一个 Harness 主目录时会共享连接。Headless 绝不会发起交互式登录：它只消费已连接的 profile 与同一份凭据存储，否则该路由保持不可用。由实现持有的 OAuth 记录与租约引用绝不是用户要复制进 `settings.yaml` 或 `cordis.yml` 的字段。
+
+这个显式启用的个人订阅冒烟测试使用进程内凭据提供方，检查完成后会断开连接，并且不会发起模型请求或创建持久化 fixture。它只打印提供方的验证 URL 与一次性设备码，然后断言脱敏连接状态、`checkAuth()` 与本地 catalog。CI 运行该文件时不设置标志，因此会跳过：
+
+```sh
+DSH_OPENAI_CODEX_OAUTH_SMOKE=1 pnpm exec vitest run --config vitest.e2e.config.ts packages/llm/llm-pi-ai/tests/openai-codex-oauth.e2e.ts
+```
+
 ## 端点询问
 
 插件提供 `ctx.llm.registerModelDiscovery('llm-pi-ai', …)`，用来回答「这个提供方能服务哪些模型？」——针对配置界面正在编辑或起草的路由。它刻意**不是** catalog 刷新：什么都不存储，回复是界面供用户采纳的候选。`settings.yaml` 始终是唯一决定路由服务什么的东西。
@@ -134,7 +162,7 @@ profile 的 `models` 列表是*替换*该路由已安装 catalog，而不是扩�
 
 每次解析产出一份**不可变**快照——profiles 加上一个持有各路由所建 `Provider` 的 `createModels()` 集合——每个操作都在自己第一个 `await` 之前整体捕获一份快照。配置变化会构造**新**集合，而不是改动正在被使用的那个：`Models.streamSimple()` 是惰性的，它在流首次被消费时才解析 provider，而那已在 credential await 之后，因此改动共享集合会让一个在旧配置下开始的请求在新配置下结束，或者撞上一个已不存在的 provider。这正是 seam 的每步调用冻结（`llm.prepareCall()`）能贯通到底的原因——回复途中切换模型会在下一步生效，绝不会影响在途的那一步。请求经 `Models.streamSimple()` 抵达提供方。保持 catalog 协议不变的 catalog 路由会**复用**已安装提供方，只替换其模型列表，因为该提供方持有本包无法重建的 API 实现——Bedrock 经由独立入口加载其 Smithy 模块——从零件重建会静默收窄可用提供方的范围。其余路由都由 `createProvider()` 基于 `supportedProtocols()` 背后的协议表构造，表中条目正是 pi-ai 自己的提供方工厂所用的同一批 factory。
 
-凭据绝不进入该集合。harness 在请求抵达 pi-ai 之前经自身 seam 解析路由密钥，并作为请求的 `apiKey` 选项传入，而 pi-ai 将其视为优先级最高的 auth 覆盖；因此 `Models` 不持有任何凭据存储，harness 也保住了自己明确失败的引用语义。没有点名任何凭据的路由会解析为「已配置但无密钥」，把该要求留给协议——那才是它真正所在的位置。
+凭据值绝不会进入 profile 或提供方定义。harness 在 API 密钥路由的请求抵达 pi-ai 之前经自身 seam 解析密钥，并作为请求的 `apiKey` 选项传入，而 pi-ai 将其视为优先级最高的 auth 覆盖；harness 因此保住了自己明确失败的引用语义。原生 `openai-codex` OAuth 是集合层刻意设置的例外：每个不可变集合都会收到共用的私有凭据存储，而该存储只会在认证时解析和刷新这个提供方的 OAuth 记录。没有点名任何凭据的非 OAuth 路由仍解析为「已配置但无密钥」，把该要求留给协议——那才是它真正所在的位置。
 
 所选模型 descriptor 提供协议实现。这包括原生 API 差异，例如 descriptor 使用 Responses API 而非 Chat Completions 的 OpenAI 模型；harness 适配器不会按模型名称硬编码端点选择。
 
@@ -190,7 +218,7 @@ pi-ai 事件会变为 harness 推理、文本、工具调用、usage 与 finish 
 
 ## 已知限制与暂缓事项
 
-- **仅以 OAuth 认证的提供方不予提供**：pi-ai 的 OAuth 只从*已存储*的 OAuth 凭据解析，而本适配器构造 `Models` 集合时不注入凭据存储、也不运行登录流程，因此这类路由的每个请求都会在发出之前以 `Provider is not configured` 失败。可配置提供方目录因此不列出它们；已安装 catalog 中只有 `openai-codex` 属于此类。settings 文档已经写过的路由仍保留目录条目，配置界面据此可以编辑或删除；`apiKeyEnv` 也仍能用该密钥完成认证——对 Codex 而言那是一个会过期、且这里没有任何环节会去刷新的 token。
+- **Codex catalog 不是订阅授权发现**：连接只证明 pi-ai 能对该帐号完成认证，并让已安装的 `openai-codex` catalog 可供选择；订阅能使用其中哪些模型仍由 OpenAI 控制。连接或列出 catalog 时，适配器不会通过可计费请求探测模型。
 - **提供方自带的凭据发现只读进程环境**：不指定凭据的路由交由 catalog 提供方自行解析，而它探测的是环境变量（`AZURE_OPENAI_API_KEY`、`AWS_PROFILE`、`AWS_ACCESS_KEY_ID` 以及各提供方自己的那一组）。它不读任何本地凭据目录，因此只有 `~/.aws/credentials` 而未导出 `AWS_PROFILE` 会被解析为未配置；由 harness 凭据 seam 保管的值，除非进程环境里也有，否则对它不可见。
 - **settings 能新增或覆盖路由，但不能移除组合路由**：用户层合并在组合 `base` 之上，因此删除 `cordis.yml` 提供的提供方属于组合变更；对该 namespace 执行 `replace` 只会重置用户层。
 - **分层合并对字典键没有删除语义**：settings seam 把组合 `base` 与用户层按键递归合并，因此 base 声明的某个 `reasoningEfforts` 档位、`modelOverrides` 条目或 `compat` 字段，用户层只能覆盖、无法移除——而 `reasoningEfforts` 里缺席本身*就是*语义（「不提供」），于是 base 声明过的档位会一直被提供。只有 `cordis.yml` entry config 为用户层正在编辑的同一模型声明了按模型推理字段才会触发；受支持的姿态是把这些字段留给 settings 文档（shipped 组合以 dormant 方式挂载该适配器），且 `models` 列表是数组、整体替换，这是带内的解决办法。

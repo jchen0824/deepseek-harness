@@ -16,7 +16,20 @@
 
 选择**添加提供方**，选取 Anthropic 或 OpenAI 等提供方，输入其 API 密钥并保存。已安装目录会提供端点、协议和模型列表。
 
-使用原生认证的提供方需要各自的原生凭据。Bedrock、Vertex、Azure 和 Codex 分别使用 AWS 凭据与区域、ADC 项目、`api-version` 和 OAuth；只填写 API 密钥字段无法完成配置。
+使用原生认证的提供方需要各自的原生凭据。Bedrock、Vertex 和 Azure 分别使用 AWS 凭据与区域、ADC 项目和 `api-version`；只填写 API 密钥字段无法完成配置。OpenAI Codex 使用下文所述的 ChatGPT 连接。
+
+## 通过 ChatGPT 连接 OpenAI Codex
+
+1. 打开**设置 → 模型**。
+2. 在 OpenAI Codex 卡片上选择**连接 ChatGPT**。
+3. 打开验证页面，输入显示的验证码并完成登录。
+4. 在普通模型选择器中选取已连接的 `openai-codex` 模型。
+
+页面只支持设备码登录。授权待完成时，页面只在当前页面中保留验证码；授权完成后，OAuth 连接存入 Harness 凭据存储。个人访问 token 与刷新 token、帐号数据和由实现持有的私有引用绝不会进入 `settings.yaml`、`cordis.yml`、提供方配置、浏览器事件或快照。请勿把个人 OAuth token 粘贴进配置文件。
+
+**断开连接**会移除已保存的 OAuth 连接，但保留提供方配置，因此可以再次通过**连接 ChatGPT**发起新登录。连接被撤销或刷新失败时，卡片会显示**重新连接**，且绝不会回退到 API 密钥、环境凭据或其他提供方。**删除**会先断开连接，再移除提供方配置；如果断开后删除失败，卡片会保留为已配置但未连接状态，供你安全重试。
+
+目录中模型是否可用由 OpenAI 订阅控制；帐号已连接不代表可以使用列出的每个模型。Headless 运行无法发起交互式登录，但 Web 与 Headless profile 使用同一个 Harness 主目录时，会消费同一份已成功建立的连接。请在该主目录中保留 `openai-codex` 提供方配置和模型选择，先通过 Web UI 连接一次，再正常运行 Headless。
 
 ## 添加自定义提供方
 

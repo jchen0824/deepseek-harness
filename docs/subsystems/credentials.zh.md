@@ -45,6 +45,12 @@ interface CredentialInfo {
 }
 ```
 
+## 原子存储修改
+
+`modify(ref, mutate)` 把读取与修改一个由提供方管理的存储值作为单个操作执行。回调只接收存储值，绝不会接收继承自环境的值；本地提供方在等待回调和完成仅限所有者的原子提交期间，始终持有跨进程文件锁。这是多个 Harness 进程共享 OAuth 刷新状态、登录租约等记录时的串行化点。
+
+每次修改都声明 `public` 或 `private` 可见性。公开值发生变化后，会在提交之后发出 `credentials/updated`。私有修改会在同一把锁下更新持久化的私有引用元数据；写入进程、其他进程和之后的文件监视器对账都不会为它发出凭据事件。私有引用和 `modify` 仅限 Host 使用；浏览器改为接收对应能力的脱敏事件。
+
 ## 已提交的变更
 
 `credentials/updated (ref)` 在提供方管理的来源发生已提交变更后发出——`set`、`unset` 或在存储中观察到的外部编辑。进程环境自身的变化不可观测，永不发出事件。消费方不需要该事件（它们按操作重新解析）；它服务于配置界面刷新「已配置」徽标。
@@ -61,7 +67,7 @@ Generated from source by `scripts/gen-cordis-catalog.ts` (verified fresh by `pnp
 
 ### `ctx.credentials` — `CredentialProvider` (abstract seam)
 
-Abstract credential service. Providers implement the four operations over their source layers; one seam-wide rule binds them all: an empty stored value is absent everywhere — `resolve` skips it, `describe` reports it unconfigured — so a blank never masquerades as a configured secret.
+Abstract credential service. Providers implement the operations over their source layers; one seam-wide rule binds them all: an empty stored value is absent everywhere — `resolve` skips it, `describe` reports it unconfigured — so a blank never masquerades as a configured secret.
 
 ```ts cordis-catalog
 /**
@@ -99,6 +105,18 @@ abstract set(ref: CredentialRef, value: string): Promise<void>
  * @param ref - the reference to remove.
  */
 abstract unset(ref: CredentialRef): Promise<void>
+
+/**
+ * Atomically read and change one provider-managed stored value. The callback
+ * receives only that stored value, never an inherited environment value.
+ * Callers must keep private references and mutations in host code; this
+ * operation is not a browser-facing credential RPC.
+ * @typeParam T - caller-defined result returned after the mutation commits.
+ * @param ref - the host-only reference to change.
+ * @param mutate - derives the next stored value and caller result from the current stored value.
+ * @returns the mutation result after its value commits.
+ */
+abstract modify<T>( ref: CredentialRef, mutate: (current: string | undefined) => Promise<CredentialMutation<T>>, ): Promise<T>
 ```
 
 Source: [`packages/credentials/credentials/src/index.ts:60`](../../packages/credentials/credentials/src/index.ts)
@@ -129,5 +147,5 @@ Committed change to a provider-managed credential source: a `set`, an `unset`, o
 'credentials/updated'(ref: CredentialRef): void
 ```
 
-Source: [`packages/credentials/credentials/src/types.ts:29`](../../packages/credentials/credentials/src/types.ts)
+Source: [`packages/credentials/credentials/src/types.ts:47`](../../packages/credentials/credentials/src/types.ts)
 <!-- END GENERATED cordis-surface -->
