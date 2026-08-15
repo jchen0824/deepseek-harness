@@ -34,6 +34,9 @@ import { buildProvider, supportedProtocols } from './provider.ts'
 /** Default maximum idle interval while an adapter stream read is outstanding. */
 export const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 300_000
 
+/** Default lifetime of the private cross-process Codex login lease. */
+export const DEFAULT_OAUTH_LOGIN_LEASE_TTL_MS = 30_000
+
 /** Context capacity assumed for a model neither configuration nor the catalog sizes. */
 export const DEFAULT_CONTEXT_WINDOW = 262_144
 
@@ -140,6 +143,18 @@ export interface PiAiProviderProfile {
   retryPolicy?: RetryPolicyConfig
 }
 
+/** Host-owned OpenAI Codex OAuth lifecycle configuration. */
+export interface PiAiOAuthConfig {
+  /** Lifetime and renewal basis for the private cross-process login lease. */
+  loginLeaseTtlMs?: number
+}
+
+/** Validated OAuth lifecycle configuration. */
+export interface ResolvedPiAiOAuthConfig {
+  /** Positive bounded cross-process login lease lifetime. */
+  loginLeaseTtlMs: number
+}
+
 /** Validated profile with its route stamped and every adapter-owned default resolved. */
 export interface ResolvedPiAiProviderProfile
   extends Omit<PiAiProviderProfile, 'apiKeyEnv' | 'retryPolicy' | 'models' | 'displayName'> {
@@ -176,6 +191,8 @@ export interface Config {
    * and registers them the moment a settings section supplies profiles.
    */
   providers?: Record<string, PiAiProviderProfile>
+  /** Host-owned OAuth coordination configuration. */
+  oauth?: PiAiOAuthConfig
 }
 
 const thinkingBudgets = z.object({
@@ -251,10 +268,36 @@ const profile = z.object({
   retryPolicy: RetryPolicySchema,
 })
 
+const oauthConfig = z.object({
+  loginLeaseTtlMs: z.number()
+    .step(1)
+    .min(1)
+    .max(MAX_TIMER_DELAY_MS)
+    .default(DEFAULT_OAUTH_LOGIN_LEASE_TTL_MS),
+})
+
 /** Runtime schema for {@link Config}. */
 export const Config: z<Config> = z.object({
   providers: z.dict(profile).default({}),
+  oauth: oauthConfig,
 })
+
+/**
+ * Resolve the OAuth lifecycle config for host-owned coordination.
+ * @param oauth - optional raw OAuth config.
+ * @returns the validated login lease lifetime.
+ */
+export function resolveOAuthConfig(oauth: PiAiOAuthConfig | undefined): ResolvedPiAiOAuthConfig {
+  const loginLeaseTtlMs = oauth?.loginLeaseTtlMs ?? DEFAULT_OAUTH_LOGIN_LEASE_TTL_MS
+  if (!Number.isInteger(loginLeaseTtlMs)
+    || loginLeaseTtlMs <= 0
+    || loginLeaseTtlMs > MAX_TIMER_DELAY_MS) {
+    throw new Error(
+      `llm-pi-ai: oauth.loginLeaseTtlMs must be a positive integer no greater than ${MAX_TIMER_DELAY_MS}`,
+    )
+  }
+  return { loginLeaseTtlMs }
+}
 
 /**
  * Reject a section this adapter could not serve. Registered as the settings
@@ -269,6 +312,7 @@ export const Config: z<Config> = z.object({
  * @throws Error naming the route and model that cannot be served.
  */
 export function assertServiceable(config: Config): void {
+  resolveOAuthConfig(config.oauth)
   resolveProfiles(config.providers)
 }
 

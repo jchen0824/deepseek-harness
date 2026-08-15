@@ -49,6 +49,26 @@ async function boot(dir: string, config: LlmPiAi.Config): Promise<Context> {
   return ctx
 }
 
+/** Boot with a durable OAuth record committed before the adapter initializes. */
+async function bootConnectedCodex(dir: string): Promise<Context> {
+  const ctx = new Context()
+  cleanups.push(async () => {
+    await ctx.fiber.dispose()
+  })
+  await ctx.plugin(LlmRuntime)
+  await ctx.plugin(FileSettingsProvider, { path: join(dir, 'settings.yaml'), watch: false })
+  await ctx.plugin(LocalCredentialProvider, { path: join(dir, '.credentials.yaml'), watch: false })
+  const store = new LlmPiAi.OpenAICodexCredentialStore(() => ctx.credentials)
+  await store.modify('openai-codex', async () => ({
+    type: 'oauth',
+    access: 'private-access-value',
+    refresh: 'private-refresh-value',
+    expires: Date.now() + 60_000,
+  }))
+  await ctx.plugin(LlmPiAi, { providers: { 'openai-codex': {} } })
+  return ctx
+}
+
 describe('request-level dynamic profiles', () => {
   it('mounts bare and dormant, then registers routes the moment settings supply providers', async () => {
     vi.stubEnv('PI_DYNAMIC_KEY', '')
@@ -73,6 +93,14 @@ describe('request-level dynamic profiles', () => {
       settingsNs: 'llm-pi-ai',
       settingsPath: ['providers', 'openai'],
       auth: { kind: 'api-key' },
+      declared: false,
+    })
+    expect(directory).toContainEqual({
+      provider: 'openai-codex',
+      displayName: 'openai-codex',
+      settingsNs: 'llm-pi-ai',
+      settingsPath: ['providers', 'openai-codex'],
+      auth: { kind: 'oauth' },
       declared: false,
     })
     await ctx.settings.update(NS, {
@@ -155,6 +183,26 @@ describe('request-level dynamic profiles', () => {
       jitterRatio: 0.2,
     })
     expect(ctx.llm.listProviders().map(provider => provider.id)).toEqual(['openai'])
+  })
+
+  it('keeps one connected controller and credential store across profile snapshots', async () => {
+    const dir = await home()
+    const ctx = await bootConnectedCodex(dir)
+    await vi.waitFor(() => {
+      expect(ctx.llm.listProviders().map(provider => provider.id)).toContain('openai-codex')
+    })
+    const controller = ctx.llm.getOAuthController('openai-codex')
+    if (controller === undefined) throw new Error('expected Codex OAuth controller')
+    await expect(controller.status()).resolves.toEqual({ provider: 'openai-codex', status: 'connected' })
+
+    await ctx.settings.update(NS, {
+      providers: { 'openai-codex': { displayName: 'Codex subscription' } },
+    })
+
+    expect(ctx.llm.getOAuthController('openai-codex')).toBe(controller)
+    await expect(controller.status()).resolves.toEqual({ provider: 'openai-codex', status: 'connected' })
+    expect(ctx.llm.listProviders()).toContainEqual({ id: 'openai-codex', name: 'Codex subscription' })
+    await expect(ctx.llm.listModels('openai-codex')).resolves.not.toHaveLength(0)
   })
 
   it('refuses a settings write this adapter could not serve, leaving its routes alone', async () => {

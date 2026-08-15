@@ -58,16 +58,27 @@
 import type { Context } from '@deepseek-ai/cordis'
 import { launchEnvironmentOf } from '@deepseek-ai/dsh-launch-environment'
 import { assertUsableApiKey, LlmError } from '@deepseek-ai/dsh-llm'
-import type { AdapterRegistrationHandle, DirectoryRegistrationHandle, LlmConfigurableProvider } from '@deepseek-ai/dsh-llm'
+import type {
+  AdapterRegistrationHandle,
+  DirectoryRegistrationHandle,
+  LlmConfigurableProvider,
+  LlmOAuthConnectionStatus,
+  LlmProviderAuth,
+} from '@deepseek-ai/dsh-llm'
 import { deepEqualJson, installSettingsSection, settingsNamespace } from '@deepseek-ai/dsh-settings'
 import { PiAiAdapter } from './adapter.ts'
-import { catalogProviderIds, catalogProviderTakesApiKey } from './catalog.ts'
-import { assertServiceable, Config, resolveProfiles } from './config.ts'
+import { catalogProviderAuth, catalogProviderIds } from './catalog.ts'
+import { assertServiceable, Config, resolveOAuthConfig, resolveProfiles } from './config.ts'
 import type { ResolvedPiAiProviderProfile } from './config.ts'
 import { discoverModels } from './discovery.ts'
+import { OpenAICodexCredentialStore } from './oauth-credential-store.ts'
+import { OpenAICodexOAuthController } from './openai-codex-oauth.ts'
 
 export { PiAiAdapter } from './adapter.ts'
 export type { PiAiAdapterOptions } from './adapter.ts'
+export { OpenAICodexCredentialStore } from './oauth-credential-store.ts'
+export { OpenAICodexOAuthController } from './openai-codex-oauth.ts'
+export type { OpenAICodexOAuthControllerOptions } from './openai-codex-oauth.ts'
 export { Config } from './config.ts'
 export type {
   PiAiCompatProfile,
@@ -75,9 +86,11 @@ export type {
   PiAiModelOverride,
   PiAiModelProfile,
   PiAiProviderProfile,
+  PiAiOAuthConfig,
   PiAiReasoningEfforts,
   PiAiThinkingFormat,
   ResolvedPiAiProviderProfile,
+  ResolvedPiAiOAuthConfig,
 } from './config.ts'
 export { supportedProtocols } from './provider.ts'
 
@@ -91,8 +104,14 @@ const NS = settingsNamespace('llm-pi-ai')
  * Sorted by provider so a settings document that merely reorders its keys is
  * not mistaken for a route change.
  */
-function registrationFacts(profiles: ReadonlyMap<string, ResolvedPiAiProviderProfile>): unknown {
+function registrationFacts(
+  profiles: ReadonlyMap<string, ResolvedPiAiProviderProfile>,
+  oauthStatus: LlmOAuthConnectionStatus,
+): unknown {
   return [...profiles.entries()]
+    .filter(([provider, profile]) => provider !== 'openai-codex'
+      || profile.apiKeyEnv !== undefined
+      || oauthStatus === 'connected')
     // `displayName` rides along because the registry hands it to every selector
     // through `providerInfo()`: a rename that did not re-register would leave
     // the old label showing until some unrelated fact happened to change.
@@ -122,28 +141,26 @@ function directoryEntries(
 ): LlmConfigurableProvider[] {
   const catalog = new Set(catalogProviderIds())
   const entries = new Map<string, LlmConfigurableProvider>()
-  const declare = (provider: string, displayName: string): void => {
+  const declare = (provider: string, displayName: string, auth: LlmProviderAuth): void => {
     entries.set(provider, {
       provider,
       displayName,
       settingsNs: NS,
       settingsPath: ['providers', provider],
-      auth: { kind: 'api-key' },
+      auth,
       // Membership of the installed catalog, not of the settings document:
       // narrowing a shipped provider's models stores a profile too, and that
       // route is still one pi-ai knows.
       declared: !catalog.has(provider),
     })
   }
-  // A provider whose only native method is OAuth leaves this adapter nothing
-  // to authenticate with, so offering it would put a card on the settings page
-  // whose own posture — no key, credentials discovered by the provider — fails
-  // every request. Catalog *membership* is unaffected, so `declare` above still
-  // answers what pi-ai ships.
   for (const provider of catalog) {
-    if (catalogProviderTakesApiKey(provider)) declare(provider, provider)
+    const auth = catalogProviderAuth(provider)
+    if (auth !== undefined) declare(provider, provider, auth)
   }
-  for (const [provider, profile] of profiles) declare(provider, profile.displayName)
+  for (const [provider, profile] of profiles) {
+    declare(provider, profile.displayName, catalogProviderAuth(provider) ?? { kind: 'api-key' })
+  }
   return [...entries.values()]
 }
 
@@ -172,6 +189,7 @@ export function apply(ctx: Context, config: Config): void {
     return next
   }
   profiles()
+  resolveOAuthConfig(current().oauth)
 
   const resolveApiKey = async (
     provider: string,
@@ -198,11 +216,37 @@ export function apply(ctx: Context, config: Config): void {
     )
   }
 
+  const credentialStore = new OpenAICodexCredentialStore(() => ctx.get('credentials'))
+  let oauthStatus: LlmOAuthConnectionStatus = 'missing'
+  let oauthLifecycleActive = true
+  let ensureRegistrationFacts: () => void = () => {}
+  const adapterRef: { current?: PiAiAdapter } = {}
+  const oauthController = new OpenAICodexOAuthController({
+    credentials: () => ctx.get('credentials'),
+    credentialStore,
+    models: () => {
+      if (adapterRef.current === undefined) throw new Error('llm-pi-ai adapter is not ready')
+      return adapterRef.current.modelsSnapshot()
+    },
+    loginLeaseTtlMs: () => resolveOAuthConfig(current().oauth).loginLeaseTtlMs,
+    emitConnectionUpdated: (connection) => {
+      oauthStatus = connection.status
+      try {
+        ensureRegistrationFacts()
+      } catch {
+        ctx.logger.error('llm-pi-ai: keeping the previously registered routes after an OAuth state update')
+      }
+      ctx.llm.emitOAuthConnectionUpdated(connection)
+    },
+  })
   const adapter = new PiAiAdapter({
     profiles,
     resolveApiKey,
+    credentialStore,
+    oauthController,
     resolveAttachments: () => ctx.get('attachments'),
   })
+  adapterRef.current = adapter
   // The full installed catalog is configurable from the moment the plugin
   // mounts — dormant or not — so configuration surfaces can offer every
   // pi-ai provider before any route exists. Hand-declared routes join it as
@@ -251,8 +295,9 @@ export function apply(ctx: Context, config: Config): void {
   // settings section supplies profiles, and routes drop when it empties.
   let registration: AdapterRegistrationHandle | undefined
   let registeredFacts: unknown
-  const ensureRegistrationFacts = (): void => {
-    const facts = registrationFacts(profiles())
+  ensureRegistrationFacts = (): void => {
+    const resolved = profiles()
+    const facts = registrationFacts(resolved, oauthStatus)
     if (deepEqualJson(facts, registeredFacts)) return
     // The registry captures the route set and each route's retry policy at
     // registration, so a change to either must re-register. The swap is
@@ -260,7 +305,11 @@ export function apply(ctx: Context, config: Config): void {
     // conflicting route leaves the previous routes serving requests, and
     // `registeredFacts` only advances once the registry actually holds the
     // new set — so returning to a working configuration always re-applies.
-    const routes = [...profiles().keys()]
+    const routes = [...resolved]
+      .filter(([provider, profile]) => provider !== 'openai-codex'
+        || profile.apiKeyEnv !== undefined
+        || oauthStatus === 'connected')
+      .map(([provider]) => provider)
     if (registration === undefined) {
       // Dormant bare mount: nothing is registered until a section supplies
       // profiles, and an empty section keeps it that way.
@@ -309,5 +358,30 @@ export function apply(ctx: Context, config: Config): void {
         ctx.logger.error(error)
       }
     },
+  })
+
+  // Register cleanup first so reverse-order Cordis disposal withdraws the
+  // public controller before aborting and awaiting its private lifecycle work.
+  let initialization: Promise<void> = Promise.resolve()
+  ctx.effect(function* () {
+    yield async () => {
+      oauthLifecycleActive = false
+      await oauthController.dispose()
+      await initialization
+    }
+  })
+  ctx.llm.registerOAuthController(oauthController)
+  initialization = oauthController.initialize().then((connection) => {
+    if (!oauthLifecycleActive) return
+    oauthStatus = connection.status
+    try {
+      ensureRegistrationFacts()
+    } catch {
+      ctx.logger.error('llm-pi-ai: keeping the previously registered routes after OAuth initialization')
+    }
+  }, () => {
+    if (oauthLifecycleActive) {
+      ctx.logger.error('llm-pi-ai: OpenAI Codex authentication state could not be initialized')
+    }
   })
 }

@@ -13,17 +13,18 @@
  * way down: switching models mid-reply takes effect on the next step, never
  * inside the one in flight.
  *
- * Credentials stay outside that collection. The harness resolves a route's key
- * through its own seam and passes it as the request's `apiKey` option, which
- * pi-ai treats as the highest-priority auth override — so `Models` never holds
- * a credential store and the harness keeps its fail-loud reference semantics.
+ * Every collection receives the same host-scoped OAuth credential store. An
+ * explicit `apiKeyEnv` still resolves through the Harness seam and becomes the
+ * highest-priority request override; the native Codex OAuth profile omits that
+ * override and lets pi-ai resolve and refresh its stored credential.
  *
  * @module dsh-llm-pi-ai/adapter
  */
 
-import { createModels, getSupportedThinkingLevels } from '@earendil-works/pi-ai'
+import { createModels, getSupportedThinkingLevels, ModelsError } from '@earendil-works/pi-ai'
 import type {
   Api,
+  CredentialStore,
   Model,
   Models,
   ModelThinkingLevel,
@@ -36,6 +37,7 @@ import {
   contentHasImage,
   LlmAdapter,
   LlmError,
+  OAUTH_RECONNECT_REQUIRED_CODE,
   ReasoningEffortId,
 } from '@deepseek-ai/dsh-llm'
 import type {
@@ -51,6 +53,7 @@ import type { AttachmentStore } from '@deepseek-ai/dsh-attachment'
 import { idleWatchdog, timeoutOf } from '@deepseek-ai/dsh-timeout'
 import type { ResolvedPiAiProviderProfile } from './config.ts'
 import { toPiContext } from './context.ts'
+import type { OpenAICodexOAuthController } from './openai-codex-oauth.ts'
 import { toStreamChunks } from './stream.ts'
 
 /** One resolution's frozen view: the profiles and the collection built from them. */
@@ -59,6 +62,14 @@ interface PiAiSnapshot {
   profiles: ReadonlyMap<string, ResolvedPiAiProviderProfile>
   /** Providers for exactly those profiles; never mutated once published. */
   models: Models
+}
+
+/** Return the provider-neutral failure for any unusable native Codex OAuth state. */
+function oauthReconnectFailure(): LlmError {
+  return new LlmError(
+    'OpenAI Codex connection needs to be reconnected',
+    OAUTH_RECONNECT_REQUIRED_CODE,
+  )
 }
 
 /** Constructor options for {@link PiAiAdapter}: the two resolution hooks the plugin owns. */
@@ -74,6 +85,10 @@ export interface PiAiAdapterOptions {
    * `MISSING_CREDENTIAL` rather than falling back.
    */
   resolveApiKey: (provider: string, profile: ResolvedPiAiProviderProfile) => Promise<string | undefined>
+  /** Stable pi-ai credential store shared by every immutable model snapshot. */
+  credentialStore?: CredentialStore
+  /** Raw host controller used only to mark a request-time refresh failure. */
+  oauthController?: Pick<OpenAICodexOAuthController, 'markReconnectRequired'>
   /** Resolve the optional durable attachment service at request time. */
   resolveAttachments?: () => AttachmentStore | undefined
 }
@@ -199,10 +214,21 @@ export class PiAiAdapter extends LlmAdapter {
   private current(): PiAiSnapshot {
     const profiles = this.config.profiles()
     if (this.snapshot?.profiles === profiles) return this.snapshot
-    const models: MutableModels = createModels()
+    const models: MutableModels = createModels(
+      this.config.credentialStore === undefined ? {} : { credentials: this.config.credentialStore },
+    )
     for (const profile of profiles.values()) models.setProvider(profile.piProvider)
     this.snapshot = { profiles, models }
     return this.snapshot
+  }
+
+  /**
+   * Return the current full-profile immutable model collection for host-owned
+   * provider lifecycle operations such as OAuth login and logout.
+   * @returns the current model snapshot.
+   */
+  modelsSnapshot(): Models {
+    return this.current().models
   }
 
   /** The profile for one route within one snapshot, or the not-owned failure. */
@@ -289,7 +315,29 @@ export class PiAiAdapter extends LlmAdapter {
       model,
       options.reasoningEffort ?? profile.reasoning,
     )
-    const apiKey = await this.config.resolveApiKey(options.provider, profile)
+    const nativeCodexOAuth = profile.provider === 'openai-codex' && profile.apiKeyEnv === undefined
+    const apiKey = nativeCodexOAuth
+      ? undefined
+      : await this.config.resolveApiKey(options.provider, profile)
+
+    if (nativeCodexOAuth) {
+      try {
+        // Preflight pi-ai's locked refresh while the typed ModelsError is still
+        // available. `streamSimple()` is lazy and otherwise flattens it into a
+        // provider-text event, which must not enter the Harness stream.
+        const auth = await snapshot.models.getAuth(model)
+        if (auth === undefined) {
+          this.config.oauthController?.markReconnectRequired()
+          throw oauthReconnectFailure()
+        }
+      } catch (error) {
+        if (error instanceof ModelsError) {
+          this.config.oauthController?.markReconnectRequired()
+          throw oauthReconnectFailure()
+        }
+        throw error
+      }
+    }
 
     const consumer = new AbortController()
     const upstream = options.signal === undefined

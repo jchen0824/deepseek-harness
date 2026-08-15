@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'vitest'
-import { assertServiceable, Config } from '../src/config.ts'
+import { MAX_TIMER_DELAY_MS } from '@deepseek-ai/dsh-timeout'
+import {
+  assertServiceable,
+  Config,
+  DEFAULT_OAUTH_LOGIN_LEASE_TTL_MS,
+  resolveOAuthConfig,
+} from '../src/config.ts'
 
 /** Validate one hand-declared route, with the caller's fields layered onto it. */
 const routeWith = (profile: Record<string, unknown>): (() => unknown) =>
@@ -63,4 +69,20 @@ describe('modality schema boundary', () => {
     expect(absent.providers['acme-gateway']?.models?.[0]?.input).toEqual([])
     expect(absent.providers['acme-gateway']?.defaultInput).toEqual(['text'])
   })
+})
+
+describe('OAuth lease configuration', () => {
+  it('defaults the login lease to thirty seconds', () => {
+    expect(resolveOAuthConfig(undefined)).toEqual({
+      loginLeaseTtlMs: DEFAULT_OAUTH_LOGIN_LEASE_TTL_MS,
+    })
+    expect(DEFAULT_OAUTH_LOGIN_LEASE_TTL_MS).toBe(30_000)
+  })
+
+  it.each([0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, MAX_TIMER_DELAY_MS + 1])(
+    'rejects an invalid login lease TTL %s at the schema boundary',
+    (loginLeaseTtlMs) => {
+      expect(() => Config({ oauth: { loginLeaseTtlMs } })).toThrow()
+    },
+  )
 })

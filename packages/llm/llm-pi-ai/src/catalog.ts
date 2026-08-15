@@ -23,6 +23,7 @@ import type {
   Provider,
   ThinkingLevelMap,
 } from '@earendil-works/pi-ai'
+import type { LlmProviderAuth } from '@deepseek-ai/dsh-llm'
 
 /**
  * Pricing for a model the installed catalog does not describe. The harness
@@ -141,24 +142,27 @@ export function catalogProviderIds(): readonly string[] {
   return getBuiltinProviders()
 }
 
+const NATIVE_AUTH_PROVIDERS = new Set([
+  'amazon-bedrock',
+  'azure-openai-responses',
+  'google-vertex',
+])
+
 /**
- * Whether the installed catalog provider for one route declares an api-key
- * method — the only authentication this adapter obtains on its own.
- *
- * A key is what the harness resolves through its own credential seam and hands
- * pi-ai per request. pi-ai's other method, OAuth, resolves from a *stored*
- * OAuth credential alone: `resolveProviderAuth` has no ambient path for it,
- * this adapter builds its `Models` collection with no credential store, and
- * nothing here runs a login flow. So a provider offering OAuth by itself
- * leaves nothing for this adapter to authenticate with, and the posture such a
- * provider invites — no key configured, credentials discovered by the provider
- * — fails every request with `Provider is not configured`.
- * @param provider - provider route key.
- * @returns whether the catalog provider takes an api key; false for a route
- *   pi-ai does not ship, which the caller answers for separately.
+ * Authentication configuration surfaces can actually provide for one
+ * installed catalog route. Bedrock, Azure, and Vertex require provider-native
+ * environment beyond one key; Codex is the only OAuth-only catalog route this
+ * package owns; catalog routes with an API-key path retain that existing path.
+ * @param provider - installed catalog provider route.
+ * @returns provider-neutral authentication metadata, or `undefined` for an unknown route.
  */
-export function catalogProviderTakesApiKey(provider: string): boolean {
-  return catalogProvider(provider)?.auth.apiKey !== undefined
+export function catalogProviderAuth(provider: string): LlmProviderAuth | undefined {
+  const installed = catalogProvider(provider)
+  if (installed === undefined) return undefined
+  if (NATIVE_AUTH_PROVIDERS.has(provider)) return { kind: 'native' }
+  if (installed.auth.apiKey !== undefined) return { kind: 'api-key' }
+  if (installed.auth.oauth !== undefined) return { kind: 'oauth' }
+  return { kind: 'native' }
 }
 
 /**

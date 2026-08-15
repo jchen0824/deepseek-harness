@@ -11,10 +11,10 @@
  * catalog route pointed at a different protocol — is built by `createProvider`
  * over the protocol table below.
  *
- * Credentials never reach this module's storage: the harness resolves a route's
- * key through `ctx.credentials` before the request enters pi-ai and hands it
- * over as a stream option, which `Models` presents to `resolve()` as the
- * credential key.
+ * An explicit route key resolves through the Harness credential seam and
+ * reaches pi-ai as a request override. Native Codex OAuth instead resolves
+ * through the host-scoped pi-ai credential store installed on every immutable
+ * model collection; this module preserves both auth methods on the provider.
  *
  * @module dsh-llm-pi-ai/provider
  */
@@ -121,9 +121,9 @@ export interface ProviderSpec {
  * honouring the override), so an OAuth-only provider — `openai-codex` is the
  * one the installed catalog ships — would refuse a profile's explicit key with
  * `Provider is not configured` before any request went out. Adding the harness
- * method beside the provider's own restores that route. A keyless profile adds
- * nothing and still reports the honest refusal, because this adapter resolves
- * credentials through its own seam and holds no OAuth store to fall back on.
+ * method beside the provider's own restores that legacy route. A keyless
+ * profile adds nothing, so pi-ai uses the provider's OAuth method and shared
+ * credential store rather than an API-key fallback.
  * @param spec - the resolved route facts.
  * @param catalog - the installed catalog provider, when pi-ai ships one.
  * @returns the auth to construct this route's provider with.
