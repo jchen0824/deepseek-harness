@@ -61,7 +61,7 @@ export const inject = ['slots', 'locale', 'connection', 'remote']
 /**
  * Register the Models section once the `settings.section` declaration is on
  * the ledger, wire its store to the connection, and keep it fresh on every
- * pushed invalidation (settings, credentials, or provider topology).
+ * pushed invalidation (settings, credentials, provider topology, or OAuth state).
  * @param ctx - client root context.
  */
 export function apply(ctx: ClientContext): void {
@@ -110,6 +110,7 @@ export function apply(ctx: ClientContext): void {
       }),
       ctx.remote.$on('credentials/updated', refreshModels),
       ctx.remote.$on('llm/adapters-updated', refreshModels),
+      ctx.remote.$on('llm/oauth-connection-updated', refreshModels),
       ctx.on('connection/reset', refreshAll),
     ]
     return () => { for (const dispose of disposers) dispose() }

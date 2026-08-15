@@ -91,6 +91,7 @@ function scriptedFace(options: {
           settingsNs: 'llm-pi-ai',
           settingsPath: ['providers', provider],
           active: true,
+          auth: { kind: 'api-key' },
           declared: options.declaredRoutes?.includes(provider) ?? false,
         })),
       }))),
@@ -635,6 +636,7 @@ describe('provider rows', () => {
         settingsNs: 'llm-pi-ai',
         settingsPath: ['providers', 'openai'],
         active: true,
+        auth: { kind: 'api-key' },
       }],
     }))) as never
     const controller = new ModelsSettingsStore(scripted.face as unknown as WireFace)
@@ -796,6 +798,7 @@ describe('hand-declared providers', () => {
         settingsNs: 'llm-pi-ai',
         settingsPath: ['providers', 'acme-gateway'],
         active: true,
+        auth: { kind: 'api-key' },
         declared: true,
       }],
     })))

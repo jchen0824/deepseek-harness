@@ -12,10 +12,10 @@ function fail<T>(message: string): RpcResponse<T> {
 }
 
 const DIRECTORY = [
-  { provider: 'deepseek-official', displayName: 'DeepSeek', settingsNs: 'llm-deepseek', settingsPath: [], active: true },
-  { provider: 'openai', displayName: 'openai', settingsNs: 'llm-pi-ai', settingsPath: ['providers', 'openai'], active: true },
-  { provider: 'anthropic', displayName: 'anthropic', settingsNs: 'llm-pi-ai', settingsPath: ['providers', 'anthropic'], active: false },
-  { provider: 'ghost', displayName: 'Ghost', settingsNs: '', settingsPath: [], active: true },
+  { provider: 'deepseek-official', displayName: 'DeepSeek', settingsNs: 'llm-deepseek', settingsPath: [], active: true, auth: { kind: 'api-key' as const } },
+  { provider: 'openai', displayName: 'openai', settingsNs: 'llm-pi-ai', settingsPath: ['providers', 'openai'], active: true, auth: { kind: 'api-key' as const } },
+  { provider: 'anthropic', displayName: 'anthropic', settingsNs: 'llm-pi-ai', settingsPath: ['providers', 'anthropic'], active: false, auth: { kind: 'api-key' as const } },
+  { provider: 'ghost', displayName: 'Ghost', settingsNs: '', settingsPath: [], active: true, auth: { kind: 'native' as const } },
 ]
 
 const NAMESPACES = [
@@ -98,6 +98,44 @@ describe('ModelsSettingsStore', () => {
     expect(state.namespaces.get('llm-pi-ai')?.ns).toBe('llm-pi-ai')
   })
 
+  it('keeps OAuth authentication and redacted connection state out of credential lookup', async () => {
+    const { face, seenRefs } = api({
+      describeSettings: () => Promise.resolve(ok({
+        writable: true,
+        hasDocument: false,
+        namespaces: [{
+          ...NAMESPACES[1]!,
+          value: { providers: { 'openai-codex': {} } },
+          user: { providers: { 'openai-codex': {} } },
+        }],
+      } as never)),
+      providers: () => Promise.resolve(ok({
+        providers: [{
+          provider: 'openai-codex',
+          displayName: 'OpenAI Codex',
+          settingsNs: 'llm-pi-ai',
+          settingsPath: ['providers', 'openai-codex'],
+          active: false,
+          auth: { kind: 'oauth' },
+          connection: { provider: 'openai-codex', status: 'connecting' },
+        }],
+      } as never)),
+    })
+    const store = new ModelsSettingsStore(face)
+    await store.load()
+
+    expect(seenRefs).toEqual([])
+    expect(store.store.getSnapshot().rows[0]).toMatchObject({
+      configured: true,
+      apiKeyEnv: undefined,
+      credential: undefined,
+      entry: {
+        auth: { kind: 'oauth' },
+        connection: { provider: 'openai-codex', status: 'connecting' },
+      },
+    })
+  })
+
   it('degrades the credential badge, not the page, when the credential domain fails', async () => {
     const { face } = api({ describeCredentials: () => Promise.resolve(fail('no provider')) })
     const store = new ModelsSettingsStore(face)
@@ -122,7 +160,6 @@ describe('ModelsSettingsStore', () => {
 
   it('stringifies a non-Error credential transport rejection', async () => {
     const { face } = api({
-      // oxlint-disable-next-line typescript/prefer-promise-reject-errors -- the non-Error rejection is the scenario
       describeCredentials: () => Promise.reject('credential transport refusal'),
     })
     const store = new ModelsSettingsStore(face)
@@ -183,7 +220,7 @@ describe('edge joins', () => {
       })),
       providers: () => Promise.resolve(ok({
         providers: [
-          { provider: 'weird', displayName: 'weird', settingsNs: 'llm-pi-ai', settingsPath: ['providers', 'weird'], active: false },
+          { provider: 'weird', displayName: 'weird', settingsNs: 'llm-pi-ai', settingsPath: ['providers', 'weird'], active: false, auth: { kind: 'api-key' } },
         ] as never,
       })),
     })
@@ -203,7 +240,7 @@ describe('edge joins', () => {
       })),
       providers: () => Promise.resolve(ok({
         providers: [
-          { provider: 'anthropic', displayName: 'anthropic', settingsNs: 'llm-pi-ai', settingsPath: ['providers', 'anthropic'], active: false },
+          { provider: 'anthropic', displayName: 'anthropic', settingsNs: 'llm-pi-ai', settingsPath: ['providers', 'anthropic'], active: false, auth: { kind: 'api-key' } },
         ] as never,
       })),
     })
@@ -222,7 +259,6 @@ describe('edge joins', () => {
 
   it('stringifies a non-Error load failure', async () => {
     // The wire can surface non-Error throwables; the store must stringify them.
-    // oxlint-disable-next-line typescript/prefer-promise-reject-errors -- the non-Error rejection is the scenario
     const { face } = api({ providers: () => Promise.reject('plain refusal') })
     const store = new ModelsSettingsStore(face)
     await store.load()

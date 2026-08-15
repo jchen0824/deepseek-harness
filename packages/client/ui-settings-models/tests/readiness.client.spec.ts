@@ -14,6 +14,7 @@ function row(overrides: Partial<ProviderRow> = {}): ProviderRow {
       settingsNs: 'llm-deepseek',
       settingsPath: [],
       active: true,
+      auth: { kind: 'api-key' },
     },
     configured: true,
     removable: false,
@@ -32,6 +33,7 @@ function otherRow(overrides: Partial<ProviderRow> = {}): ProviderRow {
       settingsNs: 'llm-pi-ai',
       settingsPath: ['providers', 'hfai'],
       active: true,
+      auth: { kind: 'api-key' },
     },
     configured: true,
     removable: true,
@@ -61,8 +63,39 @@ describe('providerUsable', () => {
     expect(providerUsable(otherRow({ credential: undefined }))).toBe(false)
   })
 
-  it('treats a reference-free registered route as provider-native authentication', () => {
-    expect(providerUsable(otherRow({ apiKeyEnv: undefined, credential: undefined }))).toBe(true)
+  it('requires the authentication method to be ready before exposing an active route', () => {
+    expect(providerUsable(otherRow({
+      entry: { ...otherRow().entry, auth: { kind: 'api-key' } },
+      apiKeyEnv: undefined,
+      credential: undefined,
+    }))).toBe(false)
+    expect(providerUsable(otherRow({
+      entry: { ...otherRow().entry, auth: { kind: 'native' } },
+      apiKeyEnv: undefined,
+      credential: undefined,
+    }))).toBe(true)
+  })
+
+  it('requires a connected OAuth state or an explicitly configured legacy key', () => {
+    const oauth = (status: 'missing' | 'connecting' | 'connected' | 'reconnect-required') => otherRow({
+      entry: {
+        ...otherRow().entry,
+        provider: 'openai-codex',
+        auth: { kind: 'oauth' },
+        connection: { provider: 'openai-codex', status },
+      },
+      apiKeyEnv: undefined,
+      credential: undefined,
+    })
+    expect(providerUsable(oauth('missing'))).toBe(false)
+    expect(providerUsable(oauth('connecting'))).toBe(false)
+    expect(providerUsable(oauth('reconnect-required'))).toBe(false)
+    expect(providerUsable(oauth('connected'))).toBe(true)
+    expect(providerUsable({
+      ...oauth('missing'),
+      apiKeyEnv: 'OPENAI_CODEX_API_KEY',
+      credential: { configured: true, writable: true },
+    })).toBe(true)
   })
 })
 

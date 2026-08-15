@@ -190,19 +190,20 @@ export class ModelsSettingsStore {
 }
 
 /**
- * Whether a joined row can serve model requests as it stands: the route is
- * registered with the adapter registry, and whatever credential its resolved
- * profile names is stored. A profile naming no reference authenticates through
- * the provider's own path (the Bedrock chain, Vertex ADC, a gateway that needs
- * nothing), as does a live route with no settings address at all, so neither
- * owes this page a key.
+ * Whether a joined row can serve model requests as it stands. API-key routes
+ * require their named key, OAuth routes require a connected state unless an
+ * explicit legacy key remains configured, and native routes need only be live.
  * @param row - one joined provider row.
  * @returns whether the user already has this provider to talk to.
  */
 export function providerUsable(row: ProviderRow): boolean {
   if (!row.entry.active) return false
-  if (row.apiKeyEnv === undefined) return true
-  return row.credential?.configured === true
+  if (row.entry.auth.kind === 'oauth') {
+    return row.entry.connection?.status === 'connected'
+      || (row.apiKeyEnv !== undefined && row.credential?.configured === true)
+  }
+  if (row.entry.auth.kind === 'api-key') return row.credential?.configured === true
+  return true
 }
 
 /** First-run onboarding readiness derived only from the shared Models join. */
