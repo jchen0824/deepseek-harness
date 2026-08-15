@@ -16,7 +16,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
 import Loader from '@deepseek-ai/cordis-plugin-loader'
 import Include from '@deepseek-ai/cordis-plugin-include'
-import LlmRuntime from '@deepseek-ai/dsh-llm'
+import LlmRuntime, { ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import LocalCredentialProvider from '@deepseek-ai/dsh-credentials-local'
 import FileSettingsProvider from '@deepseek-ai/dsh-settings-file'
 import * as LlmPiAi from '@deepseek-ai/dsh-llm-pi-ai'
@@ -35,11 +35,26 @@ afterEach(async () => {
   vi.unstubAllEnvs()
 })
 
-/** Boot the dormant composition: a bare `llm-pi-ai` row with no config at all. */
-async function loadComposition(): Promise<{ ctx: Context; settingsPath: string }> {
+/** Options for the Loader composition fixture. */
+interface CompositionOptions {
+  /** Seed a saved OAuth connection before the base adapter row activates. */
+  savedOAuthBaseUrl?: string
+}
+
+/** Boot the base adapter composition through Loader, with an optional saved OAuth connection. */
+async function loadComposition(options: CompositionOptions = {}): Promise<{ ctx: Context; settingsPath: string }> {
   root = await mkdtemp(join(tmpdir(), 'dsh-pi-composition-'))
   const settingsPath = join(root, 'settings.yaml')
-  await writeFile(settingsPath, '# personal settings\n')
+  await writeFile(settingsPath, options.savedOAuthBaseUrl === undefined
+    ? '# personal settings\n'
+    : [
+      'llm-pi-ai:',
+      '  providers:',
+      '    openai-codex:',
+      '      api: openai-completions',
+      `      baseURL: ${options.savedOAuthBaseUrl}/v1`,
+      '',
+    ].join('\n'))
   await writeFile(join(root, '.credentials.yaml'), 'PI_COMPOSITION_KEY: key-from-store\n', { mode: 0o600 })
 
   const configPath = join(root, 'cordis.yml')
@@ -56,8 +71,15 @@ async function loadComposition(): Promise<{ ctx: Context; settingsPath: string }
     '  config:',
     `    path: ${JSON.stringify(join(root, '.credentials.yaml'))}`,
     '    debounceMs: 10',
+    ...options.savedOAuthBaseUrl === undefined
+      ? []
+      : [
+        '- id: saved-oauth',
+        "  name: 'test-saved-oauth'",
+      ],
     '- id: llm-pi-ai',
     "  name: '@deepseek-ai/dsh-llm-pi-ai'",
+    ...options.savedOAuthBaseUrl === undefined ? [] : ['  inject: [savedOAuthReady]'],
     '',
   ].join('\n'))
 
@@ -70,6 +92,20 @@ async function loadComposition(): Promise<{ ctx: Context; settingsPath: string }
     ['test-llm-service', LlmRuntime],
     ['@deepseek-ai/dsh-settings-file', FileSettingsProvider],
     ['@deepseek-ai/dsh-credentials-local', LocalCredentialProvider],
+    ['test-saved-oauth', {
+      name: 'test-saved-oauth',
+      inject: ['credentials'],
+      async apply(seedCtx: Context) {
+        const store = new LlmPiAi.OpenAICodexCredentialStore(() => seedCtx.credentials)
+        await store.modify('openai-codex', async () => ({
+          type: 'oauth',
+          access: 'ABCD-EFGH',
+          refresh: 'ABCD-EFGH',
+          expires: 4_102_444_800_000,
+        }))
+        return seedCtx.provide('savedOAuthReady' as never, true as never)
+      },
+    }],
     ['@deepseek-ai/dsh-llm-pi-ai', LlmPiAi],
   ])
   ctx.loader.internal = {
@@ -121,5 +157,31 @@ describe('llm-pi-ai real dormant composition', () => {
     const result = await assemble(ctx, { provider: 'deepseek', model: 'deepseek-v4-flash', messages: [] })
     expect(result.message.content).toEqual([{ type: 'text', text: 'hello' }])
     expect(server.headers[0]?.authorization).toBe('Bearer key-from-store')
+  })
+
+  it('uses a saved OAuth connection in the shared base route without starting headless login', async () => {
+    const server = await mockServer([{ events: textEvents }])
+    const { ctx } = await loadComposition({ savedOAuthBaseUrl: server.url })
+    const controller = ctx.llm.getOAuthController('openai-codex')
+    if (controller === undefined) throw new Error('expected Codex OAuth controller')
+    const start = vi.spyOn(controller, 'start')
+
+    await vi.waitFor(() => {
+      expect(ctx.llm.listProviders().map(provider => provider.id)).toContain('openai-codex')
+    })
+    await expect(controller.status()).resolves.toEqual({ provider: 'openai-codex', status: 'connected' })
+    await expect(ctx.llm.listModels('openai-codex')).resolves.toEqual(expect.arrayContaining([
+      expect.objectContaining({ provider: 'openai-codex', id: 'gpt-5.4' }),
+    ]))
+
+    const result = await assemble(ctx, {
+      provider: 'openai-codex',
+      model: 'gpt-5.4',
+      reasoningEffort: ReasoningEffortId('high'),
+      messages: [],
+    })
+    expect(result.message.content).toEqual([{ type: 'text', text: 'hello' }])
+    expect(server.paths).toEqual(['/v1/chat/completions'])
+    expect(start).not.toHaveBeenCalled()
   })
 })

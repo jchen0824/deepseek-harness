@@ -44,3 +44,5 @@ That reachability is incidental, not a guarantee — if it ever leaves the graph
 mirror the helper like the rest.
 
 Nothing mechanically enforces this rule; keep it in review.
+
+`openai-codex-oauth.e2e.ts` mounts the scaffold's deterministic Codex device-code controller around the real pi-ai catalog. Its completion barrier first emits the redacted OAuth connection event while the route is still absent, lets the browser prove that event refreshed the Models card, and only then registers the route for the normal Host model picker, default, and per-session selection checks. The scenario is keyless and its only device code is `ABCD-EFGH` at a fixed verification URL.

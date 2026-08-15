@@ -18,18 +18,19 @@
     - img
     - text: 关闭
   - heading "模型" [level=2]
-  - paragraph: 填入各提供方的 API 密钥即可使用其模型。
+  - paragraph: 连接帐号或填入各提供方的 API 密钥，即可使用其模型。
   - list:
+    - listitem:
+      - text: openai-codex
+      - button "连接 ChatGPT"
     - listitem:
       - text: DeepSeek
       - img "API 密钥缺失"
       - button "编辑 DeepSeek (deepseek-official)": 编辑
   - text: 提供方
   - combobox "提供方":
-    - option "amazon-bedrock"
     - option "ant-ling"
     - option "anthropic"
-    - option "azure-openai-responses"
     - option "cerebras"
     - option "cloudflare-ai-gateway"
     - option "cloudflare-workers-ai"
@@ -37,7 +38,6 @@
     - option "fireworks"
     - option "github-copilot"
     - option "google"
-    - option "google-vertex"
     - option "groq"
     - option "huggingface"
     - option "kimi-coding"

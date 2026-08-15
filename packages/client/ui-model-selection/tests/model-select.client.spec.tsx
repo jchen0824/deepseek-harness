@@ -112,6 +112,49 @@ describe('ModelSelect reasoning effort', () => {
       .toEqual(['Default', 'Standard'])
   })
 
+  it('selects a server-advertised Codex model and reasoning effort through the normal seat', async () => {
+    const groups = [
+      ...state().groups,
+      {
+        id: 'openai-codex',
+        name: 'OpenAI Codex',
+        models: [{ id: 'gpt-5.4', name: 'GPT-5.4', reasoning }],
+      },
+    ]
+    const directory = createSnapshotStore<ModelDirectoryState>(state({ groups }))
+    const select = vi.fn(async (selection: ModelSelection) => {
+      directory.set(state({ groups, current: selection }))
+      return true
+    })
+    render(<ModelSelect
+      locked={false}
+      available
+      directory={directory}
+      load={vi.fn()}
+      select={select}
+      t={t}
+    />)
+
+    const trigger = screen.getByRole('button', { name: /^选择模型/ })
+    fireEvent.click(trigger)
+    fireEvent.click(screen.getByRole('menuitem', { name: /模型/ }))
+    fireEvent.click(screen.getByRole('menuitemradio', { name: 'GPT-5.4' }))
+    await waitFor(() => {
+      expect(trigger.getAttribute('aria-label')).toBe('选择模型，当前 GPT-5.4，推理等级 High')
+    })
+
+    fireEvent.click(trigger)
+    fireEvent.click(screen.getByRole('menuitem', { name: /推理等级/ }))
+    fireEvent.click(screen.getByRole('menuitemradio', { name: /Max/ }))
+    await waitFor(() => {
+      expect(select).toHaveBeenLastCalledWith({
+        provider: 'openai-codex',
+        model: 'gpt-5.4',
+        reasoningEffort: 'max',
+      })
+    })
+  })
+
   it('prompts for a selection when the current model is no longer advertised', () => {
     const directory = createSnapshotStore(state({
       current: { provider: 'deepseek-official', model: 'removed-model' },

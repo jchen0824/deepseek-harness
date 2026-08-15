@@ -15,6 +15,8 @@ import type {
   LlmResolvedModelInfo, StreamChunk,
   UserMessage,
 } from '@deepseek-ai/dsh-llm'
+import { PiAiAdapter } from '@deepseek-ai/dsh-llm-pi-ai'
+import { resolveProfiles } from '../../../llm/llm-pi-ai/src/config.ts'
 import SessionStore from '@deepseek-ai/dsh-session'
 import type { SessionId } from '@deepseek-ai/dsh-session'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
@@ -446,6 +448,90 @@ describe('Web session model selection', () => {
     expect(stillAccepted.selected).toEqual({ provider: 'deepseek-official', model: 'deepseek-chat', reasoningEffort: 'high' })
     expect(expectValue(await api.sessions.models(request({ sessionId }))).current)
       .toEqual({ provider: 'deepseek-official', model: 'deepseek-chat', reasoningEffort: 'high' })
+    await ctx.fiber.dispose()
+  })
+
+  it('offers Codex only while its OAuth-backed route is registered and keeps selection scopes intact', async () => {
+    const { ctx, sessionId } = await harness()
+    const logged = ctx.sessions.create()
+    logged.append('request/header', {
+      header: { config: { provider: 'deepseek-official', model: 'deepseek-reasoner' } },
+      reason: 'initial',
+    })
+    ctx.agents.register({
+      id: logged.id,
+      session: logged,
+      status: 'running',
+      ctx,
+      inbox: { nextTurn: [], nextStep: [] },
+    } as unknown as Agent)
+    let stored = { provider: 'deepseek-official', model: 'deepseek-chat' }
+    const saved: unknown[] = []
+    const api = createApiProxy(ctx, {
+      defaultModelSelection: () => stored,
+      saveDefaultModelSelection: (selection) => {
+        stored = selection
+        saved.push(selection)
+        return Promise.resolve()
+      },
+      cwd: '/tmp',
+    })
+
+    expect(expectValue(await api.sessions.models(request({ sessionId }))).groups)
+      .not.toEqual(expect.arrayContaining([expect.objectContaining({ id: 'openai-codex' })]))
+    expect((await api.sessions.selectModel(request({
+      sessionId, provider: 'openai-codex', model: 'gpt-5.4', reasoningEffort: 'high',
+    }))).result).toMatchObject({ ok: false, error: { code: 'model-unavailable' } })
+
+    const profiles = resolveProfiles({ 'openai-codex': {} })
+    const connectedRoute = ctx.llm.registerAdapter(['openai-codex'], new PiAiAdapter({
+      profiles: () => profiles,
+      resolveApiKey: () => Promise.resolve(undefined),
+    }))
+    const catalog = expectValue(await api.sessions.models(request({ sessionId })))
+    expect(catalog.groups).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        id: 'openai-codex',
+        models: expect.arrayContaining([
+          expect.objectContaining({
+            id: 'gpt-5.4',
+            reasoning: expect.objectContaining({
+              efforts: expect.arrayContaining([expect.objectContaining({ id: 'high' })]),
+            }),
+          }),
+        ]),
+      }),
+    ]))
+
+    expectValue(await api.sessions.selectModel(request({
+      sessionId,
+      provider: 'openai-codex',
+      model: 'gpt-5.4',
+      reasoningEffort: 'high',
+    })))
+    expect(saved).toEqual([{ provider: 'openai-codex', model: 'gpt-5.4', reasoningEffort: 'high' }])
+    expect(expectValue(await api.sessions.models(request({ sessionId }))).current)
+      .toEqual({ provider: 'openai-codex', model: 'gpt-5.4', reasoningEffort: 'high' })
+    expect(expectValue(await api.sessions.models(request({ sessionId: logged.id }))).current)
+      .toEqual({ provider: 'deepseek-official', model: 'deepseek-reasoner' })
+
+    const blank = ctx.sessions.create()
+    ctx.agents.register({
+      id: blank.id,
+      session: blank,
+      status: 'running',
+      ctx,
+      inbox: { nextTurn: [], nextStep: [] },
+    } as unknown as Agent)
+    expect(expectValue(await api.sessions.models(request({ sessionId: blank.id }))).current)
+      .toEqual({ provider: 'openai-codex', model: 'gpt-5.4', reasoningEffort: 'high' })
+
+    connectedRoute()
+    expect(expectValue(await api.sessions.models(request({ sessionId }))).groups)
+      .not.toEqual(expect.arrayContaining([expect.objectContaining({ id: 'openai-codex' })]))
+    expect((await api.sessions.selectModel(request({
+      sessionId, provider: 'openai-codex', model: 'gpt-5.4', reasoningEffort: 'high',
+    }))).result).toMatchObject({ ok: false, error: { code: 'model-unavailable' } })
     await ctx.fiber.dispose()
   })
 
