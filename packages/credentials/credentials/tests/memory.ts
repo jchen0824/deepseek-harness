@@ -1,6 +1,6 @@
 import type { Context } from '@deepseek-ai/cordis'
 import { CredentialProvider } from '../src/index.ts'
-import type { CredentialInfo, CredentialRef, ResolvedCredential } from '../src/index.ts'
+import type { CredentialInfo, CredentialMutation, CredentialRef, ResolvedCredential } from '../src/index.ts'
 
 /**
  * In-memory credentials provider for interface and consumer tests: one
@@ -35,15 +35,27 @@ export class MemoryCredentials extends CredentialProvider {
     if (value.length === 0) {
       return Promise.reject(new Error('memory credentials: an empty value cannot be stored; use unset'))
     }
-    this.store.set(ref, value)
-    this.ctx.emit('credentials/updated', ref)
-    return Promise.resolve()
+    return this.modify(ref, async () => ({ value, result: undefined, visibility: 'public' }))
   }
 
   override unset(ref: CredentialRef): Promise<void> {
-    if (this.store.delete(ref)) {
-      this.ctx.emit('credentials/updated', ref)
+    return this.modify(ref, async () => ({ value: undefined, result: undefined, visibility: 'public' }))
+  }
+
+  override async modify<T>(
+    ref: CredentialRef,
+    mutate: (current: string | undefined) => Promise<CredentialMutation<T>>,
+  ): Promise<T> {
+    const before = this.store.get(ref)
+    const mutation = await mutate(before)
+    if (mutation.value === '') {
+      throw new Error('memory credentials: an empty value cannot be stored; use undefined')
     }
-    return Promise.resolve()
+    if (before !== mutation.value) {
+      if (mutation.value === undefined) this.store.delete(ref)
+      else this.store.set(ref, mutation.value)
+      if (mutation.visibility === 'public') this.ctx.emit('credentials/updated', ref)
+    }
+    return mutation.result
   }
 }

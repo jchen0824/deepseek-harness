@@ -12,6 +12,24 @@ import type { Branded } from '@deepseek-ai/dsh-brand'
 /** Nominal reference to one credential: a POSIX-style environment-variable name. */
 export type CredentialRef = Branded<'CredentialRef'>
 
+/** Whether a mutation may announce its committed value change to consumers. */
+export type CredentialMutationVisibility = 'public' | 'private'
+
+/**
+ * Host-side result of atomically changing a provider-managed credential.
+ * Private mutations keep their reference and stored value in host code; do
+ * not expose them through a browser-facing RPC.
+ * @typeParam T - caller-defined result returned after the mutation commits.
+ */
+export interface CredentialMutation<T> {
+  /** Next stored value, or `undefined` to remove the reference. */
+  value: string | undefined
+  /** Caller-defined result returned after a successful commit. */
+  result: T
+  /** Whether a changed stored value emits `credentials/updated`. */
+  visibility: CredentialMutationVisibility
+}
+
 declare module '@deepseek-ai/cordis' {
   interface Events {
     /**

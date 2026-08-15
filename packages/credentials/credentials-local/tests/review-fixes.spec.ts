@@ -73,6 +73,43 @@ describe('read-modify-write', () => {
     expect(await third.credentials.resolve(BETA)).toEqual({ value: '3', source: 'file' })
   })
 
+  it('holds the shared writer lock through a mutation callback', async () => {
+    const dir = await tempDir()
+    const path = join(dir, '.credentials.yaml')
+    const first = await boot({ path, watch: false })
+    const second = await boot({ path, watch: false })
+    const firstEvents: string[] = []
+    first.on('credentials/updated', (ref) => { firstEvents.push(ref) })
+    let callbackStarted!: () => void
+    const started = new Promise<void>((resolve) => { callbackStarted = resolve })
+    let release!: () => void
+    const held = new Promise<void>((resolve) => { release = resolve })
+
+    const pending = first.credentials.modify(ALPHA, async (current) => {
+      expect(current).toBeUndefined()
+      callbackStarted()
+      await held
+      return { value: 'first', result: undefined, visibility: 'public' as const }
+    })
+    await started
+    let secondCurrent: string | undefined
+    let secondCallbackStarted = false
+    const after = second.credentials.modify(ALPHA, async (current) => {
+      secondCallbackStarted = true
+      secondCurrent = current
+      return { value: 'second', result: undefined, visibility: 'private' as const }
+    })
+    await new Promise(resolve => setTimeout(resolve, 20))
+    expect(secondCallbackStarted).toBe(false)
+    release()
+    await Promise.all([pending, after])
+
+    expect(secondCurrent).toBe('first')
+    expect(firstEvents).toEqual([ALPHA])
+    const reread = await boot({ path, watch: false })
+    expect(await reread.credentials.resolve(ALPHA)).toEqual({ value: 'second', source: 'file' })
+  })
+
   it('creates the credentials directory owner-only', async () => {
     const dir = await tempDir()
     const home = join(dir, 'home')

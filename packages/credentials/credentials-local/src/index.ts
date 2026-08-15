@@ -45,7 +45,7 @@ import { withFileLock, writeFileAtomic } from '@deepseek-ai/dsh-atomic-write'
 import { canonicalizeWatchPath, resolveDshHome } from '@deepseek-ai/dsh-home-paths'
 import { launchEnvironmentOf } from '@deepseek-ai/dsh-launch-environment'
 import { CredentialProvider, credentialRef } from '@deepseek-ai/dsh-credentials'
-import type { CredentialInfo, CredentialRef, ResolvedCredential } from '@deepseek-ai/dsh-credentials'
+import type { CredentialInfo, CredentialMutation, CredentialRef, ResolvedCredential } from '@deepseek-ai/dsh-credentials'
 import type { LaunchEnvironmentEntry } from '@deepseek-ai/dsh-launch-environment'
 
 /** Basename of the credentials document inside the harness home. */
@@ -334,11 +334,11 @@ export class LocalCredentialProvider extends CredentialProvider {
     if (value.length === 0) {
       throw new Error(`credentials-local: an empty value cannot be stored for "${ref}"; use unset`)
     }
-    await this.write(ref, value)
+    await this.mutate(ref, async () => ({ value, result: undefined, visibility: 'public' }), 'set')
   }
 
   override async unset(ref: CredentialRef): Promise<void> {
-    await this.write(ref, undefined)
+    await this.mutate(ref, async () => ({ value: undefined, result: undefined, visibility: 'public' }), 'unset')
   }
 
   /* jscpd:ignore-start -- the operation-chain and reload lifecycle is the same
@@ -365,9 +365,12 @@ export class LocalCredentialProvider extends CredentialProvider {
   }
   /* jscpd:ignore-end */
 
-  /** Queue one line edit; entry checks reject early, the queue re-judges them at run time. */
-  private async write(ref: CredentialRef, value: string | undefined): Promise<void> {
-    const verb = value === undefined ? 'unset' : 'set'
+  /** Atomically read, change, and commit one stored credential under the shared writer lock. */
+  private async mutate<T>(
+    ref: CredentialRef,
+    mutate: (current: string | undefined) => Promise<CredentialMutation<T>>,
+    verb: 'set' | 'unset' | 'modify',
+  ): Promise<T> {
     if (this.isClosed()) {
       throw new Error(`credentials-local is disposed: cannot ${verb} "${ref}"`)
     }
@@ -381,25 +384,45 @@ export class LocalCredentialProvider extends CredentialProvider {
       // The writer lock's exclusive create needs the parent to exist; 0700
       // because the harness home holds user-private data.
       await mkdir(dirname(this.spec.filename), { recursive: true, mode: 0o700 })
-      await withFileLock(this.spec.filename, async () => {
+      return withFileLock(this.spec.filename, async () => {
         // Read-modify-write: fold in any on-disk state this process has not
         // observed yet — an external edit still inside the watcher debounce
         // window, a change the watcher missed, or another process's write —
         // so the line edit below can never resurrect a stale document.
         await this.reconcileFromDisk()
-        const existing = this.values.get(ref)
-        if (value === undefined && existing === undefined) return
-        const nextText = renderDocument(this.text, ref, value)
-        // 0600: a document holding secrets is never world-readable.
-        await writeFileAtomic(this.spec.filename, nextText, { mode: 0o600, dirMode: 0o700 })
-        this.text = nextText
-        if (value === undefined) this.values.delete(ref)
-        else this.values.set(ref, value)
-        // After the commit: a broken observer must never make the durable
-        // write look failed (an INVARIANT failure still rethrows).
-        this.notifyUpdated(ref)
+        this.assertUnshadowed(ref, verb)
+        const before = this.values.get(ref)
+        // The file lock deliberately stays held across this async callback:
+        // its read-derived replacement must serialize with every process that
+        // writes this document.
+        const mutation = await mutate(before)
+        if (mutation.value === '') {
+          throw new Error(`credentials-local: an empty value cannot be stored for "${ref}"; use unset`)
+        }
+        await this.commitMutation(ref, mutation.value)
+        if (mutation.visibility === 'public' && before !== mutation.value) this.notifyUpdated(ref)
+        return mutation.result
       })
     })
+  }
+
+  /** Expose one host-only atomic mutation through the credential service. */
+  override modify<T>(
+    ref: CredentialRef,
+    mutate: (current: string | undefined) => Promise<CredentialMutation<T>>,
+  ): Promise<T> {
+    return this.mutate(ref, mutate, 'modify')
+  }
+
+  /** Persist a changed stored value and refresh the local snapshot; equal values are a no-op. */
+  private async commitMutation(ref: CredentialRef, value: string | undefined): Promise<void> {
+    if (this.values.get(ref) === value) return
+    const nextText = renderDocument(this.text, ref, value)
+    // 0600: a document holding secrets is never world-readable.
+    await writeFileAtomic(this.spec.filename, nextText, { mode: 0o600, dirMode: 0o700 })
+    this.text = nextText
+    if (value === undefined) this.values.delete(ref)
+    else this.values.set(ref, value)
   }
 
   /**
@@ -407,7 +430,7 @@ export class LocalCredentialProvider extends CredentialProvider {
    * no-effect. Only that layer can shadow a write: everything else this
    * provider resolves ranks below the document being written.
    */
-  private assertUnshadowed(ref: CredentialRef, verb: 'set' | 'unset'): void {
+  private assertUnshadowed(ref: CredentialRef, verb: 'set' | 'unset' | 'modify'): void {
     if (this.inherited(ref) !== undefined) {
       throw new Error(
         `credentials-local: "${ref}" is supplied read-only by the launching environment, so ${verb} would be`

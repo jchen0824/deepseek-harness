@@ -9,9 +9,9 @@
  */
 
 import { Context, Service } from '@deepseek-ai/cordis'
-import type { CredentialRef } from './types.ts'
+import type { CredentialMutation, CredentialRef } from './types.ts'
 
-export type { CredentialRef } from './types.ts'
+export type { CredentialMutation, CredentialMutationVisibility, CredentialRef } from './types.ts'
 
 const REF_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/
 
@@ -97,6 +97,21 @@ export abstract class CredentialProvider extends Service {
    * @param ref - the reference to remove.
    */
   abstract unset(ref: CredentialRef): Promise<void>
+
+  /**
+   * Atomically read and change one provider-managed stored value. The callback
+   * receives only that stored value, never an inherited environment value.
+   * Callers must keep private references and mutations in host code; this
+   * operation is not a browser-facing credential RPC.
+   * @typeParam T - caller-defined result returned after the mutation commits.
+   * @param ref - the host-only reference to change.
+   * @param mutate - derives the next stored value and caller result from the current stored value.
+   * @returns the mutation result after its value commits.
+   */
+  abstract modify<T>(
+    ref: CredentialRef,
+    mutate: (current: string | undefined) => Promise<CredentialMutation<T>>,
+  ): Promise<T>
 
   /* jscpd:ignore-start -- deliberate symmetry with the settings seam's commit
      fan-out: the contained-dispatch shape is the reviewed listener-lifecycle
