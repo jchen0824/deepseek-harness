@@ -281,6 +281,35 @@ function fakeApi(overrides: Partial<{ muxFrames: MuxFrame[]; hostFrames: HostFra
       async discoverModels(request) {
         return { rpcId: request.rpcId, result: { ok: true, value: { models: [] } } }
       },
+      async oauthStart(request) {
+        return {
+          rpcId: request.rpcId,
+          result: {
+            ok: true,
+            value: {
+              connection: { provider: request.payload.provider, status: 'connecting' as const },
+              start: {
+                kind: 'device-code' as const,
+                deviceCode: {
+                  verificationUri: 'https://auth.openai.com/codex/device',
+                  userCode: 'ABCD-EFGH',
+                  intervalSeconds: 5,
+                  expiresInSeconds: 900,
+                },
+              },
+            },
+          },
+        }
+      },
+      async oauthStatus(request) {
+        return { rpcId: request.rpcId, result: { ok: true, value: { connection: { provider: request.payload.provider, status: 'connecting' as const } } } }
+      },
+      async oauthCancel(request) {
+        return { rpcId: request.rpcId, result: { ok: true, value: { connection: { provider: request.payload.provider, status: 'missing' as const } } } }
+      },
+      async oauthDisconnect(request) {
+        return { rpcId: request.rpcId, result: { ok: true, value: { connection: { provider: request.payload.provider, status: 'missing' as const } } } }
+      },
     },
     events: {
       mux: (_request, signal) => stream(muxFrames, signal),
@@ -322,6 +351,31 @@ describe('unary round trip (handler ⇄ client, no network)', () => {
         { asOfSeq: 9, values: { todos: [{ content: 'current', status: 'in_progress' }] } },
       )
     }
+  })
+
+  it('round-trips the exact redacted OAuth lifecycle carrier fields', async () => {
+    const c = client()
+    expect((await c.llm.oauthStart({ provider: 'openai-codex' })).result).toEqual({
+      ok: true,
+      value: {
+        connection: { provider: 'openai-codex', status: 'connecting' },
+        start: {
+          kind: 'device-code',
+          deviceCode: {
+            verificationUri: 'https://auth.openai.com/codex/device',
+            userCode: 'ABCD-EFGH',
+            intervalSeconds: 5,
+            expiresInSeconds: 900,
+          },
+        },
+      },
+    })
+    expect((await c.llm.oauthStatus({ provider: 'openai-codex' })).result)
+      .toEqual({ ok: true, value: { connection: { provider: 'openai-codex', status: 'connecting' } } })
+    expect((await c.llm.oauthCancel({ provider: 'openai-codex' })).result)
+      .toEqual({ ok: true, value: { connection: { provider: 'openai-codex', status: 'missing' } } })
+    expect((await c.llm.oauthDisconnect({ provider: 'openai-codex' })).result)
+      .toEqual({ ok: true, value: { connection: { provider: 'openai-codex', status: 'missing' } } })
   })
 
   it('carries a business error as 200 + error result', async () => {

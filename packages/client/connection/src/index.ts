@@ -80,7 +80,9 @@ export const Config: z<ConnectionConfig> = z.object({
  * carries a draft credential, and it makes the HOST issue a GET to a URL the
  * caller chose and reports back the status or the parsed body — an anonymous
  * LAN caller would have a probe for whatever the host can reach and the
- * browser cannot.
+ * browser cannot. The OAuth lifecycle belongs there too: start, cancel, and
+ * disconnect mutate durable OAuth state, while status follows the same policy
+ * so an anonymous LAN caller cannot probe configured OAuth connections.
  *
  * The model catalog (`llm.providers`, `llm.models`) is deliberately NOT here:
  * it carries provider ids, display names, and model lists — no endpoints,
@@ -116,6 +118,10 @@ const PRIVILEGED_METHODS = new Set([
   'credentials.set',
   'credentials.unset',
   'llm.discoverModels',
+  'llm.oauthStart',
+  'llm.oauthStatus',
+  'llm.oauthCancel',
+  'llm.oauthDisconnect',
 ])
 
 /**

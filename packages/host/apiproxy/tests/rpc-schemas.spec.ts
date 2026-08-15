@@ -37,6 +37,15 @@ import { approvalRequestIdSchema, approvalResponsePayloadSchema } from '../src/a
 import { askUserQuestionAnswerSchema, questionResponsePayloadSchema } from '../src/api/questions.schema.ts'
 import { goalEditRequestSchema } from '../src/api/goals.schema.ts'
 import { subagentPromptRequestSchema } from '../src/api/subagents.schema.ts'
+import {
+  configurableProviderViewSchema,
+  llmOAuthCancelRequestSchema,
+  llmOAuthConnectionValueSchema,
+  llmOAuthDisconnectRequestSchema,
+  llmOAuthStartRequestSchema,
+  llmOAuthStartValueSchema,
+  llmOAuthStatusRequestSchema,
+} from '../src/api/llm.schema.ts'
 
 describe('RpcId', () => {
   it('brands a raw string at zero runtime cost', () => {
@@ -436,6 +445,96 @@ describe('goals domain schemas', () => {
   })
 })
 
+describe('llm OAuth schemas', () => {
+  it('keeps provider snapshots and lifecycle results on the redacted public fields', () => {
+    const connection = {
+      provider: 'openai-codex', status: 'connecting', access: 'private-access',
+      refresh: 'private-refresh', accountId: 'acct-private', leaseRef: 'OPENAI_CODEX_OAUTH',
+    }
+    expect(configurableProviderViewSchema.parse({
+      provider: 'openai-codex',
+      displayName: 'OpenAI Codex',
+      settingsNs: 'llm-pi-ai',
+      settingsPath: ['providers', 'openai-codex'],
+      auth: { kind: 'oauth', apiKey: 'forbidden' },
+      active: false,
+      connection,
+      deviceCode: { userCode: 'must-not-ride-a-snapshot' },
+    })).toEqual({
+      provider: 'openai-codex',
+      displayName: 'OpenAI Codex',
+      settingsNs: 'llm-pi-ai',
+      settingsPath: ['providers', 'openai-codex'],
+      auth: { kind: 'oauth' },
+      active: false,
+      connection: { provider: 'openai-codex', status: 'connecting' },
+    })
+    expect(llmOAuthStartValueSchema.parse({
+      connection,
+      start: {
+        kind: 'device-code',
+        connection,
+        deviceCode: {
+          verificationUri: 'https://auth.openai.com/codex/device',
+          userCode: 'ABCD-EFGH',
+          intervalSeconds: 5,
+          expiresInSeconds: 900,
+          access: 'private-access',
+        },
+        error: 'provider error',
+      },
+      accountId: 'acct-private',
+    })).toEqual({
+      connection: { provider: 'openai-codex', status: 'connecting' },
+      start: {
+        kind: 'device-code',
+        deviceCode: {
+          verificationUri: 'https://auth.openai.com/codex/device',
+          userCode: 'ABCD-EFGH',
+          intervalSeconds: 5,
+          expiresInSeconds: 900,
+        },
+      },
+    })
+    expect(llmOAuthConnectionValueSchema.parse({ connection })).toEqual({
+      connection: { provider: 'openai-codex', status: 'connecting' },
+    })
+  })
+
+  it('bounds device-code fields and exposes only a provider request', () => {
+    for (const schema of [
+      llmOAuthStartRequestSchema,
+      llmOAuthStatusRequestSchema,
+      llmOAuthCancelRequestSchema,
+      llmOAuthDisconnectRequestSchema,
+    ]) {
+      expect(schema.parse({ provider: 'openai-codex', apiKey: 'forbidden', access: 'private-access' }))
+        .toEqual({ provider: 'openai-codex' })
+      expect(() => schema.parse({ provider: '' })).toThrow()
+    }
+    expect(() => llmOAuthStartValueSchema.parse({
+      connection: { provider: 'openai-codex', status: 'connecting' },
+      start: { kind: 'device-code', deviceCode: { verificationUri: 'not-a-url', userCode: 'ABCD-EFGH' } },
+    })).toThrow()
+    expect(() => llmOAuthStartValueSchema.parse({
+      connection: { provider: 'openai-codex', status: 'connecting' },
+      start: {
+        kind: 'device-code',
+        deviceCode: { verificationUri: 'https://example.test/device', userCode: 'X'.repeat(257) },
+      },
+    })).toThrow()
+    for (const field of ['intervalSeconds', 'expiresInSeconds'] as const) {
+      expect(() => llmOAuthStartValueSchema.parse({
+        connection: { provider: 'openai-codex', status: 'connecting' },
+        start: {
+          kind: 'device-code',
+          deviceCode: { verificationUri: 'https://example.test/device', userCode: 'ABCD', [field]: 0 },
+        },
+      })).toThrow()
+    }
+  })
+})
+
 describe('events frame schemas', () => {
   it('accepts every mux frame branch', () => {
     const frames = [
@@ -526,6 +625,7 @@ describe('events frame schemas', () => {
       { type: 'host/remote-event', event: 'settings/document-updated', args: ['ns', 3] },
       { type: 'host/remote-event', event: 'agent-preset/selected', args: ['s', 'minimal'] },
       { type: 'host/remote-event', event: 'llm/adapters-updated', args: [] },
+      { type: 'host/remote-event', event: 'llm/oauth-connection-updated', args: [{ provider: 'openai-codex', status: 'connected' }] },
       { type: 'stream/error', error: { code: 'internal', message: 'm', details: {} } },
     ]
     for (const frame of frames) expect(hostFrameSchema.parse(frame)).toMatchObject({ type: frame.type })

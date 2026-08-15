@@ -74,6 +74,10 @@ export interface RpcMethodMap {
   'llm.providers': LlmApi['providers']
   'llm.models': LlmApi['models']
   'llm.discoverModels': LlmApi['discoverModels']
+  'llm.oauthStart': LlmApi['oauthStart']
+  'llm.oauthStatus': LlmApi['oauthStatus']
+  'llm.oauthCancel': LlmApi['oauthCancel']
+  'llm.oauthDisconnect': LlmApi['oauthDisconnect']
 }
 
 /** Business request payload of method K (reaches through the RpcRequest narrow form to payload). */

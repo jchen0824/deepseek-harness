@@ -10,6 +10,28 @@
 
 import type { RpcRequest, RpcResponse } from './rpc.ts'
 import type { ModelCatalogFailure, ModelProviderGroup } from './sessions.ts'
+import type {
+  LlmOAuthConnection,
+  LlmOAuthDeviceCode,
+  LlmProviderAuth,
+} from '@deepseek-ai/dsh-llm/types'
+
+/** Redacted public OAuth connection state. */
+export type OAuthConnectionView = LlmOAuthConnection
+
+/** Ephemeral start result, excluding the controller's duplicate connection field. */
+export type OAuthStartActionView =
+  | { kind: 'device-code'; deviceCode: LlmOAuthDeviceCode }
+  | { kind: 'already-connecting' }
+  | { kind: 'connected' }
+
+/** Direct OAuth start response with ephemeral device instructions. */
+export interface OAuthStartView {
+  /** Authoritative connection state returned by the controller. */
+  connection: OAuthConnectionView
+  /** Start outcome; device instructions appear only on this direct response. */
+  start: OAuthStartActionView
+}
 
 /** Wire view of one configurable provider. */
 export interface ConfigurableProviderView {
@@ -23,6 +45,10 @@ export interface ConfigurableProviderView {
   settingsPath: string[]
   /** Whether the route is currently registered (its models are requestable). */
   active: boolean
+  /** Authentication method the provider exposes to configuration surfaces. */
+  auth: LlmProviderAuth
+  /** Current redacted OAuth state, when an OAuth controller is registered. */
+  connection?: OAuthConnectionView
   /**
    * Whether the owning adapter knows this route only because configuration
    * declared it. Absent when the adapter draws no such distinction, so a
@@ -74,6 +100,18 @@ export interface LlmApi {
     }>,
     signal?: AbortSignal,
   ): Promise<RpcResponse<{ models: DiscoveredModelView[] }>>
+
+  /** Start or resume the configured OAuth provider's connection lifecycle. */
+  oauthStart(request: RpcRequest<{ provider: string }>): Promise<RpcResponse<OAuthStartView>>
+
+  /** Read the configured OAuth provider's current redacted connection state. */
+  oauthStatus(request: RpcRequest<{ provider: string }>): Promise<RpcResponse<{ connection: OAuthConnectionView }>>
+
+  /** Cancel the configured OAuth provider's in-progress connection attempt. */
+  oauthCancel(request: RpcRequest<{ provider: string }>): Promise<RpcResponse<{ connection: OAuthConnectionView }>>
+
+  /** Remove the configured OAuth provider's saved connection. */
+  oauthDisconnect(request: RpcRequest<{ provider: string }>): Promise<RpcResponse<{ connection: OAuthConnectionView }>>
 }
 
 /** Wire view of one model an interrogated endpoint advertises. */

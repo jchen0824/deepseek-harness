@@ -1944,6 +1944,8 @@ function createFixtureWorld(options: FixtureOptions): FixtureWorld {
   const retryScenarios = new Map<SessionId, { turn: number; stepStarted: boolean }>()
   /** The single opt-in browser stress producer; normal fixture journeys never start it. */
   let activeReasoningChunkStorm: ReasoningChunkStormState | null = null
+  /** Redacted fixture state for the one OAuth provider route. */
+  let openaiCodexConnection: 'missing' | 'connecting' | 'connected' | 'reconnect-required' = 'missing'
 
   // Timing-acceptance hooks (browser test backdoor): the in-memory fixture is
   // ideally timed. These let
@@ -2946,12 +2948,13 @@ function createFixtureWorld(options: FixtureOptions): FixtureWorld {
     llm: {
       providers: request => ok(request, {
         providers: [
-          { provider: 'deepseek-official', displayName: 'DeepSeek', settingsNs: 'llm-deepseek', settingsPath: [], active: true },
-          { provider: 'openai', displayName: 'openai', settingsNs: 'llm-pi-ai', settingsPath: ['providers', 'openai'], active: true, declared: false },
-          { provider: 'anthropic', displayName: 'anthropic', settingsNs: 'llm-pi-ai', settingsPath: ['providers', 'anthropic'], active: false, declared: false },
+          { provider: 'deepseek-official', displayName: 'DeepSeek', settingsNs: 'llm-deepseek', settingsPath: [], active: true, auth: { kind: 'api-key' } },
+          { provider: 'openai', displayName: 'openai', settingsNs: 'llm-pi-ai', settingsPath: ['providers', 'openai'], active: true, auth: { kind: 'api-key' }, declared: false },
+          { provider: 'openai-codex', displayName: 'OpenAI Codex', settingsNs: 'llm-pi-ai', settingsPath: ['providers', 'openai-codex'], active: openaiCodexConnection === 'connected', auth: { kind: 'oauth' }, connection: { provider: 'openai-codex', status: openaiCodexConnection }, declared: false },
+          { provider: 'anthropic', displayName: 'anthropic', settingsNs: 'llm-pi-ai', settingsPath: ['providers', 'anthropic'], active: false, auth: { kind: 'api-key' }, declared: false },
           // One hand-declared route, so a surface reading this fixture meets
           // the tagged shape rather than only the shipped one.
-          { provider: 'acme-gateway', displayName: 'Acme Gateway', settingsNs: 'llm-pi-ai', settingsPath: ['providers', 'acme-gateway'], active: true, declared: true },
+          { provider: 'acme-gateway', displayName: 'Acme Gateway', settingsNs: 'llm-pi-ai', settingsPath: ['providers', 'acme-gateway'], active: true, auth: { kind: 'api-key' }, declared: true },
         ],
       }),
       models: request => ok(request, { groups: fixtureModelGroups(), failures: [] }),
@@ -2961,6 +2964,44 @@ function createFixtureWorld(options: FixtureOptions): FixtureWorld {
       discoverModels: request => ok(request, {
         models: fixtureModelGroups().flatMap(group => group.models.map(model => ({ id: model.id, name: model.name }))),
       }),
+      oauthStart: (request) => {
+        openaiCodexConnection = 'connecting'
+        emitHost({
+          type: 'host/remote-event', event: 'llm/oauth-connection-updated',
+          args: [{ provider: 'openai-codex', status: openaiCodexConnection }],
+        })
+        return ok(request, {
+          connection: { provider: 'openai-codex', status: openaiCodexConnection },
+          start: {
+            kind: 'device-code' as const,
+            deviceCode: {
+              verificationUri: 'https://auth.openai.com/codex/device',
+              userCode: 'ABCD-EFGH',
+              intervalSeconds: 5,
+              expiresInSeconds: 900,
+            },
+          },
+        })
+      },
+      oauthStatus: request => ok(request, {
+        connection: { provider: 'openai-codex', status: openaiCodexConnection },
+      }),
+      oauthCancel: (request) => {
+        openaiCodexConnection = 'missing'
+        emitHost({
+          type: 'host/remote-event', event: 'llm/oauth-connection-updated',
+          args: [{ provider: 'openai-codex', status: openaiCodexConnection }],
+        })
+        return ok(request, { connection: { provider: 'openai-codex', status: openaiCodexConnection } })
+      },
+      oauthDisconnect: (request) => {
+        openaiCodexConnection = 'missing'
+        emitHost({
+          type: 'host/remote-event', event: 'llm/oauth-connection-updated',
+          args: [{ provider: 'openai-codex', status: openaiCodexConnection }],
+        })
+        return ok(request, { connection: { provider: 'openai-codex', status: openaiCodexConnection } })
+      },
     },
     respond(message: ClientResponse): Promise<RpcReceipt> {
       // Same routing discipline as the host: rpcId first, then the payload's
@@ -3129,6 +3170,10 @@ export class FixtureApiClient extends AbstractApiClient {
       case 'llm.providers': return this.api.llm.providers(request)
       case 'llm.models': return this.api.llm.models(request)
       case 'llm.discoverModels': return this.api.llm.discoverModels(request, signal)
+      case 'llm.oauthStart': return this.api.llm.oauthStart(request)
+      case 'llm.oauthStatus': return this.api.llm.oauthStatus(request)
+      case 'llm.oauthCancel': return this.api.llm.oauthCancel(request)
+      case 'llm.oauthDisconnect': return this.api.llm.oauthDisconnect(request)
     }
   }
 

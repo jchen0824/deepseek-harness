@@ -17,7 +17,7 @@ import LlmRuntime, { LlmAdapter } from '@deepseek-ai/dsh-llm'
 import type { GenerateOptions, LlmModelInfo, LlmProviderInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
 import { SettingsProvider, settingsNamespace } from '@deepseek-ai/dsh-settings'
 import type { SettingsNamespace } from '@deepseek-ai/dsh-settings'
-import { CredentialProvider } from '@deepseek-ai/dsh-credentials'
+import { CredentialProvider, credentialRef } from '@deepseek-ai/dsh-credentials'
 import type {
   CredentialInfo,
   CredentialMutation,
@@ -651,12 +651,51 @@ describe('llm domain', () => {
     const api = createApiProxy(ctx, DEFAULTS)
     const value = expectOk(await api.llm.providers(request({})))
     expect(value.providers).toEqual([
-      { provider: 'deepseek-official', displayName: 'DeepSeek', settingsNs: 'llm-deepseek', settingsPath: [], active: true },
-      { provider: 'openai', displayName: 'openai', settingsNs: 'llm-pi-ai', settingsPath: ['providers', 'openai'], active: false },
+      { provider: 'deepseek-official', displayName: 'DeepSeek', settingsNs: 'llm-deepseek', settingsPath: [], auth: { kind: 'api-key' }, active: true },
+      { provider: 'openai', displayName: 'openai', settingsNs: 'llm-pi-ai', settingsPath: ['providers', 'openai'], auth: { kind: 'api-key' }, active: false },
       // An undeclared live route has no settings address, so nothing can be
       // interrogated on its behalf either.
-      { provider: 'undeclared', displayName: 'Undeclared', settingsNs: '', settingsPath: [], active: true },
+      { provider: 'undeclared', displayName: 'Undeclared', settingsNs: '', settingsPath: [], auth: { kind: 'native' }, active: true },
     ])
+  })
+
+  it('projects OAuth snapshots and updates without exposing private credential activity', async () => {
+    const ctx = await harness({ configurableProviders: false })
+    ctx.llm.registerConfigurableProviders([{
+      provider: 'openai-codex', displayName: 'OpenAI Codex', settingsNs: 'llm-pi-ai',
+      settingsPath: ['providers', 'openai-codex'], auth: { kind: 'oauth' },
+    }])
+    ctx.llm.registerOAuthController({
+      provider: 'openai-codex',
+      status: () => Promise.resolve({ provider: 'openai-codex', status: 'connecting' as const, accountId: 'acct-private' }),
+      start: () => Promise.resolve({ kind: 'connected' as const, connection: { provider: 'openai-codex', status: 'connected' as const } }),
+      cancel: () => Promise.resolve({ provider: 'openai-codex', status: 'missing' as const }),
+      disconnect: () => Promise.resolve({ provider: 'openai-codex', status: 'missing' as const }),
+    })
+    const api = createApiProxy(ctx, DEFAULTS)
+
+    expect(expectOk(await api.llm.providers(request({})))).toEqual({ providers: [{
+      provider: 'openai-codex', displayName: 'OpenAI Codex', settingsNs: 'llm-pi-ai',
+      settingsPath: ['providers', 'openai-codex'], auth: { kind: 'oauth' }, active: false,
+      connection: { provider: 'openai-codex', status: 'connecting' },
+    }] })
+
+    const frames = await collectHost(api, ['host/remote-event'], 1, async () => {
+      await ctx.credentials.modify(credentialRef('OPENAI_CODEX_OAUTH'), () => Promise.resolve({
+        value: JSON.stringify({ access: 'private-access', refresh: 'private-refresh' }),
+        result: undefined,
+        visibility: 'private',
+      }))
+      ctx.llm.emitOAuthConnectionUpdated({
+        provider: 'openai-codex', status: 'connected', accountId: 'acct-private', error: 'provider error',
+      } as never)
+    })
+    expect(frames).toEqual([{
+      type: 'host/remote-event',
+      event: 'llm/oauth-connection-updated',
+      args: [{ provider: 'openai-codex', status: 'connected' }],
+    }])
+    expect(JSON.stringify(frames)).not.toMatch(/OPENAI_CODEX_OAUTH|access|refresh|account|provider error/)
   })
 
   it('serves the host-scoped catalog with per-provider failures contained', async () => {
