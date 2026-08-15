@@ -18,6 +18,7 @@ import LlmRuntime, {
 import * as LlmPiAi from '@deepseek-ai/dsh-llm-pi-ai'
 import { PiAiAdapter } from '@deepseek-ai/dsh-llm-pi-ai'
 import { MAX_TIMER_DELAY_MS } from '@deepseek-ai/dsh-timeout'
+import { lazyStream } from '@earendil-works/pi-ai'
 import { getBuiltinModels } from '@earendil-works/pi-ai/providers/all'
 import type { Credential, CredentialInfo, CredentialStore, OAuthCredential, Provider } from '@earendil-works/pi-ai'
 import { resolveProfiles } from '../src/config.ts'
@@ -110,6 +111,12 @@ function oauthCredential(expires: number): OAuthCredential {
     refresh: 'private-refresh-value',
     expires,
   }
+}
+
+function deferred(): { promise: Promise<void>; resolve: () => void } {
+  let resolve!: () => void
+  const promise = new Promise<void>((done) => { resolve = done })
+  return { promise, resolve }
 }
 
 /** Consume one native Codex request so setup failures reject the caller. */
@@ -304,6 +311,69 @@ describe('PiAiAdapter provider routing', () => {
     })
     expect(reconnects).toBe(1)
     expect(chunkTypes).toEqual([])
+  })
+
+  it('does not let one concurrent OAuth failure contaminate an ordinary provider failure', async () => {
+    const resolved = resolveProfiles({ 'openai-codex': {} }).get('openai-codex')
+    if (resolved === undefined) throw new Error('expected Codex profile')
+    const store = new MemoryOAuthStore(oauthCredential(Date.now() + 60_000))
+    const authFailureEntered = deferred()
+    const releaseAuthFailure = deferred()
+    const ordinaryStreamEntered = deferred()
+    const releaseOrdinaryStream = deferred()
+    const read = store.read.bind(store)
+    vi.spyOn(store, 'read').mockImplementation(async (providerId) => {
+      if (store.reads !== 1) return read(providerId)
+      store.reads += 1
+      authFailureEntered.resolve()
+      await releaseAuthFailure.promise
+      throw new Error('private credential-store failure')
+    })
+    const provider: Provider = {
+      ...resolved.piProvider,
+      streamSimple: model => lazyStream(model, async () => {
+        ordinaryStreamEntered.resolve()
+        await releaseOrdinaryStream.promise
+        throw new Error('ordinary provider failure')
+      }),
+    }
+    const profiles = new Map([['openai-codex', { ...resolved, piProvider: provider }]])
+    let reconnects = 0
+    const adapter = new PiAiAdapter({
+      profiles: () => profiles,
+      resolveApiKey: () => Promise.resolve(undefined),
+      credentialStore: store,
+      oauthController: { markReconnectRequired: () => { reconnects += 1 } },
+    })
+    const firstChunkTypes: string[] = []
+    const secondChunkTypes: string[] = []
+    const secondFinishCodes: string[] = []
+    const consume = async (chunkTypes: string[], finishCodes?: string[]): Promise<void> => {
+      for await (const chunk of adapter.stream({
+        provider: 'openai-codex',
+        model: resolved.piProvider.getModels()[0]!.id,
+        messages: [],
+      })) {
+        chunkTypes.push(chunk.type)
+        if (chunk.type === 'finish' && chunk.reason.kind === 'error') {
+          finishCodes?.push(chunk.reason.failure.code)
+        }
+      }
+    }
+
+    const first = consume(firstChunkTypes)
+    await authFailureEntered.promise
+    const second = consume(secondChunkTypes, secondFinishCodes)
+    await ordinaryStreamEntered.promise
+    releaseAuthFailure.resolve()
+    await expect(first).rejects.toMatchObject({ code: OAUTH_RECONNECT_REQUIRED_CODE })
+    releaseOrdinaryStream.resolve()
+    await expect(second).resolves.toBeUndefined()
+
+    expect(reconnects).toBe(1)
+    expect(firstChunkTypes).toEqual([])
+    expect(secondChunkTypes).toEqual(['usage', 'finish'])
+    expect(secondFinishCodes).toEqual(['PI_AI_ERROR'])
   })
 
   it('resolves a catalog model dynamically and uses a private endpoint', async () => {

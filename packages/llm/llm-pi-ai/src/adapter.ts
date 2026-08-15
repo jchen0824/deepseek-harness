@@ -13,13 +13,15 @@
  * way down: switching models mid-reply takes effect on the next step, never
  * inside the one in flight.
  *
- * Every collection receives a snapshot-local failure tracker over the same
- * host-scoped OAuth credential store. That tracker lets the final stream
- * boundary distinguish a late lazy auth failure from an ordinary provider
- * error without retaining provider diagnostics. An explicit `apiKeyEnv` still
- * resolves through the Harness seam and becomes the highest-priority request
- * override; the native Codex OAuth profile omits that override and lets pi-ai
- * resolve and refresh its stored credential.
+ * Each native Codex request receives a private failure tracker over the same
+ * host-scoped OAuth credential store. Its request-local `Models` collection is
+ * built only from the already-captured profile snapshot and serves preflight,
+ * lazy dispatch, and the final stream guard. The guard can therefore identify
+ * that request's late auth failure without retaining provider diagnostics or
+ * observing a concurrent request. An explicit `apiKeyEnv` still resolves
+ * through the Harness seam and becomes the highest-priority request override;
+ * the native Codex OAuth profile omits that override and lets pi-ai resolve and
+ * refresh its stored credential.
  *
  * @module dsh-llm-pi-ai/adapter
  */
@@ -71,7 +73,13 @@ interface PiAiSnapshot {
   profiles: ReadonlyMap<string, ResolvedPiAiProviderProfile>
   /** Providers for exactly those profiles; never mutated once published. */
   models: Models
-  /** Auth failures raised by this snapshot's private credential-store facade. */
+}
+
+/** Request-owned auth collection and its optional durable-store failure tracker. */
+interface NativeOAuthRequest {
+  /** Providers copied only from the profile snapshot captured at request entry. */
+  models: Models
+  /** Failures raised while this request alone uses the shared durable store. */
   oauthFailures?: OAuthFailureTrackingStore
 }
 
@@ -163,7 +171,8 @@ function terminalMessage(event: AssistantMessageEvent): AssistantMessage | undef
  */
 async function* guardNativeOAuthEvents(
   events: AsyncIterable<AssistantMessageEvent>,
-  snapshot: PiAiSnapshot,
+  models: Models,
+  oauthFailures: OAuthFailureTrackingStore | undefined,
   model: Model<Api>,
   failureVersion: number | undefined,
   controller: PiAiAdapterOptions['oauthController'],
@@ -172,13 +181,13 @@ async function* guardNativeOAuthEvents(
     const terminal = terminalMessage(event)
     if (terminal?.stopReason === 'error') {
       const trackedFailure = failureVersion !== undefined
-        && snapshot.oauthFailures?.version() !== failureVersion
+        && oauthFailures?.version() !== failureVersion
       const reason = mapStopReason(terminal, model.contextWindow)
       const providerAuthFailure = reason.kind === 'error' && reason.failure.code === 'AUTH'
       let unavailable = trackedFailure || providerAuthFailure
       if (!unavailable) {
         try {
-          unavailable = await snapshot.models.getAuth(model) === undefined
+          unavailable = await models.getAuth(model) === undefined
         } catch (error) {
           if (!(error instanceof ModelsError)) throw error
           unavailable = true
@@ -188,6 +197,18 @@ async function* guardNativeOAuthEvents(
     }
     yield event
   }
+}
+
+/** Build a Models collection from one captured profile map and credential store. */
+function modelsFrom(
+  profiles: ReadonlyMap<string, ResolvedPiAiProviderProfile>,
+  credentialStore: CredentialStore | undefined,
+): Models {
+  const models: MutableModels = createModels(
+    credentialStore === undefined ? {} : { credentials: credentialStore },
+  )
+  for (const profile of profiles.values()) models.setProvider(profile.piProvider)
+  return models
 }
 
 /** Constructor options for {@link PiAiAdapter}: the two resolution hooks the plugin owns. */
@@ -203,7 +224,7 @@ export interface PiAiAdapterOptions {
    * `MISSING_CREDENTIAL` rather than falling back.
    */
   resolveApiKey: (provider: string, profile: ResolvedPiAiProviderProfile) => Promise<string | undefined>
-  /** Stable pi-ai credential store shared by every immutable model snapshot. */
+  /** Stable pi-ai credential store shared beneath every request-local OAuth facade. */
   credentialStore?: CredentialStore
   /** Raw host controller used only to mark a request-time refresh failure. */
   oauthController?: Pick<OpenAICodexOAuthController, 'markReconnectRequired'>
@@ -332,13 +353,18 @@ export class PiAiAdapter extends LlmAdapter {
   private current(): PiAiSnapshot {
     const profiles = this.config.profiles()
     if (this.snapshot?.profiles === profiles) return this.snapshot
+    const models = modelsFrom(profiles, this.config.credentialStore)
+    this.snapshot = { profiles, models }
+    return this.snapshot
+  }
+
+  /** Create one native OAuth collection without consulting profiles again. */
+  private nativeOAuthRequest(snapshot: PiAiSnapshot): NativeOAuthRequest {
     const oauthFailures = this.config.credentialStore === undefined
       ? undefined
       : new OAuthFailureTrackingStore(this.config.credentialStore)
-    const models: MutableModels = createModels(oauthFailures === undefined ? {} : { credentials: oauthFailures })
-    for (const profile of profiles.values()) models.setProvider(profile.piProvider)
-    this.snapshot = { profiles, models, ...oauthFailures === undefined ? {} : { oauthFailures } }
-    return this.snapshot
+    const models = modelsFrom(snapshot.profiles, oauthFailures)
+    return { models, ...oauthFailures === undefined ? {} : { oauthFailures } }
   }
 
   /** The profile for one route within one snapshot, or the not-owned failure. */
@@ -426,6 +452,8 @@ export class PiAiAdapter extends LlmAdapter {
       options.reasoningEffort ?? profile.reasoning,
     )
     const nativeCodexOAuth = profile.provider === OPENAI_CODEX_PROVIDER && profile.apiKeyEnv === undefined
+    const oauthRequest = nativeCodexOAuth ? this.nativeOAuthRequest(snapshot) : undefined
+    const requestModels = oauthRequest?.models ?? snapshot.models
     const apiKey = nativeCodexOAuth
       ? undefined
       : await this.config.resolveApiKey(options.provider, profile)
@@ -435,7 +463,7 @@ export class PiAiAdapter extends LlmAdapter {
         // Preflight pi-ai's locked refresh while the typed ModelsError is still
         // available. `streamSimple()` is lazy and otherwise flattens it into a
         // provider-text event, which must not enter the Harness stream.
-        const auth = await snapshot.models.getAuth(model)
+        const auth = await requestModels.getAuth(model)
         if (auth === undefined) {
           reconnectOAuth(this.config.oauthController)
         }
@@ -446,7 +474,7 @@ export class PiAiAdapter extends LlmAdapter {
         throw error
       }
     }
-    const oauthFailureVersion = nativeCodexOAuth ? snapshot.oauthFailures?.version() : undefined
+    const oauthFailureVersion = oauthRequest?.oauthFailures?.version()
 
     const consumer = new AbortController()
     const upstream = options.signal === undefined
@@ -467,7 +495,7 @@ export class PiAiAdapter extends LlmAdapter {
       const context = attachments === undefined
         ? toPiContext(options)
         : await toPiContext(options, attachments)
-      const sourceEvents = snapshot.models.streamSimple(model, context, {
+      const sourceEvents = requestModels.streamSimple(model, context, {
         ...profileOptions(profile, reasoning, apiKey),
         ...options.temperature === undefined ? {} : { temperature: options.temperature },
         ...options.maxTokens === undefined ? {} : { maxTokens: options.maxTokens },
@@ -480,7 +508,8 @@ export class PiAiAdapter extends LlmAdapter {
       const events = nativeCodexOAuth
         ? guardNativeOAuthEvents(
           sourceEvents,
-          snapshot,
+          requestModels,
+          oauthRequest?.oauthFailures,
           model,
           oauthFailureVersion,
           this.config.oauthController,
