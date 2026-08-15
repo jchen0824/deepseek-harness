@@ -45,7 +45,7 @@ import { withFileLock, writeFileAtomic } from '@deepseek-ai/dsh-atomic-write'
 import { canonicalizeWatchPath, resolveDshHome } from '@deepseek-ai/dsh-home-paths'
 import { launchEnvironmentOf } from '@deepseek-ai/dsh-launch-environment'
 import { CredentialProvider, credentialRef } from '@deepseek-ai/dsh-credentials'
-import type { CredentialInfo, CredentialMutation, CredentialRef, ResolvedCredential } from '@deepseek-ai/dsh-credentials'
+import type { CredentialInfo, CredentialMutation, CredentialMutationVisibility, CredentialRef, ResolvedCredential } from '@deepseek-ai/dsh-credentials'
 import type { LaunchEnvironmentEntry } from '@deepseek-ai/dsh-launch-environment'
 
 /** Basename of the credentials document inside the harness home. */
@@ -86,6 +86,13 @@ export function resolveSpec(config: Config): ResolvedSpec {
 
 /** Permission bits outside the owner; a credentials document must have none of them. */
 const GROUP_OTHER_BITS = 0o077
+
+/**
+ * Host-only references last changed privately by providers in this process,
+ * grouped by their shared document. Reconciliation may observe another
+ * provider's write, but it must never announce one of these references.
+ */
+const privateReferencesByDocument = new Map<string, Set<CredentialRef>>()
 
 /**
  * Reject a credentials document other OS users can read, before its contents
@@ -399,8 +406,9 @@ export class LocalCredentialProvider extends CredentialProvider {
         if (mutation.value === '') {
           throw new Error(`credentials-local: an empty value cannot be stored for "${ref}"; use unset`)
         }
-        await this.commitMutation(ref, mutation.value)
-        if (mutation.visibility === 'public' && before !== mutation.value) this.notifyUpdated(ref)
+        const changed = await this.commitMutation(ref, mutation.value, mutation.visibility)
+        if (!changed) return mutation.result
+        if (mutation.visibility === 'public') this.notifyUpdated(ref)
         return mutation.result
       })
     })
@@ -414,15 +422,39 @@ export class LocalCredentialProvider extends CredentialProvider {
     return this.mutate(ref, mutate, 'modify')
   }
 
-  /** Persist a changed stored value and refresh the local snapshot; equal values are a no-op. */
-  private async commitMutation(ref: CredentialRef, value: string | undefined): Promise<void> {
-    if (this.values.get(ref) === value) return
+  /** Persist a changed stored value and refresh the local snapshot. */
+  private async commitMutation(
+    ref: CredentialRef,
+    value: string | undefined,
+    visibility: CredentialMutationVisibility,
+  ): Promise<boolean> {
+    if (this.values.get(ref) === value) return false
     const nextText = renderDocument(this.text, ref, value)
     // 0600: a document holding secrets is never world-readable.
     await writeFileAtomic(this.spec.filename, nextText, { mode: 0o600, dirMode: 0o700 })
     this.text = nextText
     if (value === undefined) this.values.delete(ref)
     else this.values.set(ref, value)
+    this.recordMutationVisibility(ref, visibility)
+    return true
+  }
+
+  /** Record whether peers may publish future reconciliations for this reference. */
+  private recordMutationVisibility(ref: CredentialRef, visibility: CredentialMutationVisibility): void {
+    const refs = privateReferencesByDocument.get(this.spec.filename)
+    if (visibility === 'public') {
+      refs?.delete(ref)
+      if (refs?.size === 0) privateReferencesByDocument.delete(this.spec.filename)
+      return
+    }
+    const privateRefs = refs ?? new Set<CredentialRef>()
+    privateRefs.add(ref)
+    privateReferencesByDocument.set(this.spec.filename, privateRefs)
+  }
+
+  /** Whether a reconciled reference may reach the credentials update stream. */
+  private mayPublishReconciled(ref: CredentialRef): boolean {
+    return !privateReferencesByDocument.get(this.spec.filename)?.has(ref)
   }
 
   /**
@@ -501,7 +533,9 @@ export class LocalCredentialProvider extends CredentialProvider {
     const changed = this.changedRefs(this.values, next)
     this.text = text
     this.values = next
-    for (const ref of changed) this.notifyUpdated(ref)
+    for (const ref of changed) {
+      if (this.mayPublishReconciled(ref)) this.notifyUpdated(ref)
+    }
   }
   /* jscpd:ignore-end */
 

@@ -81,6 +81,36 @@ describe('the credentials seam through the memory provider', () => {
     expect(events).toEqual([REF])
   })
 
+  it('serializes held mutation callbacks before exposing the next stored value', async () => {
+    const ctx = await boot()
+    let releaseFirst!: () => void
+    const firstHeld = new Promise<void>((resolve) => { releaseFirst = resolve })
+    let firstStarted!: () => void
+    const started = new Promise<void>((resolve) => { firstStarted = resolve })
+
+    const first = ctx.credentials.modify(REF, async (current) => {
+      expect(current).toBeUndefined()
+      firstStarted()
+      await firstHeld
+      return { value: 'first', result: undefined, visibility: 'private' as const }
+    })
+    await started
+    let secondStarted = false
+    let secondCurrent: string | undefined
+    const second = ctx.credentials.modify(REF, async (current) => {
+      secondStarted = true
+      secondCurrent = current
+      return { value: 'second', result: undefined, visibility: 'private' as const }
+    })
+    await Promise.resolve()
+    expect(secondStarted).toBe(false)
+    releaseFirst()
+    await Promise.all([first, second])
+
+    expect(secondCurrent).toBe('first')
+    expect(await ctx.credentials.resolve(REF)).toEqual({ value: 'second', source: 'memory' })
+  })
+
   it('keeps an unchanged public set silent', async () => {
     const ctx = await boot({ DEEPSEEK_API_KEY: 'sk-live' })
     const events: CredentialRef[] = []

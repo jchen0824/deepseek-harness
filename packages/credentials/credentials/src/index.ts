@@ -52,7 +52,7 @@ declare module '@deepseek-ai/cordis' {
 }
 
 /**
- * Abstract credential service. Providers implement the four operations over
+ * Abstract credential service. Providers implement the operations over
  * their source layers; one seam-wide rule binds them all: an empty stored
  * value is absent everywhere — `resolve` skips it, `describe` reports it
  * unconfigured — so a blank never masquerades as a configured secret.

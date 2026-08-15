@@ -110,6 +110,69 @@ describe('read-modify-write', () => {
     expect(await reread.credentials.resolve(ALPHA)).toEqual({ value: 'second', source: 'file' })
   })
 
+  it('keeps a private cross-instance update out of a later mutation reconciliation', async () => {
+    const dir = await tempDir()
+    const path = join(dir, '.credentials.yaml')
+    const first = await boot({ path, watch: false })
+    const second = await boot({ path, watch: false })
+    const secondEvents: string[] = []
+    second.on('credentials/updated', (ref) => { secondEvents.push(ref) })
+
+    await first.credentials.modify(ALPHA, async () => ({
+      value: 'private-first',
+      result: undefined,
+      visibility: 'private',
+    }))
+    await second.credentials.modify(BETA, async () => ({
+      value: 'private-second',
+      result: undefined,
+      visibility: 'private',
+    }))
+
+    expect(secondEvents).toEqual([])
+    expect(await second.credentials.resolve(ALPHA)).toEqual({ value: 'private-first', source: 'file' })
+  })
+
+  it('keeps a private cross-instance update out of watcher notifications', async () => {
+    const dir = await tempDir()
+    const path = join(dir, '.credentials.yaml')
+    const first = await boot({ path, watch: false })
+    const second = await boot({ path, debounceMs: 10 })
+    const secondEvents: string[] = []
+    second.on('credentials/updated', (ref) => { secondEvents.push(ref) })
+
+    await first.credentials.modify(ALPHA, async () => ({
+      value: 'private-first',
+      result: undefined,
+      visibility: 'private',
+    }))
+
+    await vi.waitFor(async () => {
+      expect(await second.credentials.resolve(ALPHA)).toEqual({ value: 'private-first', source: 'file' })
+    })
+    expect(secondEvents).toEqual([])
+  })
+
+  it('publishes a changed public cross-instance update to watcher notifications', async () => {
+    const dir = await tempDir()
+    const path = join(dir, '.credentials.yaml')
+    const first = await boot({ path, watch: false })
+    const second = await boot({ path, debounceMs: 10 })
+    const secondEvents: string[] = []
+    second.on('credentials/updated', (ref) => { secondEvents.push(ref) })
+
+    await first.credentials.modify(ALPHA, async () => ({
+      value: 'public-first',
+      result: undefined,
+      visibility: 'public',
+    }))
+
+    await vi.waitFor(async () => {
+      expect(await second.credentials.resolve(ALPHA)).toEqual({ value: 'public-first', source: 'file' })
+    })
+    expect(secondEvents).toEqual([ALPHA])
+  })
+
   it('creates the credentials directory owner-only', async () => {
     const dir = await tempDir()
     const home = join(dir, 'home')

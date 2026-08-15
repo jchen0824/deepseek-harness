@@ -8,6 +8,8 @@ import type { CredentialInfo, CredentialMutation, CredentialRef, ResolvedCredent
  */
 export class MemoryCredentials extends CredentialProvider {
   private readonly store = new Map<string, string>()
+  /** Settled operation tail that serializes async read-modify-write callbacks. */
+  private operations: Promise<void> = Promise.resolve()
 
   constructor(ctx: Context, seed: Record<string, string> = {}) {
     super(ctx)
@@ -46,16 +48,25 @@ export class MemoryCredentials extends CredentialProvider {
     ref: CredentialRef,
     mutate: (current: string | undefined) => Promise<CredentialMutation<T>>,
   ): Promise<T> {
-    const before = this.store.get(ref)
-    const mutation = await mutate(before)
-    if (mutation.value === '') {
-      throw new Error('memory credentials: an empty value cannot be stored; use undefined')
-    }
-    if (before !== mutation.value) {
-      if (mutation.value === undefined) this.store.delete(ref)
-      else this.store.set(ref, mutation.value)
-      if (mutation.visibility === 'public') this.ctx.emit('credentials/updated', ref)
-    }
-    return mutation.result
+    return this.enqueue(async () => {
+      const before = this.store.get(ref)
+      const mutation = await mutate(before)
+      if (mutation.value === '') {
+        throw new Error('memory credentials: an empty value cannot be stored; use undefined')
+      }
+      if (before !== mutation.value) {
+        if (mutation.value === undefined) this.store.delete(ref)
+        else this.store.set(ref, mutation.value)
+        if (mutation.visibility === 'public') this.ctx.emit('credentials/updated', ref)
+      }
+      return mutation.result
+    })
+  }
+
+  /** Queue one mutation while keeping the tail usable after a rejected callback. */
+  private enqueue<T>(operation: () => Promise<T>): Promise<T> {
+    const task = this.operations.then(operation)
+    this.operations = task.then(() => undefined, () => undefined)
+    return task
   }
 }
