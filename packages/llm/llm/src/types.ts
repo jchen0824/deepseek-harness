@@ -21,6 +21,16 @@ declare module '@deepseek-ai/cordis' {
      * @mode emit
      */
     'llm/adapters-updated'(): void
+
+    /**
+     * One OAuth connection changed. The payload deliberately contains only
+     * the provider route and lifecycle status: device codes, account data,
+     * credentials, and provider errors remain owned by the controller call
+     * that produced them and never enter this broadcast.
+     * @param connection - detached provider route and connection status.
+     * @mode emit
+     */
+    'llm/oauth-connection-updated'(connection: LlmOAuthConnection): void
   }
 }
 
@@ -175,6 +185,8 @@ export interface LlmConfigurableProvider {
    * object; empty when the whole section is the profile.
    */
   settingsPath: readonly string[]
+  /** Authentication method this provider route exposes to configuration surfaces. */
+  auth: LlmProviderAuth
   /**
    * Whether the owning adapter knows this route only because configuration
    * declared it — a gateway or self-hosted server it ships nothing about.
@@ -184,6 +196,55 @@ export interface LlmConfigurableProvider {
    * from outside.
    */
   declared?: boolean
+}
+
+/** Provider-neutral authentication method a configurable provider supports. */
+export type LlmProviderAuth =
+  | { kind: 'api-key' }
+  | { kind: 'oauth' }
+  | { kind: 'native' }
+
+/** Public lifecycle state for one OAuth provider connection. */
+export type LlmOAuthConnectionStatus = 'missing' | 'connecting' | 'connected' | 'reconnect-required'
+
+/** Redacted connection state for one OAuth-capable provider route. */
+export interface LlmOAuthConnection {
+  /** Provider route the controller owns. */
+  provider: string
+  /** Current connection lifecycle state. */
+  status: LlmOAuthConnectionStatus
+}
+
+/** Device-code instructions returned only from the initiating controller call. */
+export interface LlmOAuthDeviceCode {
+  /** URL at which the user verifies the device. */
+  verificationUri: string
+  /** Short code the user enters at the verification URL. */
+  userCode: string
+  /** Optional polling interval requested by the provider. */
+  intervalSeconds?: number
+  /** Optional lifetime of the device code. */
+  expiresInSeconds?: number
+}
+
+/** Result of starting an OAuth connection lifecycle. */
+export type LlmOAuthStart =
+  | { kind: 'device-code'; connection: LlmOAuthConnection; deviceCode: LlmOAuthDeviceCode }
+  | { kind: 'already-connecting'; connection: LlmOAuthConnection }
+  | { kind: 'connected'; connection: LlmOAuthConnection }
+
+/** Provider-owned OAuth lifecycle operations. */
+export interface LlmOAuthController {
+  /** Provider route this controller exclusively owns. */
+  readonly provider: string
+  /** Return the provider's current redacted connection state. */
+  status(): Promise<LlmOAuthConnection>
+  /** Start or resume connecting the provider account. */
+  start(): Promise<LlmOAuthStart>
+  /** Stop an in-progress connection attempt. */
+  cancel(): Promise<LlmOAuthConnection>
+  /** Remove the provider connection. */
+  disconnect(): Promise<LlmOAuthConnection>
 }
 
 /**

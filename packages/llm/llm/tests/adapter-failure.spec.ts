@@ -1,7 +1,13 @@
 import { describe, expect, it } from 'vitest'
 import { normalizeLlmFailure } from '../src/adapter-failure.ts'
+import { OAUTH_RECONNECT_REQUIRED_CODE } from '../src/error.ts'
 
 describe('adapter failure normalization', () => {
+  it('exports a stable OAuth reconnect-required code for request routing', () => {
+    const failure = { message: 'provider wording is not a routing API', code: OAUTH_RECONNECT_REQUIRED_CODE }
+    expect(failure.code).toBe('OAUTH_RECONNECT_REQUIRED')
+  })
+
   it('contains hostile non-Error coercion', () => {
     const thrown = { [Symbol.toPrimitive]: () => { throw new Error('coercion failed') } }
     expect(normalizeLlmFailure(thrown)).toEqual({ message: 'LLM adapter failed', code: 'UNKNOWN' })

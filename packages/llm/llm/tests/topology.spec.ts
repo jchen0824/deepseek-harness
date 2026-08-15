@@ -1,7 +1,14 @@
 import { describe, expect, it, vi } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
 import LlmRuntime, { LlmAdapter, LlmError } from '@deepseek-ai/dsh-llm'
-import type { GenerateOptions, LlmConfigurableProvider, StreamChunk } from '@deepseek-ai/dsh-llm'
+import type {
+  GenerateOptions,
+  LlmConfigurableProvider,
+  LlmOAuthConnection,
+  LlmOAuthController,
+  LlmOAuthStart,
+  StreamChunk,
+} from '@deepseek-ai/dsh-llm'
 
 class NoopAdapter extends LlmAdapter {
 
@@ -22,7 +29,20 @@ function entry(overrides: Partial<LlmConfigurableProvider> = {}): LlmConfigurabl
     displayName: 'OpenAI',
     settingsNs: 'llm-pi-ai',
     settingsPath: ['providers', 'openai'],
+    auth: { kind: 'api-key' },
     ...overrides,
+  }
+}
+
+function controller(provider = 'openai-codex'): LlmOAuthController {
+  const connection = (): LlmOAuthConnection => ({ provider, status: 'connected' })
+  const start = (): Promise<LlmOAuthStart> => Promise.resolve({ kind: 'connected', connection: connection() })
+  return {
+    provider,
+    status: () => Promise.resolve(connection()),
+    start,
+    cancel: () => Promise.resolve(connection()),
+    disconnect: () => Promise.resolve(connection()),
   }
 }
 
@@ -113,8 +133,8 @@ describe('configurable-provider directory', () => {
     expect(events).toHaveBeenCalledTimes(1)
     const listed = ctx.llm.listConfigurableProviders()
     expect(listed).toEqual([
-      { provider: 'deepseek-official', displayName: 'DeepSeek', settingsNs: 'llm-deepseek', settingsPath: [] },
-      { provider: 'openai', displayName: 'OpenAI', settingsNs: 'llm-pi-ai', settingsPath: ['providers', 'openai'] },
+      { provider: 'deepseek-official', displayName: 'DeepSeek', settingsNs: 'llm-deepseek', settingsPath: [], auth: { kind: 'api-key' } },
+      { provider: 'openai', displayName: 'OpenAI', settingsNs: 'llm-pi-ai', settingsPath: ['providers', 'openai'], auth: { kind: 'api-key' } },
     ])
     listed[0]!.displayName = 'mutated'
     ;(listed[1]!.settingsPath as string[]).push('mutated')
@@ -164,6 +184,7 @@ describe('configurable-provider directory', () => {
     [entry({ displayName: '' }), /non-empty provider/],
     [entry({ settingsNs: '' }), /non-empty provider/],
     [entry({ settingsPath: ['providers', ''] }), /empty settingsPath segment/],
+    [entry({ auth: undefined } as never), /authentication metadata/],
   ])('rejects invalid entries all-or-nothing', async (invalid, message) => {
     const ctx = await setup()
     expect(() => ctx.llm.registerConfigurableProviders([entry({ provider: 'valid-first' }), invalid])).toThrow(message)
@@ -203,6 +224,63 @@ describe('configurable-provider directory', () => {
     expect(() => ctx.llm.registerConfigurableProviders([entry({ displayName: 'Other' }), entry({ provider: 'unseen' })]))
       .toThrow(/already declared/)
     expect(ctx.llm.listConfigurableProviders()).toHaveLength(1)
+  })
+})
+
+describe('OAuth controller registry', () => {
+  it('registers controllers, emits redacted updates, and withdraws on disposal', async () => {
+    const ctx = await setup()
+    const events: LlmOAuthConnection[] = []
+    ctx.on('llm/oauth-connection-updated', connection => events.push(connection))
+    const registered = controller()
+
+    const dispose = ctx.llm.registerOAuthController(registered)
+    expect(ctx.llm.getOAuthController('openai-codex')).toBe(registered)
+    ctx.llm.emitOAuthConnectionUpdated({ provider: 'openai-codex', status: 'connected' })
+    expect(events).toEqual([{ provider: 'openai-codex', status: 'connected' }])
+
+    dispose()
+    expect(ctx.llm.getOAuthController('openai-codex')).toBeUndefined()
+  })
+
+  it('disposes a controller when its contributing fiber disposes', async () => {
+    const ctx = await setup()
+    const registered = controller()
+    const fiber = await ctx.plugin({
+      inject: ['llm'],
+      apply: (child: Context) => { child.llm.registerOAuthController(registered) },
+    })
+    expect(ctx.llm.getOAuthController(registered.provider)).toBe(registered)
+
+    await fiber.dispose()
+    expect(ctx.llm.getOAuthController(registered.provider)).toBeUndefined()
+  })
+
+  it('rejects empty or duplicate controller provider ids without disturbing the existing owner', async () => {
+    const ctx = await setup()
+    const registered = controller()
+    ctx.llm.registerOAuthController(registered)
+
+    expect(() => ctx.llm.registerOAuthController(controller(''))).toThrow(/non-empty provider/)
+    expect(() => ctx.llm.registerOAuthController(controller())).toThrow(/already registered/)
+    expect(ctx.llm.getOAuthController(registered.provider)).toBe(registered)
+  })
+
+  it('rejects invalid connection updates and never exposes extra payload fields', async () => {
+    const ctx = await setup()
+    const events: unknown[] = []
+    ctx.on('llm/oauth-connection-updated', connection => events.push(connection))
+
+    expect(() => ctx.llm.emitOAuthConnectionUpdated({ provider: '', status: 'connected' })).toThrow(/non-empty provider/)
+    expect(() => ctx.llm.emitOAuthConnectionUpdated({ provider: 'openai-codex', status: 'invalid' } as never))
+      .toThrow(/invalid OAuth connection status/)
+
+    ctx.llm.emitOAuthConnectionUpdated({
+      provider: 'openai-codex',
+      status: 'connecting',
+      deviceCode: 'do-not-publish',
+    } as never)
+    expect(events).toEqual([{ provider: 'openai-codex', status: 'connecting' }])
   })
 })
 
