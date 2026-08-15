@@ -458,7 +458,9 @@ export class LlmRuntime extends Service {
         if (entry.provider.length === 0 || entry.displayName.length === 0 || entry.settingsNs.length === 0) {
           throw new LlmError('configurable providers need a non-empty provider, displayName, and settingsNs', 'INVALID_DIRECTORY')
         }
-        if (entry.auth === undefined || !['api-key', 'oauth', 'native'].includes(entry.auth.kind)) {
+        const auth: unknown = entry.auth
+        if (typeof auth !== 'object' || auth === null || !('kind' in auth) || typeof auth.kind !== 'string'
+          || !['api-key', 'oauth', 'native'].includes(auth.kind)) {
           throw new LlmError('configurable providers need authentication metadata', 'INVALID_DIRECTORY')
         }
         if (entry.settingsPath.some(segment => segment.length === 0)) {

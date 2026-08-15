@@ -160,7 +160,7 @@ describe('ModelsSettingsStore', () => {
 
   it('stringifies a non-Error credential transport rejection', async () => {
     const { face } = api({
-      describeCredentials: () => Promise.reject('credential transport refusal'),
+      describeCredentials: async () => { throw 'credential transport refusal' },
     })
     const store = new ModelsSettingsStore(face)
     await expect(store.load()).resolves.toBeUndefined()
@@ -259,7 +259,7 @@ describe('edge joins', () => {
 
   it('stringifies a non-Error load failure', async () => {
     // The wire can surface non-Error throwables; the store must stringify them.
-    const { face } = api({ providers: () => Promise.reject('plain refusal') })
+    const { face } = api({ providers: async () => { throw 'plain refusal' } })
     const store = new ModelsSettingsStore(face)
     await store.load()
     expect(store.store.getSnapshot()).toMatchObject({ status: 'error', error: 'plain refusal' })

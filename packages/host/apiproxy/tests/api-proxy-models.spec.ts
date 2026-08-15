@@ -489,19 +489,9 @@ describe('Web session model selection', () => {
       resolveApiKey: () => Promise.resolve(undefined),
     }))
     const catalog = expectValue(await api.sessions.models(request({ sessionId })))
-    expect(catalog.groups).toEqual(expect.arrayContaining([
-      expect.objectContaining({
-        id: 'openai-codex',
-        models: expect.arrayContaining([
-          expect.objectContaining({
-            id: 'gpt-5.4',
-            reasoning: expect.objectContaining({
-              efforts: expect.arrayContaining([expect.objectContaining({ id: 'high' })]),
-            }),
-          }),
-        ]),
-      }),
-    ]))
+    expect(catalog.groups.some(group => group.id === 'openai-codex'
+      && group.models.some(model => model.id === 'gpt-5.4'
+        && model.reasoning?.efforts.some(effort => effort.id === 'high') === true))).toBe(true)
 
     expectValue(await api.sessions.selectModel(request({
       sessionId,

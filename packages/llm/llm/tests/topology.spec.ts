@@ -295,7 +295,7 @@ describe('OAuth controller registry', () => {
     [{ kind: 'connected', connection: { provider: 'wrong-provider', status: 'connected', account: 'must-not-leak' } }, { kind: 'connected', connection: { provider: 'openai-codex', status: 'connected' } }],
   ] as const)('reconstructs each OAuth start result without provider data', async (start, expected) => {
     const ctx = await setup()
-    const raw = controllerWithForeignResults('openai-codex', start as LlmOAuthStart)
+    const raw = controllerWithForeignResults('openai-codex', start)
     ctx.llm.registerOAuthController(raw)
     const publicController = ctx.llm.getOAuthController('openai-codex')
     if (publicController === undefined) throw new Error('expected registered controller')
@@ -349,8 +349,8 @@ describe('OAuth controller registry', () => {
     const events: unknown[] = []
     ctx.on('llm/oauth-connection-updated', connection => events.push(connection))
 
-    expect(() => ctx.llm.emitOAuthConnectionUpdated({ provider: '', status: 'connected' })).toThrow(/non-empty provider/)
-    expect(() => ctx.llm.emitOAuthConnectionUpdated({ provider: 'openai-codex', status: 'invalid' } as never))
+    expect(() => { ctx.llm.emitOAuthConnectionUpdated({ provider: '', status: 'connected' }) }).toThrow(/non-empty provider/)
+    expect(() => { ctx.llm.emitOAuthConnectionUpdated({ provider: 'openai-codex', status: 'invalid' } as never) })
       .toThrow(/invalid OAuth connection status/)
 
     ctx.llm.emitOAuthConnectionUpdated({
@@ -368,7 +368,7 @@ describe('OAuth controller registry', () => {
     ctx.on('llm/oauth-connection-updated', () => { throw new Error('broken observer') })
     ctx.on('llm/oauth-connection-updated', later)
 
-    expect(() => ctx.llm.emitOAuthConnectionUpdated({ provider: 'openai-codex', status: 'connected' })).not.toThrow()
+    expect(() => { ctx.llm.emitOAuthConnectionUpdated({ provider: 'openai-codex', status: 'connected' }) }).not.toThrow()
     expect(later).toHaveBeenCalledWith({ provider: 'openai-codex', status: 'connected' })
     expect(warn).toHaveBeenCalledWith('llm: an llm/oauth-connection-updated listener failed')
   })

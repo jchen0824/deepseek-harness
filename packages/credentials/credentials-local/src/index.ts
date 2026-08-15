@@ -150,7 +150,7 @@ async function readPrivateReferences(filename: string): Promise<Set<CredentialRe
   } catch {
     throw new Error(`credentials-local: invalid private reference metadata at ${filename}`)
   }
-  if (!Array.isArray(parsed) || parsed.some(ref => typeof ref !== 'string')) {
+  if (!Array.isArray(parsed) || !parsed.every((ref): ref is string => typeof ref === 'string')) {
     throw new TypeError(`credentials-local: private reference metadata at ${filename} must be a string array`)
   }
   return new Set(parsed.map(ref => credentialRef(ref)))
@@ -377,11 +377,11 @@ export class LocalCredentialProvider extends CredentialProvider {
     if (value.length === 0) {
       throw new Error(`credentials-local: an empty value cannot be stored for "${ref}"; use unset`)
     }
-    await this.mutate(ref, async () => ({ value, result: undefined, visibility: 'public' }), 'set')
+    await this.mutate(ref, () => Promise.resolve({ value, result: undefined, visibility: 'public' }), 'set')
   }
 
   override async unset(ref: CredentialRef): Promise<void> {
-    await this.mutate(ref, async () => ({ value: undefined, result: undefined, visibility: 'public' }), 'unset')
+    await this.mutate(ref, () => Promise.resolve({ value: undefined, result: undefined, visibility: 'public' }), 'unset')
   }
 
   /* jscpd:ignore-start -- the operation-chain and reload lifecycle is the same
