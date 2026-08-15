@@ -247,6 +247,7 @@ function scriptedOAuthFace(options: {
   removeFailure?: string
   startFailure?: string
   deferStart?: boolean
+  disconnectStatus?: OAuthStatus
 } = {}) {
   let status = options.status ?? 'missing'
   let configured = options.configured ?? status !== 'missing'
@@ -297,7 +298,7 @@ function scriptedOAuthFace(options: {
     return Promise.resolve(ok({ connection: { provider: 'openai-codex', status } }))
   })
   const oauthDisconnect = vi.fn(() => {
-    status = 'missing'
+    status = options.disconnectStatus ?? 'missing'
     return Promise.resolve(ok({ connection: { provider: 'openai-codex', status } }))
   })
   const face = {
@@ -1603,6 +1604,30 @@ describe('ModelsSection', () => {
       },
     )
     expect(failure).toBe('credential is read-only')
+    expect(mutate).not.toHaveBeenCalled()
+  })
+
+  it('keeps an OAuth profile while remote disconnection is still nonterminal', async () => {
+    const { face, mutate } = scriptedOAuthFace({
+      status: 'connecting',
+      configured: true,
+      disconnectStatus: 'connecting',
+    })
+    const controller = new ModelsSettingsStore(face as unknown as WireFace)
+    await controller.load()
+
+    const failure = await removeProviderProfile(
+      face as unknown as Parameters<typeof removeProviderProfile>[0],
+      controller,
+      {
+        provider: 'openai-codex',
+        settingsNs: 'llm-pi-ai',
+        settingsPath: ['providers', 'openai-codex'],
+        oauth: true,
+      },
+    )
+
+    expect(failure).toBe('oauth-action-failed')
     expect(mutate).not.toHaveBeenCalled()
   })
 

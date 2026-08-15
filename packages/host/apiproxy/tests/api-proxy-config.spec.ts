@@ -634,6 +634,48 @@ describe('credentials domain', () => {
     const unsetError = expectErr(await api.credentials.unset(request({ ref: 'DEEPSEEK_API_KEY' })))
     expect(unsetError.code).toBe('credential-rejected')
   })
+
+  it('keeps fixed OAuth references outside every generic browser credential operation', async () => {
+    const ctx = await harness()
+    const api = createApiProxy(ctx, DEFAULTS)
+    const privateRefs = ['DSH_OPENAI_CODEX_OAUTH', 'DSH_OPENAI_CODEX_LOGIN_LEASE']
+    for (const ref of privateRefs) {
+      await ctx.credentials.modify(credentialRef(ref), async () => ({
+        value: 'private-browser-reservation-sentinel',
+        result: undefined,
+        visibility: 'private',
+      }))
+    }
+
+    const frames = await collectHost(api, ['host/remote-event'], 1, async () => {
+      for (const ref of privateRefs) {
+        const describeError = expectErr(await api.credentials.describe(request({ refs: [ref] })))
+        const setError = expectErr(await api.credentials.set(request({
+          ref,
+          value: 'browser-overwrite-sentinel',
+        })))
+        const unsetError = expectErr(await api.credentials.unset(request({ ref })))
+        for (const error of [describeError, setError, unsetError]) {
+          expect(error).toEqual({
+            code: 'credential-rejected',
+            message: 'Credential operation is unavailable.',
+            details: {},
+          })
+          expect(JSON.stringify(error)).not.toContain(ref)
+        }
+        await expect(ctx.credentials.resolve(credentialRef(ref))).resolves.toMatchObject({
+          value: 'private-browser-reservation-sentinel',
+        })
+      }
+      expectOk(await api.credentials.set(request({ ref: 'PUBLIC_BROWSER_KEY', value: 'public-value' })))
+    })
+
+    expect(frames).toEqual([{
+      type: 'host/remote-event',
+      event: 'credentials/updated',
+      args: ['PUBLIC_BROWSER_KEY'],
+    }])
+  })
 })
 
 describe('llm domain', () => {

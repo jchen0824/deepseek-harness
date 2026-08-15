@@ -132,6 +132,19 @@
   - text: GPT-5.4 High
   - img
 
+# Provider-neutral model failure
+
+- text: Exercise the provider failure path. {{clock}}
+- button "Copy":
+  - img
+- button "Context injection @deepseek-ai/dsh-system-prompt":
+  - img
+  - img
+  - text: Context injection @deepseek-ai/dsh-system-prompt
+- status:
+  - text: This turn failedOpenAI Codex request failed
+  - code: PI_AI_ERROR
+
 # Saved default inherited by a later session
 
 - button "Select model, current GPT-5.4, reasoning effort High":

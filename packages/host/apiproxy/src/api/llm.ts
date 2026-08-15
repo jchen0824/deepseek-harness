@@ -10,18 +10,31 @@
 
 import type { RpcRequest, RpcResponse } from './rpc.ts'
 import type { ModelCatalogFailure, ModelProviderGroup } from './sessions.ts'
-import type {
-  LlmOAuthConnection,
-  LlmOAuthDeviceCode,
-  LlmProviderAuth,
-} from '@deepseek-ai/dsh-llm/types'
+import type { LlmProviderAuth } from '@deepseek-ai/dsh-llm/types'
 
 /** Redacted public OAuth connection state. */
-export type OAuthConnectionView = LlmOAuthConnection
+export interface OAuthConnectionView {
+  /** Configured provider route. */
+  provider: string
+  /** Fixed Host-owned public lifecycle state. */
+  status: 'missing' | 'connecting' | 'connected' | 'reconnect-required'
+}
+
+/** Ephemeral device instructions returned only to the initiating browser call. */
+export interface OAuthDeviceCodeView {
+  /** Provider verification page. */
+  verificationUri: string
+  /** One-time code entered at the verification page. */
+  userCode: string
+  /** Provider polling interval, when supplied. */
+  intervalSeconds?: number
+  /** Device-code lifetime, when supplied. */
+  expiresInSeconds?: number
+}
 
 /** Ephemeral start result, excluding the controller's duplicate connection field. */
 export type OAuthStartActionView =
-  | { kind: 'device-code'; deviceCode: LlmOAuthDeviceCode }
+  | { kind: 'device-code'; deviceCode: OAuthDeviceCodeView }
   | { kind: 'already-connecting' }
   | { kind: 'connected' }
 

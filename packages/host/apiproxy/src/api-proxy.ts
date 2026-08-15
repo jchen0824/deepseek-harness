@@ -134,6 +134,12 @@ const WEB_SETTINGS_NAMESPACES = [
   'agent-loop', 'shell', 'locale', 'permission', 'ui-conversation', 'ui-theme', 'web-search-deepseek',
 ] as const
 
+/** Fixed OAuth storage names unavailable to every generic browser credential operation. */
+const PRIVATE_BROWSER_CREDENTIAL_REFS = new Set([
+  'DSH_OPENAI_CODEX_OAUTH',
+  'DSH_OPENAI_CODEX_LOGIN_LEASE',
+])
+
 /** Provider work budget: at most 100 calls and 2,000 inspected hits. */
 const SESSION_SEARCH_PROVIDER_CALL_LIMIT = 100
 
@@ -1932,6 +1938,15 @@ export function createApiProxy(ctx: Context, defaults: ApiProxyDefaults): ApiPro
     return { code: 'internal', message: 'credentials service is absent: this deployment does not mount a credential provider (e.g. @deepseek-ai/dsh-credentials-local) in its composition', details: {} }
   }
 
+  /** Refuse private references without echoing their name or stored state. */
+  function privateCredentialUnavailable<T>(request: RpcRequest<unknown>): RpcResponse<T> {
+    return err(request, {
+      code: 'credential-rejected',
+      message: 'Credential operation is unavailable.',
+      details: {},
+    })
+  }
+
   /** Map one redacted settings descriptor to its wire view. */
   function namespaceView(descriptor: SettingsDescriptor): SettingsNamespaceView {
     return {
@@ -3394,6 +3409,9 @@ export function createApiProxy(ctx: Context, defaults: ApiProxyDefaults): ApiPro
 
     credentials: {
       async describe(request) {
+        if (request.payload.refs.some(ref => PRIVATE_BROWSER_CREDENTIAL_REFS.has(ref))) {
+          return privateCredentialUnavailable(request)
+        }
         const credentials = ctx.get('credentials')
         if (credentials === undefined) return err(request, credentialsAbsent())
         const entries = await Promise.all(request.payload.refs.map(async (ref) => {
@@ -3409,6 +3427,9 @@ export function createApiProxy(ctx: Context, defaults: ApiProxyDefaults): ApiPro
       },
 
       async set(request) {
+        if (PRIVATE_BROWSER_CREDENTIAL_REFS.has(request.payload.ref)) {
+          return privateCredentialUnavailable(request)
+        }
         const credentials = ctx.get('credentials')
         if (credentials === undefined) return err(request, credentialsAbsent())
         const { ref, value } = request.payload
@@ -3425,6 +3446,9 @@ export function createApiProxy(ctx: Context, defaults: ApiProxyDefaults): ApiPro
       },
 
       async unset(request) {
+        if (PRIVATE_BROWSER_CREDENTIAL_REFS.has(request.payload.ref)) {
+          return privateCredentialUnavailable(request)
+        }
         const credentials = ctx.get('credentials')
         if (credentials === undefined) return err(request, credentialsAbsent())
         const { ref } = request.payload

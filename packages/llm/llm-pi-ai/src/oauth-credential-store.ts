@@ -31,9 +31,12 @@ const STORAGE_ERROR_CODE = 'OPENAI_CODEX_AUTH_STORAGE'
 
 /** Versioned durable credential record; pi-ai owns credential extension fields. */
 interface StoredOAuthRecord {
-  version: 1
-  credential: OAuthCredential
+  version: 2
+  generation: number
+  credential?: OAuthCredential
 }
+
+const INITIAL_GENERATION = 0
 
 /** Distinguish a pi-ai callback rejection from storage and codec failures. */
 class CredentialCallbackFailure extends Error {
@@ -68,7 +71,7 @@ function oauthCredential(value: unknown): OAuthCredential {
 }
 
 /** Decode one absent or versioned private record. */
-function decodeRecord(value: string | undefined): OAuthCredential | undefined {
+function decodeRecord(value: string | undefined): StoredOAuthRecord | undefined {
   if (value === undefined) return undefined
   let parsed: unknown
   try {
@@ -76,17 +79,34 @@ function decodeRecord(value: string | undefined): OAuthCredential | undefined {
   } catch {
     throw storageFailure()
   }
-  if (!isObject(parsed) || parsed.version !== 1 || !('credential' in parsed)) {
+  if (!isObject(parsed)
+    || parsed.version !== 2
+    || typeof parsed.generation !== 'number'
+    || !Number.isSafeInteger(parsed.generation)
+    || parsed.generation < INITIAL_GENERATION) {
     throw storageFailure()
   }
-  return oauthCredential(parsed.credential)
+  return {
+    version: 2,
+    generation: parsed.generation,
+    ...parsed.credential === undefined ? {} : { credential: oauthCredential(parsed.credential) },
+  }
 }
 
-/** Encode one validated credential as the current private record version. */
-function encodeRecord(credential: Credential): string {
-  const record: StoredOAuthRecord = { version: 1, credential: oauthCredential(credential) }
+/** Return the initial private record used before any login generation exists. */
+function initialRecord(): StoredOAuthRecord {
+  return { version: 2, generation: INITIAL_GENERATION }
+}
+
+/** Encode one validated private record. */
+function encodeRecord(record: StoredOAuthRecord): string {
+  const validated: StoredOAuthRecord = {
+    version: 2,
+    generation: record.generation,
+    ...record.credential === undefined ? {} : { credential: oauthCredential(record.credential) },
+  }
   try {
-    return JSON.stringify(record)
+    return JSON.stringify(validated)
   } catch {
     throw storageFailure()
   }
@@ -129,9 +149,25 @@ export class OpenAICodexCredentialStore implements CredentialStore {
     if (providerId !== PROVIDER) return Promise.resolve(undefined)
     return this.mutatePrivate(current => Promise.resolve({
       value: current,
-      result: decodeRecord(current),
+      result: decodeRecord(current)?.credential,
       visibility: 'private',
     }))
+  }
+
+  /**
+   * Read a credential only when its durable login generation is authoritative.
+   * @param generation - current coordination generation.
+   * @returns the matching credential, or `undefined` after revocation or takeover.
+   */
+  readForGeneration(generation: number): Promise<Credential | undefined> {
+    return this.mutatePrivate((current) => {
+      const record = decodeRecord(current)
+      return Promise.resolve({
+        value: current,
+        result: record?.generation === generation ? record.credential : undefined,
+        visibility: 'private',
+      })
+    })
   }
 
   /** List only redacted OpenAI Codex credential metadata. */
@@ -147,7 +183,8 @@ export class OpenAICodexCredentialStore implements CredentialStore {
   ): Promise<Credential | undefined> {
     if (providerId !== PROVIDER) return Promise.reject(storageFailure())
     return this.mutatePrivate(async (currentValue) => {
-      const current = decodeRecord(currentValue)
+      const record = decodeRecord(currentValue) ?? initialRecord()
+      const current = record.credential
       let proposed: Credential | undefined
       try {
         proposed = await fn(current)
@@ -157,18 +194,121 @@ export class OpenAICodexCredentialStore implements CredentialStore {
       if (proposed === undefined) {
         return { value: currentValue, result: current, visibility: 'private' }
       }
-      const value = encodeRecord(proposed)
-      return { value, result: oauthCredential(proposed), visibility: 'private' }
+      const credential = oauthCredential(proposed)
+      const value = encodeRecord({ ...record, credential })
+      return { value, result: credential, visibility: 'private' }
     })
   }
 
-  /** Remove the private record without decoding a malformed value first. */
+  /** Remove the credential while retaining the generation revocation tombstone. */
   async delete(providerId: string): Promise<void> {
     if (providerId !== PROVIDER) throw storageFailure()
-    await this.mutatePrivate(() => Promise.resolve({
-      value: undefined,
-      result: undefined,
-      visibility: 'private',
-    }))
+    await this.mutatePrivate((current) => {
+      const record = decodeRecord(current) ?? initialRecord()
+      return Promise.resolve({
+        value: encodeRecord({ version: 2, generation: record.generation }),
+        result: undefined,
+        visibility: 'private',
+      })
+    })
+  }
+
+  /**
+   * Bind a new login generation before provider interaction begins.
+   * @param previousGeneration - generation that authorized the lease claim.
+   * @param generation - generation assigned to the new lease holder.
+   * @returns a store facade whose writes fail after revocation or takeover.
+   */
+  async beginLogin(previousGeneration: number, generation: number): Promise<CredentialStore> {
+    if (!Number.isSafeInteger(previousGeneration)
+      || !Number.isSafeInteger(generation)
+      || previousGeneration < INITIAL_GENERATION
+      || generation <= previousGeneration) {
+      throw storageFailure()
+    }
+    await this.mutatePrivate((current) => {
+      const record = decodeRecord(current) ?? initialRecord()
+      if (record.generation > previousGeneration) throw storageFailure()
+      return Promise.resolve({
+        value: encodeRecord({ ...record, generation }),
+        result: undefined,
+        visibility: 'private',
+      })
+    })
+    return this.loginStore(generation)
+  }
+
+  /**
+   * Advance the credential tombstone without allowing an older revoker to win.
+   * @param generation - durable coordination generation to record.
+   * @param clearCredential - whether the committed credential must be removed.
+   */
+  async revokeGeneration(generation: number, clearCredential: boolean): Promise<void> {
+    if (!Number.isSafeInteger(generation) || generation < INITIAL_GENERATION) throw storageFailure()
+    await this.mutatePrivate((current) => {
+      const record = decodeRecord(current) ?? initialRecord()
+      if (record.generation > generation) {
+        return Promise.resolve({ value: current, result: undefined, visibility: 'private' })
+      }
+      const next: StoredOAuthRecord = {
+        version: 2,
+        generation,
+        ...clearCredential || record.credential === undefined ? {} : { credential: record.credential },
+      }
+      return Promise.resolve({
+        value: encodeRecord(next),
+        result: undefined,
+        visibility: 'private',
+      })
+    })
+  }
+
+  /** Create the pi-ai store used only by one currently authorized login. */
+  private loginStore(generation: number): CredentialStore {
+    const read = async (providerId: string): Promise<Credential | undefined> => {
+      if (providerId !== PROVIDER) return undefined
+      return this.readForGeneration(generation)
+    }
+    return {
+      read,
+      list: async () => {
+        const credential = await read(PROVIDER)
+        return credential === undefined ? [] : [{ providerId: PROVIDER, type: credential.type }]
+      },
+      modify: async (providerId, fn) => {
+        if (providerId !== PROVIDER) throw storageFailure()
+        return this.mutatePrivate(async (current) => {
+          const record = decodeRecord(current) ?? initialRecord()
+          if (record.generation !== generation) throw storageFailure()
+          let proposed: Credential | undefined
+          try {
+            proposed = await fn(record.credential)
+          } catch (error) {
+            throw new CredentialCallbackFailure(error)
+          }
+          if (proposed === undefined) {
+            return { value: current, result: record.credential, visibility: 'private' }
+          }
+          const credential = oauthCredential(proposed)
+          return {
+            value: encodeRecord({ ...record, credential }),
+            result: credential,
+            visibility: 'private',
+          }
+        })
+      },
+      delete: async (providerId) => {
+        if (providerId !== PROVIDER) throw storageFailure()
+        await this.mutatePrivate((current) => {
+          const record = decodeRecord(current) ?? initialRecord()
+          if (record.generation !== generation) throw storageFailure()
+          return Promise.resolve({
+            value: encodeRecord({ version: 2, generation }),
+            result: undefined,
+            visibility: 'private',
+          })
+        })
+      },
+    }
   }
 }

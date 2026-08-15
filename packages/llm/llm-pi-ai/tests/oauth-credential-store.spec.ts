@@ -104,10 +104,15 @@ describe('OpenAICodexCredentialStore', () => {
     await expect(store.list()).resolves.toEqual([{ providerId: PROVIDER, type: 'oauth' }])
     const stored = JSON.parse(credentials.latestStoredValue() ?? '{}') as {
       version?: unknown
+      generation?: unknown
       credential?: { type?: unknown }
     }
-    expect({ version: stored.version, credentialType: stored.credential?.type }).toEqual({
-      version: 1, credentialType: 'oauth',
+    expect({
+      version: stored.version,
+      generation: stored.generation,
+      credentialType: stored.credential?.type,
+    }).toEqual({
+      version: 2, generation: 0, credentialType: 'oauth',
     })
     expect(credentials.visibilities.every(visibility => visibility === 'private')).toBe(true)
   })
@@ -185,6 +190,22 @@ describe('OpenAICodexCredentialStore', () => {
       { auth: {}, source: 'OAuth' },
     ])
     expect(refreshes).toBe(1)
+  })
+
+  it('rejects a login persistence after its durable generation is revoked', async () => {
+    const credentials = new AtomicCredentials(new Context())
+    const store = new OpenAICodexCredentialStore(() => credentials)
+    const loginStore = await store.beginLogin(0, 1)
+
+    await store.revokeGeneration(2, true)
+
+    await expect(loginStore.modify(PROVIDER, async () => oauth())).rejects.toEqual(
+      expect.objectContaining({
+        code: 'OPENAI_CODEX_AUTH_STORAGE',
+        message: 'OpenAI Codex authentication storage is unavailable',
+      }),
+    )
+    await expect(store.readForGeneration(2)).resolves.toBeUndefined()
   })
 
   it('deletes the stored connection through pi-ai logout', async () => {

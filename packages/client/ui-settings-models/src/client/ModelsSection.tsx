@@ -118,6 +118,10 @@ export async function removeProviderProfile(
     if (target.oauth === true) {
       const response = await api.llm.oauthDisconnect({ provider: target.provider })
       if (!response.result.ok) return OAUTH_ACTION_FAILED
+      if (response.result.value.connection.status !== 'missing') {
+        await controller.load()
+        return OAUTH_ACTION_FAILED
+      }
       disconnected = true
       await controller.load()
     }

@@ -63,9 +63,10 @@ import { idleWatchdog, timeoutOf } from '@deepseek-ai/dsh-timeout'
 import type { ResolvedPiAiProviderProfile } from './config.ts'
 import { toPiContext } from './context.ts'
 import type { OpenAICodexOAuthController } from './openai-codex-oauth.ts'
-import { mapStopReason, toStreamChunks } from './stream.ts'
+import { classifyPiAiError, mapStopReason, toStreamChunks } from './stream.ts'
 
 const OPENAI_CODEX_PROVIDER = 'openai-codex'
+const OPENAI_CODEX_REQUEST_FAILURE = 'OpenAI Codex request failed'
 
 /** One resolution's frozen view: the profiles and the collection built from them. */
 interface PiAiSnapshot {
@@ -149,9 +150,9 @@ function oauthReconnectFailure(): LlmError {
   )
 }
 
-/** Throw the single public reconnect failure after committing controller state. */
-function reconnectOAuth(controller: PiAiAdapterOptions['oauthController']): never {
-  controller?.markReconnectRequired()
+/** Throw the single public reconnect failure after committing durable controller state. */
+async function reconnectOAuth(controller: PiAiAdapterOptions['oauthController']): Promise<never> {
+  await controller?.markReconnectRequired()
   throw oauthReconnectFailure()
 }
 
@@ -193,10 +194,41 @@ async function* guardNativeOAuthEvents(
           unavailable = true
         }
       }
-      if (unavailable) reconnectOAuth(controller)
+      if (unavailable) await reconnectOAuth(controller)
     }
     yield event
   }
+}
+
+/** Replace every native Codex terminal failure message before yielding a chunk. */
+async function* sanitizeNativeCodexChunks(
+  events: AsyncIterable<AssistantMessageEvent>,
+  contextWindow: number | undefined,
+): AsyncGenerator<StreamChunk> {
+  for await (const chunk of toStreamChunks(events, contextWindow)) {
+    if (chunk.type !== 'finish'
+      || (chunk.reason.kind !== 'error' && chunk.reason.kind !== 'aborted')) {
+      yield chunk
+      continue
+    }
+    yield {
+      ...chunk,
+      reason: {
+        ...chunk.reason,
+        failure: { ...chunk.reason.failure, message: OPENAI_CODEX_REQUEST_FAILURE },
+      },
+    }
+  }
+}
+
+/** Convert a thrown native provider failure without retaining its message or cause. */
+function nativeCodexFailure(error: unknown): LlmError {
+  const message = typeof error === 'string'
+    ? error
+    : error instanceof Error
+      ? error.message
+      : ''
+  return new LlmError(OPENAI_CODEX_REQUEST_FAILURE, classifyPiAiError(message))
 }
 
 /** Build a Models collection from one captured profile map and credential store. */
@@ -226,7 +258,7 @@ export interface PiAiAdapterOptions {
   resolveApiKey: (provider: string, profile: ResolvedPiAiProviderProfile) => Promise<string | undefined>
   /** Stable pi-ai credential store shared beneath every request-local OAuth facade. */
   credentialStore?: CredentialStore
-  /** Raw host controller used only to mark a request-time refresh failure. */
+  /** Raw host controller used only to persist a request-time refresh failure. */
   oauthController?: Pick<OpenAICodexOAuthController, 'markReconnectRequired'>
   /** Resolve the optional durable attachment service at request time. */
   resolveAttachments?: () => AttachmentStore | undefined
@@ -465,11 +497,11 @@ export class PiAiAdapter extends LlmAdapter {
         // provider-text event, which must not enter the Harness stream.
         const auth = await requestModels.getAuth(model)
         if (auth === undefined) {
-          reconnectOAuth(this.config.oauthController)
+          await reconnectOAuth(this.config.oauthController)
         }
       } catch (error) {
         if (error instanceof ModelsError) {
-          reconnectOAuth(this.config.oauthController)
+          await reconnectOAuth(this.config.oauthController)
         }
         throw error
       }
@@ -515,7 +547,10 @@ export class PiAiAdapter extends LlmAdapter {
           this.config.oauthController,
         )
         : sourceEvents
-      const iterator = toStreamChunks(events, model.contextWindow)[Symbol.asyncIterator]()
+      const chunks = nativeCodexOAuth
+        ? sanitizeNativeCodexChunks(events, model.contextWindow)
+        : toStreamChunks(events, model.contextWindow)
+      const iterator = chunks[Symbol.asyncIterator]()
       let exhausted = false
       try {
         while (true) {
@@ -540,12 +575,28 @@ export class PiAiAdapter extends LlmAdapter {
       }
     } catch (error: unknown) {
       if (error instanceof LlmError && error.code === OAUTH_RECONNECT_REQUIRED_CODE) throw error
+      if (nativeCodexOAuth
+        && (oauthFailureVersion !== oauthRequest?.oauthFailures?.version()
+          || error instanceof ModelsError)) {
+        await reconnectOAuth(this.config.oauthController)
+      }
       if (timeoutOf(watchdog.signal, 'LLM_STREAM_IDLE_TIMEOUT') !== undefined) {
-        throw new LlmError(`pi-ai stream idle timeout after ${streamIdleTimeoutMs}ms`, 'TIMEOUT', { cause: error })
+        throw new LlmError(
+          nativeCodexOAuth
+            ? `OpenAI Codex stream idle timeout after ${streamIdleTimeoutMs}ms`
+            : `pi-ai stream idle timeout after ${streamIdleTimeoutMs}ms`,
+          'TIMEOUT',
+          nativeCodexOAuth ? undefined : { cause: error },
+        )
       }
       if (options.signal?.aborted) {
-        throw new LlmError('pi-ai request aborted by caller', 'ABORTED', { cause: error })
+        throw new LlmError(
+          nativeCodexOAuth ? 'OpenAI Codex request aborted by caller' : 'pi-ai request aborted by caller',
+          'ABORTED',
+          nativeCodexOAuth ? undefined : { cause: error },
+        )
       }
+      if (nativeCodexOAuth) throw nativeCodexFailure(error)
       throw error
     } finally {
       consumer.abort('pi-ai stream consumer stopped')

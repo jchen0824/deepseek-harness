@@ -1,14 +1,17 @@
 // Keyless browser proof for the complete Codex OAuth-to-selection path. The
 // scaffold owns the device-code transition, while the real Models store,
 // remote event, pi-ai catalog, Host model gate, and composer selection paths
-// remain assembled exactly as the Web bundle ships them. No model call is
-// made; a stray call still fails through the fixture-less route-only adapter.
+// remain assembled exactly as the Web bundle ships them. A deterministic
+// native-provider failure drives a real model request and proves that stream,
+// persistence, Host history, browser events, visible copy, and logs expose
+// only the provider-neutral failure.
 import { readFile } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
 import { join } from 'node:path'
 import type { Browser, Page } from 'playwright'
 import { chromium } from 'playwright'
 import { afterAll, beforeAll, describe, expect, it, onTestFailed } from 'vitest'
+import { Logger } from '@deepseek-ai/cordis'
 import type { SessionId } from '@deepseek-ai/dsh-session'
 import {
   acknowledgeReloadConnectionLoss, assertFixtureInventory, captureStableAria, compareOrRefreshGolden,
@@ -19,6 +22,15 @@ import { connectFreshWorkspace, newEnglishPage, saveFailureShot } from './suppor
 const SNAPSHOT_DIR = fileURLToPath(new URL('./snapshots/openai-codex-oauth', import.meta.url))
 const FLOW_EXPECTED = join(SNAPSHOT_DIR, 'flow.expected.md')
 const MODE = webSnapshotMode()
+const PROVIDER_FAILURE_MESSAGE = 'OpenAI Codex request failed'
+const REDACTION_SENTINELS = [
+  'sensitive-token-sentinel',
+  'sensitive-authorization-sentinel',
+  'sensitive-account-sentinel',
+  'sensitive-plan-sentinel',
+  'sensitive-reference-sentinel',
+  'sensitive-error-sentinel',
+] as const
 
 /** Add a stable Markdown heading to one captured ARIA state. */
 function stage(title: string, snapshot: string): string {
@@ -30,6 +42,7 @@ describe.skipIf(MODE === 'record')('web e2e: Codex OAuth reaches normal model se
   let browser: Browser
   let page: Page
   let tripwire: ReturnType<typeof watchConsole>
+  let browserConsoleMessages: string[]
   let oauthRpcPayloads: Array<Promise<string>>
   let oauthEventPayloads: string[]
 
@@ -48,6 +61,8 @@ describe.skipIf(MODE === 'record')('web e2e: Codex OAuth reaches normal model se
     browser = await chromium.launch()
     page = await newEnglishPage(browser)
     tripwire = watchConsole(page)
+    browserConsoleMessages = []
+    page.on('console', message => browserConsoleMessages.push(message.text()))
     oauthRpcPayloads = []
     oauthEventPayloads = []
     page.on('response', (response) => {
@@ -131,14 +146,54 @@ describe.skipIf(MODE === 'record')('web e2e: Codex OAuth reaches normal model se
     expect(settings).toContain('model: gpt-5.4')
     expect(settings).toContain('reasoningEffort: high')
 
-    // Model selection alone deliberately leaves a Session blank and reusable.
-    // Commit an empty completed turn, then reload the list projection, so New
-    // session exercises default inheritance without issuing a model request.
+    const logStart = scaffold.ctx.logger.buffer.length
+    const input = page.locator('textarea').first()
+    await input.waitFor({ timeout: 10_000 })
+    const settled = scaffold.whenTurnSettled()
+    await input.fill('Exercise the provider failure path.')
+    await input.press('Enter')
+    expect(await settled).toBe(initialSession)
+    await page.getByText(PROVIDER_FAILURE_MESSAGE, { exact: true }).last().waitFor({ timeout: 10_000 })
+    const providerFailure = await captureStableAria(page, '[data-chat-flow]', scaffold.workspaceCwd)
+
     const initialAgent = scaffold.ctx.agents.get(initialSession)
     if (initialAgent === undefined) throw new Error('Codex OAuth scenario lost its initial Agent')
-    initialAgent.session.append('turn/start', { turn: 1 })
-    initialAgent.session.append('turn/end', { turn: 1, reason: { kind: 'completed' } })
-    await scaffold.ctx.sessions.flush(initialAgent.session)
+    const streamPayload = JSON.stringify(initialAgent.session.events)
+    expect(streamPayload).toContain(PROVIDER_FAILURE_MESSAGE)
+    const persistedPayload = JSON.stringify(await scaffold.ctx.sessionPersistence.inspect(initialSession))
+    expect(persistedPayload).toContain(PROVIDER_FAILURE_MESSAGE)
+    const browserHistory = await page.evaluate(async ({ sessionId }) => {
+      const response = await fetch('/api/session.history', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          type: 'client-request',
+          rpcId: 'codex-oauth-failure-history',
+          method: 'session.history',
+          payload: { sessionId },
+        }),
+      })
+      if (!response.ok) throw new Error(`session.history returned HTTP ${response.status}`)
+      return response.text()
+    }, { sessionId: String(initialSession) })
+    expect(browserHistory).toContain(PROVIDER_FAILURE_MESSAGE)
+    await expect.poll(
+      () => oauthEventPayloads.some(payload => payload.includes(PROVIDER_FAILURE_MESSAGE)),
+      { timeout: 10_000 },
+    ).toBe(true)
+    const logPayload = scaffold.ctx.logger.buffer.slice(logStart)
+      .map(message => Logger.format({ colors: false, export: () => undefined }, message))
+      .join('\n')
+    for (const sentinel of REDACTION_SENTINELS) {
+      expect(streamPayload).not.toContain(sentinel)
+      expect(persistedPayload).not.toContain(sentinel)
+      expect(browserHistory).not.toContain(sentinel)
+      expect(logPayload).not.toContain(sentinel)
+      expect(browserConsoleMessages.join('\n')).not.toContain(sentinel)
+    }
+
+    // The failed request made the Session nonblank. Reload the list projection
+    // so New session exercises default inheritance from an ordinary turn.
     const warningStart = tripwire.warnings.length
     await page.reload({ waitUntil: 'load' })
     await page.waitForSelector('[class*="frame"]', { timeout: 30_000 })
@@ -191,22 +246,16 @@ describe.skipIf(MODE === 'record')('web e2e: Codex OAuth reaches normal model se
       stage('Connected through the OAuth event', connectedFromEvent),
       stage('Connected Codex catalog in the normal picker', picker),
       stage('Current session Codex selection', currentSelection),
+      stage('Provider-neutral model failure', providerFailure),
       stage('Saved default inherited by a later session', inheritedDefault),
       stage('Later session override remains scoped', scopedSelection),
     ].join('\n\n')
     const redaction = scaffold.oauthRedactionEvidence('openai-codex')
-    const sentinels = [
-      'sensitive-token-sentinel',
-      'sensitive-authorization-sentinel',
-      'sensitive-account-sentinel',
-      'sensitive-plan-sentinel',
-      'sensitive-reference-sentinel',
-      'sensitive-error-sentinel',
-    ]
-    expect(redaction.sentinels).toEqual(sentinels)
+    expect(redaction.sentinels).toEqual(REDACTION_SENTINELS)
     expect(redaction.payloadsIssued).toBeGreaterThan(0)
+    expect(redaction.modelRequests).toBeGreaterThan(0)
     const privatePayload = JSON.stringify(redaction.lastPrivatePayload)
-    for (const sentinel of sentinels) expect(privatePayload).toContain(sentinel)
+    for (const sentinel of REDACTION_SENTINELS) expect(privatePayload).toContain(sentinel)
 
     const rpcPayload = (await Promise.all(oauthRpcPayloads)).join('\n')
     expect(rpcPayload).toContain('ABCD-EFGH')
@@ -217,7 +266,8 @@ describe.skipIf(MODE === 'record')('web e2e: Codex OAuth reaches normal model se
     ).toBe(true)
     const browserPayload = `${rpcPayload}\n${oauthEventPayloads.join('\n')}`
     expect(browserPayload).toContain('"status":"connected"')
-    for (const sentinel of sentinels) expect(browserPayload).not.toContain(sentinel)
+    expect(browserPayload).toContain(PROVIDER_FAILURE_MESSAGE)
+    for (const sentinel of REDACTION_SENTINELS) expect(browserPayload).not.toContain(sentinel)
 
     const visibleOutput = `${flow}\n${await page.locator('body').innerText()}`
     expect(visibleOutput).not.toMatch(/\b(?:sk-[A-Za-z0-9_-]{8,}|eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,})\b/)

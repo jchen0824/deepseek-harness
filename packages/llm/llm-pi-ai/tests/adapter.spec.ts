@@ -20,7 +20,7 @@ import { PiAiAdapter } from '@deepseek-ai/dsh-llm-pi-ai'
 import { MAX_TIMER_DELAY_MS } from '@deepseek-ai/dsh-timeout'
 import { lazyStream } from '@earendil-works/pi-ai'
 import { getBuiltinModels } from '@earendil-works/pi-ai/providers/all'
-import type { Credential, CredentialInfo, CredentialStore, OAuthCredential, Provider } from '@earendil-works/pi-ai'
+import type { Credential, CredentialInfo, CredentialStore, Models, OAuthCredential, Provider } from '@earendil-works/pi-ai'
 import { resolveProfiles } from '../src/config.ts'
 import { assemble } from './assemble.ts'
 import { closeMockServers, mockServer, textEvents } from './mock-server.ts'
@@ -195,7 +195,7 @@ describe('PiAiAdapter provider routing', () => {
     if (resolved === undefined) throw new Error('expected Codex profile')
     const provider: Provider = {
       ...resolved.piProvider,
-      streamSimple: () => { throw new Error('test stream stop') },
+      streamSimple: () => { throw new Error('hostile-native-terminal-sentinel') },
     }
     const profile = { ...resolved, piProvider: provider }
     let keyResolutions = 0
@@ -207,11 +207,12 @@ describe('PiAiAdapter provider routing', () => {
         return Promise.resolve('legacy-override')
       },
       credentialStore: new MemoryOAuthStore(oauthCredential(Date.now() + 60_000)),
-      oauthController: { markReconnectRequired: () => { reconnects += 1 } },
+      oauthController: { markReconnectRequired: () => { reconnects += 1; return Promise.resolve() } },
     })
 
     const chunkTypes: string[] = []
     let finishCode: string | undefined
+    let finishMessage: string | undefined
     for await (const chunk of adapter.stream({
       provider: 'openai-codex',
       model: resolved.piProvider.getModels()[0]!.id,
@@ -220,6 +221,7 @@ describe('PiAiAdapter provider routing', () => {
       chunkTypes.push(chunk.type)
       if (chunk.type === 'finish' && chunk.reason.kind === 'error') {
         finishCode = chunk.reason.failure.code
+        finishMessage = chunk.reason.failure.message
       }
     }
 
@@ -227,6 +229,42 @@ describe('PiAiAdapter provider routing', () => {
     expect(reconnects).toBe(0)
     expect(chunkTypes).toEqual(['usage', 'finish'])
     expect(finishCode).toBe('PI_AI_ERROR')
+    expect(finishMessage).toBe('OpenAI Codex request failed')
+    expect(JSON.stringify({ chunkTypes, finishCode, finishMessage }))
+      .not.toContain('hostile-native-terminal-sentinel')
+  })
+
+  it('sanitizes a synchronous native Codex stream exception without yielding provider text', async () => {
+    const resolved = resolveProfiles({ 'openai-codex': {} }).get('openai-codex')
+    if (resolved === undefined) throw new Error('expected Codex profile')
+    const adapter = new PiAiAdapter({
+      profiles: () => new Map([['openai-codex', resolved]]),
+      resolveApiKey: () => Promise.resolve(undefined),
+      credentialStore: new MemoryOAuthStore(oauthCredential(Date.now() + 60_000)),
+    })
+    const requestModels = {
+      getAuth: () => Promise.resolve({ auth: {}, source: 'OAuth' as const }),
+      streamSimple: () => { throw new Error('hostile-native-throw-sentinel') },
+    } as unknown as Models
+    vi.spyOn(
+      adapter as unknown as { nativeOAuthRequest: () => { models: Models } },
+      'nativeOAuthRequest',
+    ).mockReturnValue({ models: requestModels })
+    const chunks: unknown[] = []
+    const consume = async (): Promise<void> => {
+      for await (const chunk of adapter.stream({
+        provider: 'openai-codex',
+        model: resolved.piProvider.getModels()[0]!.id,
+        messages: [],
+      })) chunks.push(chunk)
+    }
+
+    await expect(consume()).rejects.toMatchObject({
+      code: 'PI_AI_ERROR',
+      message: 'OpenAI Codex request failed',
+    })
+    expect(chunks).toEqual([])
+    expect(JSON.stringify(chunks)).not.toContain('hostile-native-throw-sentinel')
   })
 
   it('normalizes a failed OAuth refresh before provider text reaches the stream', async () => {
@@ -254,7 +292,7 @@ describe('PiAiAdapter provider routing', () => {
       profiles: () => new Map([['openai-codex', profile]]),
       resolveApiKey: () => Promise.resolve(undefined),
       credentialStore: new MemoryOAuthStore(oauthCredential(0)),
-      oauthController: { markReconnectRequired: () => { reconnects += 1 } },
+      oauthController: { markReconnectRequired: () => { reconnects += 1; return Promise.resolve() } },
     })
     await expect(drainCodex(adapter, resolved.piProvider.getModels()[0]!.id))
       .rejects.toEqual(expect.objectContaining({
@@ -275,7 +313,7 @@ describe('PiAiAdapter provider routing', () => {
       profiles: () => new Map([['openai-codex', resolved]]),
       resolveApiKey: () => Promise.resolve(undefined),
       credentialStore: store,
-      oauthController: { markReconnectRequired: () => { reconnects += 1 } },
+      oauthController: { markReconnectRequired: () => { reconnects += 1; return Promise.resolve() } },
     })
     await expect(drainCodex(adapter, resolved.piProvider.getModels()[0]!.id)).rejects.toMatchObject({
       code: OAUTH_RECONNECT_REQUIRED_CODE,
@@ -294,7 +332,7 @@ describe('PiAiAdapter provider routing', () => {
       profiles: () => new Map([['openai-codex', resolved]]),
       resolveApiKey: () => Promise.resolve(undefined),
       credentialStore: store,
-      oauthController: { markReconnectRequired: () => { reconnects += 1 } },
+      oauthController: { markReconnectRequired: () => { reconnects += 1; return Promise.resolve() } },
     })
     const chunkTypes: string[] = []
     const consume = async (): Promise<void> => {
@@ -343,7 +381,7 @@ describe('PiAiAdapter provider routing', () => {
       profiles: () => profiles,
       resolveApiKey: () => Promise.resolve(undefined),
       credentialStore: store,
-      oauthController: { markReconnectRequired: () => { reconnects += 1 } },
+      oauthController: { markReconnectRequired: () => { reconnects += 1; return Promise.resolve() } },
     })
     const firstChunkTypes: string[] = []
     const secondChunkTypes: string[] = []

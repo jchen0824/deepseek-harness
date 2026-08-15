@@ -9,6 +9,7 @@ import type {
 import type {
   AuthInteraction,
   Credential,
+  CredentialStore,
   Models,
   OAuthCredential,
 } from '@earendil-works/pi-ai'
@@ -111,10 +112,41 @@ class DeviceCodeModels {
   prompt: 'device-select' | 'manual-code' | 'lookalike-select' = 'device-select'
   abortCleanup: Promise<void> | undefined
   lastSignal: AbortSignal | undefined
+  private persistencePause: { reached: Deferred<undefined>; release: Deferred<undefined> } | undefined
+  private persistedPause: { reached: Deferred<undefined>; release: Deferred<undefined> } | undefined
 
-  constructor(private readonly store: OpenAICodexCredentialStore) {}
+  /** Pause after provider completion but before the generation-scoped write. */
+  pausePersistence(): { reached: Promise<undefined>; release: () => void } {
+    const reached = deferred<undefined>()
+    const release = deferred<undefined>()
+    this.persistencePause = { reached, release }
+    return { reached: reached.promise, release: () => { release.resolve(undefined) } }
+  }
 
-  async login(providerId: string, type: string, interaction: AuthInteraction): Promise<Credential> {
+  /** Pause after the generation-scoped write but before provider completion. */
+  pauseAfterPersistence(): { reached: Promise<undefined>; release: () => void } {
+    const reached = deferred<undefined>()
+    const release = deferred<undefined>()
+    this.persistedPause = { reached, release }
+    return { reached: reached.promise, release: () => { release.resolve(undefined) } }
+  }
+
+  /** Bind the fake Models calls to the controller-supplied generation store. */
+  models(store: CredentialStore): Models {
+    return {
+      login: (providerId: string, type: string, interaction: AuthInteraction) => (
+        this.login(store, providerId, type, interaction)
+      ),
+      logout: (providerId: string) => this.logout(store, providerId),
+    } as unknown as Models
+  }
+
+  private async login(
+    store: CredentialStore,
+    providerId: string,
+    type: string,
+    interaction: AuthInteraction,
+  ): Promise<Credential> {
     this.loginCount += 1
     this.lastSignal = interaction.signal
     if (providerId !== PROVIDER || type !== 'oauth') throw new Error('unexpected login route')
@@ -162,7 +194,19 @@ class DeviceCodeModels {
           }, { once: true })
         }),
       ])
-      await this.store.modify(PROVIDER, async () => credential)
+      const pause = this.persistencePause
+      if (pause !== undefined) {
+        pause.reached.resolve(undefined)
+        await pause.release.promise
+        if (this.persistencePause === pause) this.persistencePause = undefined
+      }
+      await store.modify(PROVIDER, async () => credential)
+      const persisted = this.persistedPause
+      if (persisted !== undefined) {
+        persisted.reached.resolve(undefined)
+        await persisted.release.promise
+        if (this.persistedPause === persisted) this.persistedPause = undefined
+      }
       return credential
     } catch (error) {
       await this.abortCleanup
@@ -170,9 +214,9 @@ class DeviceCodeModels {
     }
   }
 
-  async logout(providerId: string): Promise<void> {
+  private async logout(store: CredentialStore, providerId: string): Promise<void> {
     this.logoutCount += 1
-    await this.store.delete(providerId)
+    await store.delete(providerId)
   }
 }
 
@@ -191,7 +235,7 @@ function controllerOf(
   const controller = new OpenAICodexOAuthController({
     credentials: () => credentials,
     credentialStore: new OpenAICodexCredentialStore(() => credentials),
-    models: () => models as unknown as Models,
+    models: store => models.models(store),
     loginLeaseTtlMs: () => ttl.value,
     emitConnectionUpdated: (connection) => { events.push(connection) },
     now: () => now.value,
@@ -218,8 +262,7 @@ afterEach(async () => {
 describe('OpenAICodexOAuthController', () => {
   it('selects device-code login and returns as soon as the code is available', async () => {
     const credentials = new SharedCredentials(new Context())
-    const store = new OpenAICodexCredentialStore(() => credentials)
-    const models = new DeviceCodeModels(store)
+    const models = new DeviceCodeModels()
     const events: LlmOAuthConnection[] = []
     const controller = controllerOf(credentials, models, events, { value: 0 })
 
@@ -241,7 +284,7 @@ describe('OpenAICodexOAuthController', () => {
   it('persists a successful login and emits only redacted status transitions', async () => {
     const credentials = new SharedCredentials(new Context())
     const store = new OpenAICodexCredentialStore(() => credentials)
-    const models = new DeviceCodeModels(store)
+    const models = new DeviceCodeModels()
     const events: LlmOAuthConnection[] = []
     const controller = controllerOf(credentials, models, events, { value: 0 })
     await controller.start()
@@ -258,8 +301,8 @@ describe('OpenAICodexOAuthController', () => {
 
   it('allows only one live login lease across controller processes', async () => {
     const credentials = new SharedCredentials(new Context())
-    const firstModels = new DeviceCodeModels(new OpenAICodexCredentialStore(() => credentials))
-    const secondModels = new DeviceCodeModels(new OpenAICodexCredentialStore(() => credentials))
+    const firstModels = new DeviceCodeModels()
+    const secondModels = new DeviceCodeModels()
     const now = { value: 0 }
     const first = controllerOf(credentials, firstModels, [], now)
     const second = controllerOf(credentials, secondModels, [], now)
@@ -273,19 +316,140 @@ describe('OpenAICodexOAuthController', () => {
     expect(secondModels.loginCount).toBe(0)
   })
 
+  it('lets another controller cancel the live generation without credential recreation', async () => {
+    const credentials = new SharedCredentials(new Context())
+    const ownerModels = new DeviceCodeModels()
+    const remoteModels = new DeviceCodeModels()
+    const now = { value: 0 }
+    const ownerEvents: LlmOAuthConnection[] = []
+    const remoteEvents: LlmOAuthConnection[] = []
+    const owner = controllerOf(credentials, ownerModels, ownerEvents, now)
+    const remote = controllerOf(credentials, remoteModels, remoteEvents, now)
+    await owner.start()
+
+    await expect(remote.cancel()).resolves.toEqual({ provider: PROVIDER, status: 'missing' })
+    ownerModels.completion.resolve(oauth())
+    await waitForStatus(owner, 'missing')
+
+    const store = new OpenAICodexCredentialStore(() => credentials)
+    await expect(store.read(PROVIDER)).resolves.toBeUndefined()
+    expect(remoteModels.loginCount).toBe(0)
+    expect(ownerEvents.at(-1)).toEqual({ provider: PROVIDER, status: 'missing' })
+    expect(remoteEvents).not.toContainEqual({ provider: PROVIDER, status: 'connecting' })
+    expect(JSON.stringify([...ownerEvents, ...remoteEvents])).not.toMatch(/private-(?:access|refresh|account)-value/)
+  })
+
+  it('remote cancellation clears a credential persisted by the still-live lease', async () => {
+    const credentials = new SharedCredentials(new Context())
+    const store = new OpenAICodexCredentialStore(() => credentials)
+    const ownerModels = new DeviceCodeModels()
+    const now = { value: 0 }
+    const owner = controllerOf(credentials, ownerModels, [], now)
+    const remote = controllerOf(credentials, new DeviceCodeModels(), [], now)
+    const persisted = ownerModels.pauseAfterPersistence()
+    await owner.start()
+    ownerModels.completion.resolve(oauth())
+    await persisted.reached
+
+    try {
+      await expect(store.read(PROVIDER)).resolves.toMatchObject({ type: 'oauth' })
+      await expect(remote.cancel()).resolves.toEqual({ provider: PROVIDER, status: 'missing' })
+      await expect(store.read(PROVIDER)).resolves.toBeUndefined()
+    } finally {
+      persisted.release()
+    }
+    await waitForStatus(owner, 'missing')
+  })
+
+  it('lets another controller disconnect while provider completion is waiting to persist', async () => {
+    const credentials = new SharedCredentials(new Context())
+    const ownerModels = new DeviceCodeModels()
+    const remoteModels = new DeviceCodeModels()
+    const now = { value: 0 }
+    const owner = controllerOf(credentials, ownerModels, [], now)
+    const remote = controllerOf(credentials, remoteModels, [], now)
+    const persistence = ownerModels.pausePersistence()
+    await owner.start()
+    ownerModels.completion.resolve(oauth())
+    await persistence.reached
+
+    try {
+      await expect(remote.disconnect()).resolves.toEqual({ provider: PROVIDER, status: 'missing' })
+    } finally {
+      persistence.release()
+    }
+    await waitForStatus(owner, 'missing')
+
+    const store = new OpenAICodexCredentialStore(() => credentials)
+    await expect(store.read(PROVIDER)).resolves.toBeUndefined()
+    expect(remoteModels.logoutCount).toBe(1)
+  })
+
+  it('lets remote removal delete its profile only after polling is durably disconnected', async () => {
+    const credentials = new SharedCredentials(new Context())
+    const ownerModels = new DeviceCodeModels()
+    const now = { value: 0 }
+    const owner = controllerOf(credentials, ownerModels, [], now)
+    const remote = controllerOf(credentials, new DeviceCodeModels(), [], now)
+    const persistence = ownerModels.pausePersistence()
+    let profileConfigured = true
+    await owner.start()
+    ownerModels.completion.resolve(oauth())
+    await persistence.reached
+
+    try {
+      const connection = await remote.disconnect()
+      expect(profileConfigured).toBe(true)
+      if (connection.status === 'missing') profileConfigured = false
+      expect(profileConfigured).toBe(false)
+    } finally {
+      persistence.release()
+    }
+    await waitForStatus(owner, 'missing')
+    const store = new OpenAICodexCredentialStore(() => credentials)
+    await expect(store.read(PROVIDER)).resolves.toBeUndefined()
+  })
+
+  it('propagates reconnect-required state to every controller sharing the home', async () => {
+    const credentials = new SharedCredentials(new Context())
+    const store = new OpenAICodexCredentialStore(() => credentials)
+    await store.modify(PROVIDER, async () => oauth())
+    const now = { value: 0 }
+    const first = controllerOf(credentials, new DeviceCodeModels(), [], now)
+    const secondEvents: LlmOAuthConnection[] = []
+    const second = controllerOf(credentials, new DeviceCodeModels(), secondEvents, now)
+    await expect(second.initialize()).resolves.toEqual({ provider: PROVIDER, status: 'connected' })
+
+    await first.markReconnectRequired()
+
+    await expect(second.status()).resolves.toEqual({ provider: PROVIDER, status: 'reconnect-required' })
+    expect(secondEvents.at(-1)).toEqual({ provider: PROVIDER, status: 'reconnect-required' })
+  })
+
+  it('preserves an established credential when no login lease is pending', async () => {
+    const credentials = new SharedCredentials(new Context())
+    const store = new OpenAICodexCredentialStore(() => credentials)
+    await store.modify(PROVIDER, async () => oauth())
+    const controller = controllerOf(credentials, new DeviceCodeModels(), [], { value: 0 })
+    await expect(controller.initialize()).resolves.toEqual({ provider: PROVIDER, status: 'connected' })
+
+    await expect(controller.cancel()).resolves.toEqual({ provider: PROVIDER, status: 'connected' })
+    await expect(store.read(PROVIDER)).resolves.toMatchObject({ type: 'oauth' })
+  })
+
   it('renews a held lease from the configured TTL before its original expiry', async () => {
     vi.useFakeTimers()
     const credentials = new SharedCredentials(new Context())
     const now = { value: 0 }
     const ttl = { value: 100 }
-    const firstModels = new DeviceCodeModels(new OpenAICodexCredentialStore(() => credentials))
+    const firstModels = new DeviceCodeModels()
     const first = controllerOf(credentials, firstModels, [], now, ttl)
     await first.start()
 
     now.value = 60
     await vi.advanceTimersByTimeAsync(50)
     now.value = 110
-    const secondModels = new DeviceCodeModels(new OpenAICodexCredentialStore(() => credentials))
+    const secondModels = new DeviceCodeModels()
     const second = controllerOf(credentials, secondModels, [], now, ttl)
 
     await expect(second.start()).resolves.toMatchObject({ kind: 'already-connecting' })
@@ -299,7 +463,7 @@ describe('OpenAICodexOAuthController', () => {
     const ttl = { value: 100 }
     const first = controllerOf(
       credentials,
-      new DeviceCodeModels(new OpenAICodexCredentialStore(() => credentials)),
+      new DeviceCodeModels(),
       [],
       now,
       ttl,
@@ -307,12 +471,12 @@ describe('OpenAICodexOAuthController', () => {
     await first.start()
 
     now.value = 101
-    const secondModels = new DeviceCodeModels(new OpenAICodexCredentialStore(() => credentials))
+    const secondModels = new DeviceCodeModels()
     const second = controllerOf(credentials, secondModels, [], now, ttl)
     await expect(second.start()).resolves.toMatchObject({ kind: 'device-code' })
     await first.dispose()
 
-    const thirdModels = new DeviceCodeModels(new OpenAICodexCredentialStore(() => credentials))
+    const thirdModels = new DeviceCodeModels()
     const third = controllerOf(credentials, thirdModels, [], now, ttl)
     await expect(third.start()).resolves.toMatchObject({ kind: 'already-connecting' })
     expect(secondModels.loginCount).toBe(1)
@@ -321,7 +485,7 @@ describe('OpenAICodexOAuthController', () => {
 
   it('cancels and settles the poller before making its lease available', async () => {
     const credentials = new SharedCredentials(new Context())
-    const models = new DeviceCodeModels(new OpenAICodexCredentialStore(() => credentials))
+    const models = new DeviceCodeModels()
     const events: LlmOAuthConnection[] = []
     const now = { value: 0 }
     const controller = controllerOf(credentials, models, events, now)
@@ -329,7 +493,7 @@ describe('OpenAICodexOAuthController', () => {
 
     await expect(controller.cancel()).resolves.toEqual({ provider: PROVIDER, status: 'missing' })
     expect(models.lastSignal?.aborted).toBe(true)
-    const replacementModels = new DeviceCodeModels(new OpenAICodexCredentialStore(() => credentials))
+    const replacementModels = new DeviceCodeModels()
     const replacement = controllerOf(credentials, replacementModels, [], now)
     await expect(replacement.start()).resolves.toMatchObject({ kind: 'device-code' })
     expect(events).toEqual([
@@ -340,7 +504,7 @@ describe('OpenAICodexOAuthController', () => {
 
   it('ordered disposal waits for provider cleanup after aborting', async () => {
     const credentials = new SharedCredentials(new Context())
-    const models = new DeviceCodeModels(new OpenAICodexCredentialStore(() => credentials))
+    const models = new DeviceCodeModels()
     const cleanup = deferred<undefined>()
     models.abortCleanup = cleanup.promise
     const controller = controllerOf(credentials, models, [], { value: 0 })
@@ -359,7 +523,7 @@ describe('OpenAICodexOAuthController', () => {
   it('disposal waits for setup status and prevents a later poller or event', async () => {
     const credentials = new SharedCredentials(new Context())
     const setup = credentials.pauseOperation(1)
-    const models = new DeviceCodeModels(new OpenAICodexCredentialStore(() => credentials))
+    const models = new DeviceCodeModels()
     const events: LlmOAuthConnection[] = []
     const controller = controllerOf(credentials, models, events, { value: 0 })
     const starting = controller.start()
@@ -385,7 +549,7 @@ describe('OpenAICodexOAuthController', () => {
   it('disposal settles a claimed setup lease without starting its poller', async () => {
     const credentials = new SharedCredentials(new Context())
     const setup = credentials.pauseOperation(3)
-    const models = new DeviceCodeModels(new OpenAICodexCredentialStore(() => credentials))
+    const models = new DeviceCodeModels()
     const events: LlmOAuthConnection[] = []
     const controller = controllerOf(credentials, models, events, { value: 0 })
     const starting = controller.start()
@@ -399,7 +563,7 @@ describe('OpenAICodexOAuthController', () => {
       expect(models.loginCount).toBe(0)
       expect(events).toEqual([])
 
-      const replacementModels = new DeviceCodeModels(new OpenAICodexCredentialStore(() => credentials))
+      const replacementModels = new DeviceCodeModels()
       const replacement = controllerOf(credentials, replacementModels, [], { value: 0 })
       await expect(replacement.start()).resolves.toMatchObject({ kind: 'device-code' })
       expect(replacementModels.loginCount).toBe(1)
@@ -413,7 +577,7 @@ describe('OpenAICodexOAuthController', () => {
   it('returns already-connecting for a second start while setup is pending', async () => {
     const credentials = new SharedCredentials(new Context())
     const setup = credentials.pauseOperation(1)
-    const models = new DeviceCodeModels(new OpenAICodexCredentialStore(() => credentials))
+    const models = new DeviceCodeModels()
     const controller = controllerOf(credentials, models, [], { value: 0 })
     const first = controller.start()
     await setup.reached
@@ -437,7 +601,7 @@ describe('OpenAICodexOAuthController', () => {
 
   it('rejects every prompt other than pi-ai device-code selection', async () => {
     const credentials = new SharedCredentials(new Context())
-    const models = new DeviceCodeModels(new OpenAICodexCredentialStore(() => credentials))
+    const models = new DeviceCodeModels()
     models.prompt = 'manual-code'
     const events: LlmOAuthConnection[] = []
     const controller = controllerOf(credentials, models, events, { value: 0 })
@@ -455,7 +619,7 @@ describe('OpenAICodexOAuthController', () => {
 
   it('rejects a lookalike selector that is not pi-ai\'s supported Codex prompt', async () => {
     const credentials = new SharedCredentials(new Context())
-    const models = new DeviceCodeModels(new OpenAICodexCredentialStore(() => credentials))
+    const models = new DeviceCodeModels()
     models.prompt = 'lookalike-select'
     const controller = controllerOf(credentials, models, [], { value: 0 })
 
@@ -467,13 +631,13 @@ describe('OpenAICodexOAuthController', () => {
     const credentials = new SharedCredentials(new Context())
     const store = new OpenAICodexCredentialStore(() => credentials)
     await store.modify(PROVIDER, async () => oauth())
-    const models = new DeviceCodeModels(store)
+    const models = new DeviceCodeModels()
     const events: LlmOAuthConnection[] = []
     const controller = controllerOf(credentials, models, events, { value: 0 })
     await controller.initialize()
     await expect(controller.status()).resolves.toEqual({ provider: PROVIDER, status: 'connected' })
 
-    controller.markReconnectRequired()
+    await controller.markReconnectRequired()
     await expect(controller.status()).resolves.toEqual({ provider: PROVIDER, status: 'reconnect-required' })
     await expect(controller.disconnect()).resolves.toEqual({ provider: PROVIDER, status: 'missing' })
     await expect(store.read(PROVIDER)).resolves.toBeUndefined()
