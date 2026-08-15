@@ -8,6 +8,7 @@ import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
+import { withFileLock, writeFileAtomic } from '@deepseek-ai/dsh-atomic-write'
 import { LocalCredentialProvider } from '../src/index.ts'
 
 /** Credential documents are seeded owner-only, exactly as the provider creates them. */
@@ -245,6 +246,43 @@ describe('read-modify-write', () => {
       expect(await watched.credentials.resolve(ALPHA)).toEqual({ value: 'public-peer', source: 'file' })
     })
 
+    expect(watchedEvents).toEqual([ALPHA])
+  })
+
+  it('waits for the writer lock before reconciling a public visibility transition', async () => {
+    const dir = await tempDir()
+    const path = join(dir, '.credentials.yaml')
+    await writeCredentials(path, `${ALPHA}: old-public\n`)
+    const watched = await boot({ path, debounceMs: 200 })
+    const writer = await boot({ path, watch: false })
+    const watchedEvents: string[] = []
+    watched.on('credentials/updated', (ref) => { watchedEvents.push(ref) })
+
+    await writer.credentials.modify(ALPHA, async () => ({
+      value: 'private-pending',
+      result: undefined,
+      visibility: 'private',
+    }))
+    let locked!: () => void
+    const lockHeld = new Promise<void>((resolve) => { locked = resolve })
+    let release!: () => void
+    const held = new Promise<void>((resolve) => { release = resolve })
+    const transition = withFileLock(path, async () => {
+      await writeFileAtomic(`${path}.private-references.json`, '[]\n', { mode: 0o600, dirMode: 0o700 })
+      locked()
+      await held
+      await writeFileAtomic(path, `${ALPHA}: public-final\n`, { mode: 0o600, dirMode: 0o700 })
+    })
+    await lockHeld
+    await new Promise(resolve => setTimeout(resolve, 300))
+
+    expect(watchedEvents).toEqual([])
+    expect(await watched.credentials.resolve(ALPHA)).toEqual({ value: 'old-public', source: 'file' })
+    release()
+    await transition
+    await vi.waitFor(async () => {
+      expect(await watched.credentials.resolve(ALPHA)).toEqual({ value: 'public-final', source: 'file' })
+    })
     expect(watchedEvents).toEqual([ALPHA])
   })
 

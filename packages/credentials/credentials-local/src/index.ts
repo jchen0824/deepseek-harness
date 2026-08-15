@@ -432,7 +432,7 @@ export class LocalCredentialProvider extends CredentialProvider {
         // observed yet — an external edit still inside the watcher debounce
         // window, a change the watcher missed, or another process's write —
         // so the line edit below can never resurrect a stale document.
-        await this.reconcileFromDisk()
+        await this.reconcileLockedFromDisk()
         this.assertUnshadowed(ref, verb)
         const before = this.values.get(ref)
         // The file lock deliberately stays held across this async callback:
@@ -543,14 +543,22 @@ export class LocalCredentialProvider extends CredentialProvider {
     }
   }
 
-  /**
-   * Compare the on-disk text against the cache and publish any difference
-   * into the seam. Absence publishes the empty store; an unreadable or
-   * invalid document throws, so each caller picks its policy — a reload warns
-   * and keeps the last good snapshot, a write fails loud rather than
-   * overwriting a document it could not understand.
-   */
+  /** Acquire the main writer lock before reconciling credential and visibility snapshots. */
   private async reconcileFromDisk(): Promise<void> {
+    // The lock's exclusive create needs the parent even for a watcher reload
+    // that observes an absent document.
+    await mkdir(dirname(this.spec.filename), { recursive: true, mode: 0o700 })
+    await withFileLock(this.spec.filename, async () => this.reconcileLockedFromDisk())
+  }
+
+  /**
+   * Compare the locked credential and visibility snapshots against the cache
+   * and publish any difference into the seam. Absence publishes the empty
+   * store; an unreadable or invalid document throws, so each caller picks its
+   * policy — a reload warns and keeps the last good snapshot, a write fails
+   * loud rather than overwriting a document it could not understand.
+   */
+  private async reconcileLockedFromDisk(): Promise<void> {
     // Re-checked on every reload and before every write: an external editor or
     // a restored backup can loosen the mode after boot.
     await assertOwnerOnly(this.spec.filename)
