@@ -1947,6 +1947,18 @@ function createFixtureWorld(options: FixtureOptions): FixtureWorld {
   /** Redacted fixture state for the one OAuth provider route. */
   let openaiCodexConnection: 'missing' | 'connecting' | 'connected' | 'reconnect-required' = 'missing'
 
+  /** Match the Host's provider eligibility before any fixture OAuth state changes. */
+  const requireFixtureOAuth = (
+    request: RpcRequest<{ provider: string }>,
+  ): Promise<RpcResponse<never>> | undefined => {
+    if (request.payload.provider === 'openai-codex') return undefined
+    return err(request, {
+      code: 'internal',
+      message: 'OAuth connection is unavailable. Refresh the provider list and try again.',
+      details: {},
+    })
+  }
+
   // Timing-acceptance hooks (browser test backdoor): the in-memory fixture is
   // ideally timed. These let
   // browser acceptance runs create slow-history, lost-frame, and reconnect
@@ -2965,6 +2977,8 @@ function createFixtureWorld(options: FixtureOptions): FixtureWorld {
         models: fixtureModelGroups().flatMap(group => group.models.map(model => ({ id: model.id, name: model.name }))),
       }),
       oauthStart: (request) => {
+        const unavailable = requireFixtureOAuth(request)
+        if (unavailable !== undefined) return unavailable
         openaiCodexConnection = 'connecting'
         emitHost({
           type: 'host/remote-event', event: 'llm/oauth-connection-updated',
@@ -2983,10 +2997,16 @@ function createFixtureWorld(options: FixtureOptions): FixtureWorld {
           },
         })
       },
-      oauthStatus: request => ok(request, {
-        connection: { provider: 'openai-codex', status: openaiCodexConnection },
-      }),
+      oauthStatus: (request) => {
+        const unavailable = requireFixtureOAuth(request)
+        if (unavailable !== undefined) return unavailable
+        return ok(request, {
+          connection: { provider: 'openai-codex', status: openaiCodexConnection },
+        })
+      },
       oauthCancel: (request) => {
+        const unavailable = requireFixtureOAuth(request)
+        if (unavailable !== undefined) return unavailable
         openaiCodexConnection = 'missing'
         emitHost({
           type: 'host/remote-event', event: 'llm/oauth-connection-updated',
@@ -2995,6 +3015,8 @@ function createFixtureWorld(options: FixtureOptions): FixtureWorld {
         return ok(request, { connection: { provider: 'openai-codex', status: openaiCodexConnection } })
       },
       oauthDisconnect: (request) => {
+        const unavailable = requireFixtureOAuth(request)
+        if (unavailable !== undefined) return unavailable
         openaiCodexConnection = 'missing'
         emitHost({
           type: 'host/remote-event', event: 'llm/oauth-connection-updated',
