@@ -72,6 +72,7 @@ describe('request-level dynamic profiles', () => {
       displayName: 'openai',
       settingsNs: 'llm-pi-ai',
       settingsPath: ['providers', 'openai'],
+      auth: { kind: 'api-key' },
       declared: false,
     })
     await ctx.settings.update(NS, {

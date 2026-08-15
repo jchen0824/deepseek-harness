@@ -142,6 +142,7 @@ describe('hand-declared providers', () => {
       displayName: 'Acme Gateway',
       settingsNs: 'llm-pi-ai',
       settingsPath: ['providers', 'acme-gateway'],
+      auth: { kind: 'api-key' },
       // Nothing in the installed catalog answers for this route, which is what
       // configuration surfaces mark as a route this deployment declared.
       declared: true,
@@ -889,7 +890,7 @@ describe('configurable-provider directory', () => {
     const ctx = await bootWithSettings(dir, {})
     // Another adapter family owns this route id, exactly as llm-deepseek does.
     ctx.llm.registerConfigurableProviders([
-      { provider: 'deepseek-official', displayName: 'DeepSeek', settingsNs: 'llm-deepseek', settingsPath: [] },
+      { provider: 'deepseek-official', displayName: 'DeepSeek', settingsNs: 'llm-deepseek', settingsPath: [], auth: { kind: 'api-key' } },
     ])
     const before = ctx.llm.listConfigurableProviders().length
     expect(before).toBeGreaterThan(30)
@@ -965,6 +966,7 @@ describe('configurable-provider directory', () => {
       displayName: 'openai-codex',
       settingsNs: 'llm-pi-ai',
       settingsPath: ['providers', 'openai-codex'],
+      auth: { kind: 'api-key' },
       declared: false,
     })
   })
