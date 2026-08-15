@@ -47,6 +47,49 @@ When connected, the ordinary Models picker lists the provider's catalogued model
 
 `Disconnect` deletes the OAuth credential while preserving the provider profile so a user can reconnect. `Remove provider` disconnects first and then removes the provider profile. If the second action fails, the page reports that the provider remains configured but disconnected.
 
+### Device-code login flow
+
+```mermaid
+sequenceDiagram
+  actor User
+  participant UI as Models UI
+  participant API as Host API
+  participant Bridge as pi-ai OAuth bridge
+  participant Lease as Private login lease
+  participant OpenAI
+  participant Credential as Private OAuth credential
+  User->>UI: Select Connect
+  UI->>API: start login
+  API->>Bridge: start device-code login
+  Bridge->>Lease: atomically claim lease
+  alt another live lease exists
+    Lease-->>Bridge: Connecting (redacted)
+    Bridge-->>API: current connection state
+    API-->>UI: show current state
+  else lease claimed
+    Bridge->>OpenAI: request device code
+    OpenAI-->>Bridge: verification URL and user code
+    Bridge-->>API: code and redacted progress
+    API-->>UI: display code and URL
+    User->>OpenAI: authorize subscription in browser
+    loop until success, cancellation, or expiry
+      Bridge->>Lease: renew lease
+      Bridge->>OpenAI: poll authorization status
+      OpenAI-->>Bridge: pending or terminal status
+    end
+    alt authorization succeeds
+      Bridge->>Credential: atomically persist OAuth record
+      Bridge->>Lease: release lease
+      Bridge-->>API: Connected (redacted)
+      API-->>UI: refresh models and status
+    else cancelled, expired, or failed
+      Bridge->>Lease: release lease
+      Bridge-->>API: reconnect-required state
+      API-->>UI: show redacted failure state
+    end
+  end
+```
+
 ## Components
 
 ### Atomic credential operation

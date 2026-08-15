@@ -47,6 +47,49 @@ Models 页面提供一个专用的 ChatGPT/Codex 卡片，而不是 API 密钥�
 
 `Disconnect` 会删除 OAuth 凭据，但保留提供方 profile，以便用户重新连接。`Remove provider` 会先断开连接，再删除提供方 profile。如果第二个操作失败，页面会报告提供方仍已配置但已断开连接。
 
+### 设备代码登录流程
+
+```mermaid
+sequenceDiagram
+  actor User
+  participant UI as Models UI
+  participant API as Host API
+  participant Bridge as pi-ai OAuth bridge
+  participant Lease as Private login lease
+  participant OpenAI
+  participant Credential as Private OAuth credential
+  User->>UI: Select Connect
+  UI->>API: start login
+  API->>Bridge: start device-code login
+  Bridge->>Lease: atomically claim lease
+  alt another live lease exists
+    Lease-->>Bridge: Connecting (redacted)
+    Bridge-->>API: current connection state
+    API-->>UI: show current state
+  else lease claimed
+    Bridge->>OpenAI: request device code
+    OpenAI-->>Bridge: verification URL and user code
+    Bridge-->>API: code and redacted progress
+    API-->>UI: display code and URL
+    User->>OpenAI: authorize subscription in browser
+    loop until success, cancellation, or expiry
+      Bridge->>Lease: renew lease
+      Bridge->>OpenAI: poll authorization status
+      OpenAI-->>Bridge: pending or terminal status
+    end
+    alt authorization succeeds
+      Bridge->>Credential: atomically persist OAuth record
+      Bridge->>Lease: release lease
+      Bridge-->>API: Connected (redacted)
+      API-->>UI: refresh models and status
+    else cancelled, expired, or failed
+      Bridge->>Lease: release lease
+      Bridge-->>API: reconnect-required state
+      API-->>UI: show redacted failure state
+    end
+  end
+```
+
 ## 组件
 
 ### 原子凭据操作
