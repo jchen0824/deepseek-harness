@@ -8,20 +8,27 @@
  * same guard.
  */
 
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { pathToFileURL } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
 import Loader from '@deepseek-ai/cordis-plugin-loader'
 import Include from '@deepseek-ai/cordis-plugin-include'
-import LlmRuntime, { ReasoningEffortId } from '@deepseek-ai/dsh-llm'
+import LlmRuntime from '@deepseek-ai/dsh-llm'
 import LocalCredentialProvider from '@deepseek-ai/dsh-credentials-local'
 import FileSettingsProvider from '@deepseek-ai/dsh-settings-file'
 import * as LlmPiAi from '@deepseek-ai/dsh-llm-pi-ai'
+import { boot, healProfilesModuleFallback, loadOverlayPatches } from '../../../boot/app-boot/src/index.ts'
+import { provideCmdline } from '../../../boot/cmdline/src/index.ts'
 import { assemble } from './assemble.ts'
 import { closeMockServers, mockServer, textEvents } from './mock-server.ts'
+
+const REPO_ROOT = fileURLToPath(new URL('../../../..', import.meta.url))
+const BASE_PATCH_PATH = join(REPO_ROOT, 'packages/bundle/base/cordis.patch.yml')
+const HEADLESS_PATCH_PATH = join(REPO_ROOT, 'packages/bundle/headless/cordis.patch.yml')
+const INSTALL_ANCHOR = join(REPO_ROOT, 'apps/cli/package.json')
 
 let root: string | undefined
 let context: Context | undefined
@@ -32,29 +39,15 @@ afterEach(async () => {
   if (root !== undefined) await rm(root, { recursive: true, force: true })
   root = undefined
   await closeMockServers()
+  vi.restoreAllMocks()
   vi.unstubAllEnvs()
 })
 
-/** Options for the Loader composition fixture. */
-interface CompositionOptions {
-  /** Seed a saved OAuth connection before the base adapter row activates. */
-  savedOAuthBaseUrl?: string
-}
-
-/** Boot the base adapter composition through Loader, with an optional saved OAuth connection. */
-async function loadComposition(options: CompositionOptions = {}): Promise<{ ctx: Context; settingsPath: string }> {
+/** Boot the dormant adapter composition through Loader. */
+async function loadComposition(): Promise<{ ctx: Context; settingsPath: string }> {
   root = await mkdtemp(join(tmpdir(), 'dsh-pi-composition-'))
   const settingsPath = join(root, 'settings.yaml')
-  await writeFile(settingsPath, options.savedOAuthBaseUrl === undefined
-    ? '# personal settings\n'
-    : [
-      'llm-pi-ai:',
-      '  providers:',
-      '    openai-codex:',
-      '      api: openai-completions',
-      `      baseURL: ${options.savedOAuthBaseUrl}/v1`,
-      '',
-    ].join('\n'))
+  await writeFile(settingsPath, '# personal settings\n')
   await writeFile(join(root, '.credentials.yaml'), 'PI_COMPOSITION_KEY: key-from-store\n', { mode: 0o600 })
 
   const configPath = join(root, 'cordis.yml')
@@ -71,15 +64,8 @@ async function loadComposition(options: CompositionOptions = {}): Promise<{ ctx:
     '  config:',
     `    path: ${JSON.stringify(join(root, '.credentials.yaml'))}`,
     '    debounceMs: 10',
-    ...options.savedOAuthBaseUrl === undefined
-      ? []
-      : [
-        '- id: saved-oauth',
-        "  name: 'test-saved-oauth'",
-      ],
     '- id: llm-pi-ai',
     "  name: '@deepseek-ai/dsh-llm-pi-ai'",
-    ...options.savedOAuthBaseUrl === undefined ? [] : ['  inject: [savedOAuthReady]'],
     '',
   ].join('\n'))
 
@@ -92,20 +78,6 @@ async function loadComposition(options: CompositionOptions = {}): Promise<{ ctx:
     ['test-llm-service', LlmRuntime],
     ['@deepseek-ai/dsh-settings-file', FileSettingsProvider],
     ['@deepseek-ai/dsh-credentials-local', LocalCredentialProvider],
-    ['test-saved-oauth', {
-      name: 'test-saved-oauth',
-      inject: ['credentials'],
-      async apply(seedCtx: Context) {
-        const store = new LlmPiAi.OpenAICodexCredentialStore(() => seedCtx.credentials)
-        await store.modify('openai-codex', async () => ({
-          type: 'oauth',
-          access: 'ABCD-EFGH',
-          refresh: 'ABCD-EFGH',
-          expires: 4_102_444_800_000,
-        }))
-        return seedCtx.provide('savedOAuthReady' as never, true as never)
-      },
-    }],
     ['@deepseek-ai/dsh-llm-pi-ai', LlmPiAi],
   ])
   ctx.loader.internal = {
@@ -121,6 +93,99 @@ async function loadComposition(options: CompositionOptions = {}): Promise<{ ctx:
   })
   await ctx.loader.await()
   return { ctx, settingsPath }
+}
+
+/** Boot the shipped base-plus-headless layer stack against a saved Codex OAuth connection. */
+async function loadHeadlessComposition(baseUrl: string): Promise<{
+  ctx: Context
+  exit: Promise<number>
+}> {
+  root = await mkdtemp(join(tmpdir(), 'dsh-pi-headless-composition-'))
+  vi.stubEnv('DSH_HOME', root)
+  const settingsPath = join(root, 'settings.yaml')
+  const credentialsPath = join(root, '.credentials.yaml')
+  await writeFile(settingsPath, [
+    'agent-default-model:',
+    '  provider: openai-codex',
+    '  model: gpt-5.4',
+    '  reasoningEffort: high',
+    'llm-pi-ai:',
+    '  providers:',
+    '    openai-codex:',
+    '      api: openai-completions',
+    `      baseURL: ${baseUrl}/v1`,
+    '',
+  ].join('\n'))
+
+  healProfilesModuleFallback(INSTALL_ANCHOR, root)
+  const profileDir = join(root, 'profiles', 'headless-composition-test')
+  await mkdir(profileDir, { recursive: true })
+  const rootConfig = join(profileDir, 'cordis.yml')
+  await writeFile(rootConfig, '[]\n')
+  const oauthSeedPlugin = join(profileDir, 'saved-oauth-seed.mjs')
+  await writeFile(oauthSeedPlugin, [
+    "import { OpenAICodexCredentialStore } from '@deepseek-ai/dsh-llm-pi-ai'",
+    "import { OpenAICodexOAuthController } from '@deepseek-ai/dsh-llm-pi-ai'",
+    "export const name = 'saved-oauth-seed'",
+    "export const inject = ['credentials']",
+    'export async function apply(ctx) {',
+    '  const evidence = { oauthStartCalls: 0 }',
+    '  const originalStart = OpenAICodexOAuthController.prototype.start',
+    '  ctx.effect(() => {',
+    '    OpenAICodexOAuthController.prototype.start = function (...args) {',
+    '      evidence.oauthStartCalls += 1',
+    '      return Reflect.apply(originalStart, this, args)',
+    '    }',
+    '    return () => { OpenAICodexOAuthController.prototype.start = originalStart }',
+    '  })',
+    '  const store = new OpenAICodexCredentialStore(() => ctx.credentials)',
+    "  await store.modify('openai-codex', async () => ({",
+    "    type: 'oauth', access: 'ABCD-EFGH', refresh: 'ABCD-EFGH', expires: 4102444800000,",
+    '  }))',
+    "  ctx.provide('savedOAuthSeeded', evidence)",
+    '}',
+    '',
+  ].join('\n'))
+  const oauthReadyPlugin = join(profileDir, 'saved-oauth-ready.mjs')
+  await writeFile(oauthReadyPlugin, [
+    "export const name = 'saved-oauth-ready'",
+    "export const inject = ['llm']",
+    'export async function apply(ctx) {',
+    '  let controller',
+    '  for (let attempt = 0; attempt < 100 && controller === undefined; attempt += 1) {',
+    "    controller = ctx.llm.getOAuthController('openai-codex')",
+    '    if (controller === undefined) await new Promise(resolve => setTimeout(resolve, 0))',
+    '  }',
+    "  if (controller === undefined) throw new Error('saved OAuth controller did not register')",
+    '  const connection = await controller.status()',
+    "  if (connection.status !== 'connected') throw new Error(`saved OAuth connection did not initialize: ${connection.status}`)",
+    "  ctx.provide('savedOAuthReady', connection)",
+    '}',
+    '',
+  ].join('\n'))
+  let resolveExit: (code: number) => void = () => {}
+  const exit = new Promise<number>((resolve) => { resolveExit = resolve })
+  const ctx = await boot('llm-pi-ai headless composition', rootConfig, [
+    ...loadOverlayPatches('llm-pi-ai headless composition', BASE_PATCH_PATH),
+    ...loadOverlayPatches('llm-pi-ai headless composition', HEADLESS_PATCH_PATH),
+    { id: 'settings', config: { path: settingsPath, watch: false } },
+    { id: 'credentials', config: { path: credentialsPath, watch: false } },
+    { id: 'session-persistence-jsonl', config: { root: join(root, 'sessions') } },
+    { id: 'session-title-llm', disabled: true },
+    { id: 'session-telemetry-otel', disabled: true },
+    { id: 'agent-instructions', disabled: true },
+    { id: 'llm-deepseek', disabled: true },
+    { insert: [
+      { id: 'saved-oauth-seed', name: pathToFileURL(oauthSeedPlugin).href },
+      { id: 'saved-oauth-ready', name: pathToFileURL(oauthReadyPlugin).href, inject: ['savedOAuthSeeded'] },
+    ] },
+    { id: 'llm-pi-ai', inject: ['savedOAuthSeeded'] },
+    { id: 'headless-runner', inject: ['headlessStartup', 'savedOAuthReady'] },
+  ], (bootCtx) => {
+    provideCmdline(bootCtx, { args: ['prove', 'saved', 'OAuth'], exit: resolveExit })
+  })
+  context = ctx
+  return { ctx, exit }
 }
 
 describe('llm-pi-ai real dormant composition', () => {
@@ -160,28 +225,27 @@ describe('llm-pi-ai real dormant composition', () => {
   })
 
   it('uses a saved OAuth connection in the shared base route without starting headless login', async () => {
+    const stdout = vi.spyOn(process.stdout, 'write').mockImplementation(() => true)
     const server = await mockServer([{ events: textEvents }])
-    const { ctx } = await loadComposition({ savedOAuthBaseUrl: server.url })
+    const { ctx, exit } = await loadHeadlessComposition(server.url)
+    expect(ctx.get('headlessStartup')).toEqual({ task: 'prove saved OAuth' })
+    expect(ctx.get('savedOAuthReady')).toEqual({ provider: 'openai-codex', status: 'connected' })
     const controller = ctx.llm.getOAuthController('openai-codex')
     if (controller === undefined) throw new Error('expected Codex OAuth controller')
-    const start = vi.spyOn(controller, 'start')
 
+    await vi.waitFor(async () => {
+      await expect(controller.status()).resolves.toEqual({ provider: 'openai-codex', status: 'connected' })
+    }, { timeout: 5000 })
     await vi.waitFor(() => {
       expect(ctx.llm.listProviders().map(provider => provider.id)).toContain('openai-codex')
-    })
-    await expect(controller.status()).resolves.toEqual({ provider: 'openai-codex', status: 'connected' })
+    }, { timeout: 5000 })
     await expect(ctx.llm.listModels('openai-codex')).resolves.toEqual(expect.arrayContaining([
       expect.objectContaining({ provider: 'openai-codex', id: 'gpt-5.4' }),
     ]))
 
-    const result = await assemble(ctx, {
-      provider: 'openai-codex',
-      model: 'gpt-5.4',
-      reasoningEffort: ReasoningEffortId('high'),
-      messages: [],
-    })
-    expect(result.message.content).toEqual([{ type: 'text', text: 'hello' }])
+    await expect(exit).resolves.toBe(0)
+    expect(stdout).toHaveBeenCalledWith('hello\n')
     expect(server.paths).toEqual(['/v1/chat/completions'])
-    expect(start).not.toHaveBeenCalled()
+    expect(ctx.get('savedOAuthSeeded')).toEqual({ oauthStartCalls: 0 })
   })
 })

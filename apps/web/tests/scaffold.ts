@@ -122,11 +122,31 @@ const REPLAY_PROVIDERS = [{
 const OPENAI_CODEX_PROVIDER = 'openai-codex'
 const OPENAI_CODEX_VERIFICATION_URL = 'https://auth.openai.com/codex/device'
 const OPENAI_CODEX_VERIFICATION_CODE = 'ABCD-EFGH'
+const OPENAI_CODEX_REDACTION_SENTINELS = [
+  'sensitive-token-sentinel',
+  'sensitive-authorization-sentinel',
+  'sensitive-account-sentinel',
+  'sensitive-plan-sentinel',
+  'sensitive-reference-sentinel',
+  'sensitive-error-sentinel',
+] as const
+
+/** Test-only proof that private controller fields were exercised before browser-wire projection. */
+export interface OAuthRedactionEvidence {
+  /** Fixed non-secret markers attached to every private fixture connection. */
+  sentinels: readonly string[]
+  /** Number of private connection payloads returned or emitted by the fixture. */
+  payloadsIssued: number
+  /** Last private payload passed into a real LLM redaction seam. */
+  lastPrivatePayload: Readonly<Record<string, unknown>>
+}
 
 /** Test-owned control over the deterministic Codex OAuth lifecycle. */
 interface OpenAICodexOAuthFixture {
   /** Complete the pending login, optionally observing the event-driven UI before the model route appears. */
   complete(observeConnectionEvent?: () => Promise<void>): Promise<void>
+  /** Inspect whether non-secret private sentinels reached the real redaction seams. */
+  redactionEvidence(): OAuthRedactionEvidence
 }
 
 /**
@@ -147,7 +167,23 @@ function installOpenAICodexOAuthFixture(ctx: Context): OpenAICodexOAuthFixture {
   })
   let status: LlmOAuthConnectionStatus = 'missing'
   let route: AdapterRegistrationHandle | undefined
-  const connection = (): LlmOAuthConnection => ({ provider: OPENAI_CODEX_PROVIDER, status })
+  let payloadsIssued = 0
+  let lastPrivatePayload: Readonly<Record<string, unknown>> | undefined
+  const connection = (): LlmOAuthConnection => {
+    const payload = {
+      provider: OPENAI_CODEX_PROVIDER,
+      status,
+      token: OPENAI_CODEX_REDACTION_SENTINELS[0],
+      authorization: OPENAI_CODEX_REDACTION_SENTINELS[1],
+      account: OPENAI_CODEX_REDACTION_SENTINELS[2],
+      plan: OPENAI_CODEX_REDACTION_SENTINELS[3],
+      privateReference: OPENAI_CODEX_REDACTION_SENTINELS[4],
+      rawProviderError: OPENAI_CODEX_REDACTION_SENTINELS[5],
+    }
+    payloadsIssued += 1
+    lastPrivatePayload = payload
+    return payload
+  }
   const publish = (): void => { ctx.llm.emitOAuthConnectionUpdated(connection()) }
 
   ctx.settings.register(settingsNamespace('llm-pi-ai'), PiAiConfig, { base: {} })
@@ -203,6 +239,16 @@ function installOpenAICodexOAuthFixture(ctx: Context): OpenAICodexOAuthFixture {
         route = ctx.llm.registerAdapter([OPENAI_CODEX_PROVIDER], adapter)
       } else {
         route.replace([OPENAI_CODEX_PROVIDER])
+      }
+    },
+    redactionEvidence(): OAuthRedactionEvidence {
+      if (lastPrivatePayload === undefined) {
+        throw new Error('web e2e scaffold: Codex OAuth fixture issued no private payload')
+      }
+      return {
+        sentinels: [...OPENAI_CODEX_REDACTION_SENTINELS],
+        payloadsIssued,
+        lastPrivatePayload: { ...lastPrivatePayload },
       }
     },
   }
@@ -274,6 +320,8 @@ export interface WebScaffold {
   whenTurnSettled(timeoutMs?: number): Promise<SessionId>
   /** Complete the deterministic Codex device-code login when that fixture was requested. */
   completeOAuthLogin(provider: 'openai-codex', observeConnectionEvent?: () => Promise<void>): Promise<void>
+  /** Read non-secret private-payload evidence for the deterministic Codex fixture. */
+  oauthRedactionEvidence(provider: 'openai-codex'): OAuthRedactionEvidence
   /** Tear everything down; asserts the replay fixture was fully consumed first (replay/refresh). */
   close(): Promise<void>
 }
@@ -714,6 +762,12 @@ export async function launchWebScaffold(options: LaunchOptions = {}): Promise<We
         return Promise.reject(new Error(`web e2e scaffold: no OAuth fixture is mounted for ${provider}`))
       }
       return openAiCodexOAuthFixture.complete(observeConnectionEvent)
+    },
+    oauthRedactionEvidence(provider): OAuthRedactionEvidence {
+      if (provider !== OPENAI_CODEX_PROVIDER || openAiCodexOAuthFixture === undefined) {
+        throw new Error(`web e2e scaffold: no OAuth fixture is mounted for ${provider}`)
+      }
+      return openAiCodexOAuthFixture.redactionEvidence()
     },
     async close(): Promise<void> {
       const failures: unknown[] = []

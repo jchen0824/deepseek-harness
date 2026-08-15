@@ -30,6 +30,8 @@ describe.skipIf(MODE === 'record')('web e2e: Codex OAuth reaches normal model se
   let browser: Browser
   let page: Page
   let tripwire: ReturnType<typeof watchConsole>
+  let oauthRpcPayloads: Array<Promise<string>>
+  let oauthEventPayloads: string[]
 
   /** Read one session's authoritative model catalog and selection through Host RPC. */
   const models = async (sessionId: SessionId) => {
@@ -46,6 +48,18 @@ describe.skipIf(MODE === 'record')('web e2e: Codex OAuth reaches normal model se
     browser = await chromium.launch()
     page = await newEnglishPage(browser)
     tripwire = watchConsole(page)
+    oauthRpcPayloads = []
+    oauthEventPayloads = []
+    page.on('response', (response) => {
+      const path = new URL(response.url()).pathname
+      if (path.startsWith('/api/llm.oauth') || path === '/api/llm.providers') {
+        oauthRpcPayloads.push(response.text())
+      }
+    })
+    page.on('websocket', (socket) => {
+      if (new URL(socket.url()).pathname !== '/api/events.host') return
+      socket.on('framereceived', frame => oauthEventPayloads.push(String(frame.payload)))
+    })
     await page.goto(scaffold.baseUrl, { waitUntil: 'load' })
     await page.waitForSelector('[class*="frame"]', { timeout: 30_000 })
     await connectFreshWorkspace(page, scaffold.workspaceCwd)
@@ -180,6 +194,31 @@ describe.skipIf(MODE === 'record')('web e2e: Codex OAuth reaches normal model se
       stage('Saved default inherited by a later session', inheritedDefault),
       stage('Later session override remains scoped', scopedSelection),
     ].join('\n\n')
+    const redaction = scaffold.oauthRedactionEvidence('openai-codex')
+    const sentinels = [
+      'sensitive-token-sentinel',
+      'sensitive-authorization-sentinel',
+      'sensitive-account-sentinel',
+      'sensitive-plan-sentinel',
+      'sensitive-reference-sentinel',
+      'sensitive-error-sentinel',
+    ]
+    expect(redaction.sentinels).toEqual(sentinels)
+    expect(redaction.payloadsIssued).toBeGreaterThan(0)
+    const privatePayload = JSON.stringify(redaction.lastPrivatePayload)
+    for (const sentinel of sentinels) expect(privatePayload).toContain(sentinel)
+
+    const rpcPayload = (await Promise.all(oauthRpcPayloads)).join('\n')
+    expect(rpcPayload).toContain('ABCD-EFGH')
+    expect(rpcPayload).toContain('openai-codex')
+    await expect.poll(
+      () => oauthEventPayloads.some(payload => payload.includes('llm/oauth-connection-updated')),
+      { timeout: 10_000 },
+    ).toBe(true)
+    const browserPayload = `${rpcPayload}\n${oauthEventPayloads.join('\n')}`
+    expect(browserPayload).toContain('"status":"connected"')
+    for (const sentinel of sentinels) expect(browserPayload).not.toContain(sentinel)
+
     const visibleOutput = `${flow}\n${await page.locator('body').innerText()}`
     expect(visibleOutput).not.toMatch(/\b(?:sk-[A-Za-z0-9_-]{8,}|eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,})\b/)
     expect(visibleOutput).not.toMatch(/\b[A-Z][A-Z0-9_]*(?:OAUTH|LOGIN_LEASE)[A-Z0-9_]*\b/)
