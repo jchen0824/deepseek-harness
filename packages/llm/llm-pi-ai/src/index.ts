@@ -128,6 +128,7 @@ function directoryEntries(
       displayName,
       settingsNs: NS,
       settingsPath: ['providers', provider],
+      auth: { kind: 'api-key' },
       // Membership of the installed catalog, not of the settings document:
       // narrowing a shipped provider's models stores a profile too, and that
       // route is still one pi-ai knows.

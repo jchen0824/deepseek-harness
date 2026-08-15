@@ -499,7 +499,7 @@ export const SERVICE_API: readonly ServiceApiEntry[] = [
   {
     key: 'credentials',
     summary: 'Abstract credential service.',
-    description: 'Abstract credential service. Providers implement the four operations over their source layers; one seam-wide rule binds them all: an empty stored value is absent everywhere — `resolve` skips it, `describe` reports it unconfigured — so a blank never masquerades as a configured secret.',
+    description: 'Abstract credential service. Providers implement the operations over their source layers; one seam-wide rule binds them all: an empty stored value is absent everywhere — `resolve` skips it, `describe` reports it unconfigured — so a blank never masquerades as a configured secret.',
     methods: [
       {
         signature: 'abstract resolve(ref: CredentialRef): Promise<ResolvedCredential | undefined>',
@@ -522,6 +522,12 @@ export const SERVICE_API: readonly ServiceApiEntry[] = [
         signature: 'abstract unset(ref: CredentialRef): Promise<void>',
         description: 'Remove one reference from the provider-managed writable source; removing an absent reference is a no-op. Rejects while a read-only source shadows the reference, like set.',
         parameters: [{ name: 'ref', description: 'the reference to remove.' }],
+      },
+      {
+        signature: 'abstract modify<T>( ref: CredentialRef, mutate: (current: string | undefined) => Promise<CredentialMutation<T>>, ): Promise<T>',
+        description: 'Atomically read and change one provider-managed stored value. The callback receives only that stored value, never an inherited environment value. Callers must keep private references and mutations in host code; this operation is not a browser-facing credential RPC.',
+        parameters: [{ name: 'ref', description: 'the host-only reference to change.' }, { name: 'mutate', description: 'derives the next stored value and caller result from the current stored value.' }],
+        returns: 'the mutation result after its value commits.',
       },
     ],
   },
@@ -811,6 +817,23 @@ export const SERVICE_API: readonly ServiceApiEntry[] = [
         description: 'List every declared configurable provider, registered or dormant.',
         parameters: [],
         returns: 'detached directory entries in declaration order.',
+      },
+      {
+        signature: 'registerOAuthController(controller: LlmOAuthController): () => void',
+        description: 'Register the controller that exclusively owns one OAuth-capable provider route. Public reads receive a facade bound to this provider, never the controller itself; every lifecycle result is reconstructed with only public fields. The contribution disposes with its registering fiber.',
+        parameters: [{ name: 'controller', description: 'provider-owned lifecycle operations.' }],
+        returns: 'a disposer that withdraws the provider-bound facade.',
+      },
+      {
+        signature: 'getOAuthController(provider: string): LlmOAuthController | undefined',
+        description: 'Look up the provider-bound facade registered for a provider route. Every lifecycle call returns detached connection data containing only its owner provider and declared public fields.',
+        parameters: [{ name: 'provider', description: 'provider route whose controller to read.' }],
+        returns: 'the provider-bound public controller, when one is registered.',
+      },
+      {
+        signature: 'emitOAuthConnectionUpdated(connection: LlmOAuthConnection): void',
+        description: 'Broadcast a redacted OAuth lifecycle update. Device codes, account data, credentials, and provider errors are intentionally not accepted here. Listener failures are contained after the caller committed its transition.',
+        parameters: [{ name: 'connection', description: 'provider route and valid public lifecycle status.' }],
       },
       {
         signature: 'registerModelDiscovery( settingsNs: string, discover: (request: LlmModelDiscoveryRequest) => Promise<readonly LlmDiscoveredModel[]>, ): () => void',
@@ -2390,6 +2413,14 @@ export const EVENT_API: readonly EventApiEntry[] = [
     parameters: [],
   },
   {
+    name: 'llm/oauth-connection-updated',
+    mode: 'emit',
+    signature: '\'llm/oauth-connection-updated\'(connection: LlmOAuthConnection): void',
+    summary: 'One OAuth connection changed.',
+    description: 'One OAuth connection changed. The payload deliberately contains only the provider route and lifecycle status: device codes, account data, credentials, and provider errors remain owned by the controller call that produced them and never enter this broadcast.',
+    parameters: [{ name: 'connection', description: 'detached provider route and connection status.' }],
+  },
+  {
     name: 'llm/stream',
     mode: 'waterfall',
     signature: '\'llm/stream\'(this: LlmRuntime, options: GenerateOptions, next: () => AsyncIterable<StreamChunk>): AsyncIterable<StreamChunk>',
@@ -2918,6 +2949,14 @@ export const TYPE_API: readonly TypeApiEntry[] = [
     declaration: 'export interface CredentialInfo {\n    configured: boolean;\n    source?: string;\n    writable: boolean;\n}',
   },
   {
+    name: 'CredentialMutation',
+    declaration: 'export interface CredentialMutation<T> {\n    value: string | undefined;\n    result: T;\n    visibility: CredentialMutationVisibility;\n}',
+  },
+  {
+    name: 'CredentialMutationVisibility',
+    declaration: 'export type CredentialMutationVisibility = \'public\' | \'private\';',
+  },
+  {
     name: 'CredentialRef',
     declaration: 'export type CredentialRef = Branded<\'CredentialRef\'>;',
   },
@@ -3275,7 +3314,7 @@ export const TYPE_API: readonly TypeApiEntry[] = [
   },
   {
     name: 'LlmConfigurableProvider',
-    declaration: 'export interface LlmConfigurableProvider {\n    provider: string;\n    displayName: string;\n    settingsNs: string;\n    settingsPath: readonly string[];\n    declared?: boolean;\n}',
+    declaration: 'export interface LlmConfigurableProvider {\n    provider: string;\n    displayName: string;\n    settingsNs: string;\n    settingsPath: readonly string[];\n    auth: LlmProviderAuth;\n    declared?: boolean;\n}',
   },
   {
     name: 'LlmDiscoveredModel',
@@ -3302,6 +3341,30 @@ export const TYPE_API: readonly TypeApiEntry[] = [
     declaration: 'export interface LlmModelReasoningInfo {\n    efforts: readonly LlmReasoningEffortInfo[];\n    defaultEffort?: ReasoningEffortId;\n}',
   },
   {
+    name: 'LlmOAuthConnection',
+    declaration: 'export interface LlmOAuthConnection {\n    provider: string;\n    status: LlmOAuthConnectionStatus;\n}',
+  },
+  {
+    name: 'LlmOAuthConnectionStatus',
+    declaration: 'export type LlmOAuthConnectionStatus = \'missing\' | \'connecting\' | \'connected\' | \'reconnect-required\';',
+  },
+  {
+    name: 'LlmOAuthController',
+    declaration: 'export interface LlmOAuthController {\n    readonly provider: string;\n    status(): Promise<LlmOAuthConnection>;\n    start(): Promise<LlmOAuthStart>;\n    cancel(): Promise<LlmOAuthConnection>;\n    disconnect(): Promise<LlmOAuthConnection>;\n}',
+  },
+  {
+    name: 'LlmOAuthDeviceCode',
+    declaration: 'export interface LlmOAuthDeviceCode {\n    verificationUri: string;\n    userCode: string;\n    intervalSeconds?: number;\n    expiresInSeconds?: number;\n}',
+  },
+  {
+    name: 'LlmOAuthStart',
+    declaration: 'export type LlmOAuthStart = {\n    kind: \'device-code\';\n    connection: LlmOAuthConnection;\n    deviceCode: LlmOAuthDeviceCode;\n} | {\n    kind: \'already-connecting\';\n    connection: LlmOAuthConnection;\n} | {\n    kind: \'connected\';\n    connection: LlmOAuthConnection;\n};',
+  },
+  {
+    name: 'LlmProviderAuth',
+    declaration: 'export type LlmProviderAuth = {\n    kind: \'api-key\';\n} | {\n    kind: \'oauth\';\n} | {\n    kind: \'native\';\n};',
+  },
+  {
     name: 'LlmProviderInfo',
     declaration: 'export interface LlmProviderInfo {\n    id: string;\n    name: string;\n}',
   },
@@ -3315,7 +3378,7 @@ export const TYPE_API: readonly TypeApiEntry[] = [
   },
   {
     name: 'LlmRuntime',
-    declaration: 'export class LlmRuntime extends Service {\n    constructor(ctx: Context);\n    registerAdapter(providers: string[], adapter: LlmAdapter): AdapterRegistrationHandle;\n    listProviders(): LlmProviderInfo[];\n    registerConfigurableProviders(entries: readonly LlmConfigurableProvider[]): DirectoryRegistrationHandle;\n    listConfigurableProviders(): LlmConfigurableProvider[];\n    registerModelDiscovery(settingsNs: string, discover: (request: LlmModelDiscoveryRequest) => Promise<readonly LlmDiscoveredModel[]>): () => void;\n    async discoverModels(settingsNs: string, request: LlmModelDiscoveryRequest): Promise<LlmDiscoveredModel[]>;\n    providerRetryPolicy(provider: string): ResolvedRetryPolicy;\n    async listModels(provider: string): Promise<LlmModelInfo[]>;\n    async resolveModelInfo(provider: string, model: string, signal?: AbortSignal): Promise<LlmResolvedModelInfo>;\n    async resolveCallConfig(config: LlmCallConfig, signal?: AbortSignal): Promise<LlmCallConfig>;\n    async prepareCall(config: LlmCallConfig, signal?: AbortSignal): Promise<PreparedLlmCall>;\n    stream(options: GenerateOptions): AsyncIterable<StreamChunk>;\n}',
+    declaration: 'export class LlmRuntime extends Service {\n    constructor(ctx: Context);\n    registerAdapter(providers: string[], adapter: LlmAdapter): AdapterRegistrationHandle;\n    listProviders(): LlmProviderInfo[];\n    registerConfigurableProviders(entries: readonly LlmConfigurableProvider[]): DirectoryRegistrationHandle;\n    listConfigurableProviders(): LlmConfigurableProvider[];\n    registerOAuthController(controller: LlmOAuthController): () => void;\n    getOAuthController(provider: string): LlmOAuthController | undefined;\n    emitOAuthConnectionUpdated(connection: LlmOAuthConnection): void;\n    registerModelDiscovery(settingsNs: string, discover: (request: LlmModelDiscoveryRequest) => Promise<readonly LlmDiscoveredModel[]>): () => void;\n    async discoverModels(settingsNs: string, request: LlmModelDiscoveryRequest): Promise<LlmDiscoveredModel[]>;\n    providerRetryPolicy(provider: string): ResolvedRetryPolicy;\n    async listModels(provider: string): Promise<LlmModelInfo[]>;\n    async resolveModelInfo(provider: string, model: string, signal?: AbortSignal): Promise<LlmResolvedModelInfo>;\n    async resolveCallConfig(config: LlmCallConfig, signal?: AbortSignal): Promise<LlmCallConfig>;\n    async prepareCall(config: LlmCallConfig, signal?: AbortSignal): Promise<PreparedLlmCall>;\n    stream(options: GenerateOptions): AsyncIterable<StreamChunk>;\n}',
   },
   {
     name: 'LspHover',

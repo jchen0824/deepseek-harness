@@ -46,6 +46,21 @@ function controller(provider = 'openai-codex'): LlmOAuthController {
   }
 }
 
+function controllerWithForeignResults(provider: string, start: LlmOAuthStart): LlmOAuthController {
+  const connection = {
+    provider: 'wrong-provider',
+    status: 'connected' as const,
+    accountId: 'must-not-leak',
+  }
+  return {
+    provider,
+    status: () => Promise.resolve(connection),
+    start: () => Promise.resolve(start),
+    cancel: () => Promise.resolve(connection),
+    disconnect: () => Promise.resolve(connection),
+  }
+}
+
 describe('llm/adapters-updated', () => {
   it('fires at both adapter registration commit points with the registry already readable', async () => {
     const ctx = await setup()
@@ -235,12 +250,75 @@ describe('OAuth controller registry', () => {
     const registered = controller()
 
     const dispose = ctx.llm.registerOAuthController(registered)
-    expect(ctx.llm.getOAuthController('openai-codex')).toBe(registered)
+    expect(ctx.llm.getOAuthController('openai-codex')).not.toBe(registered)
     ctx.llm.emitOAuthConnectionUpdated({ provider: 'openai-codex', status: 'connected' })
     expect(events).toEqual([{ provider: 'openai-codex', status: 'connected' }])
 
     dispose()
     expect(ctx.llm.getOAuthController('openai-codex')).toBeUndefined()
+  })
+
+  it('returns detached controller results bound to the registered provider', async () => {
+    const ctx = await setup()
+    const shared = {
+      provider: 'wrong-provider',
+      status: 'connected' as const,
+      accountId: 'must-not-leak',
+    }
+    const raw: LlmOAuthController = {
+      provider: 'openai-codex',
+      status: () => Promise.resolve(shared),
+      start: () => Promise.resolve({ kind: 'connected', connection: shared }),
+      cancel: () => Promise.resolve(shared),
+      disconnect: () => Promise.resolve(shared),
+    }
+    ctx.llm.registerOAuthController(raw)
+    const publicController = ctx.llm.getOAuthController('openai-codex')
+    if (publicController === undefined) throw new Error('expected registered controller')
+
+    const status = await publicController.status()
+    expect(status).toEqual({ provider: 'openai-codex', status: 'connected' })
+    expect(status).not.toBe(shared)
+    status.status = 'missing'
+    await expect(publicController.status()).resolves.toEqual({ provider: 'openai-codex', status: 'connected' })
+    await expect(publicController.cancel()).resolves.toEqual({ provider: 'openai-codex', status: 'connected' })
+    await expect(publicController.disconnect()).resolves.toEqual({ provider: 'openai-codex', status: 'connected' })
+  })
+
+  it.each([
+    [{ kind: 'device-code', connection: { provider: 'wrong-provider', status: 'connecting' }, deviceCode: {
+      verificationUri: 'https://example.test/verify', userCode: 'ABCD', intervalSeconds: 5, expiresInSeconds: 600, secret: 'must-not-leak',
+    } }, { kind: 'device-code', connection: { provider: 'openai-codex', status: 'connecting' }, deviceCode: {
+      verificationUri: 'https://example.test/verify', userCode: 'ABCD', intervalSeconds: 5, expiresInSeconds: 600,
+    } }],
+    [{ kind: 'already-connecting', connection: { provider: 'wrong-provider', status: 'connecting', account: 'must-not-leak' } }, { kind: 'already-connecting', connection: { provider: 'openai-codex', status: 'connecting' } }],
+    [{ kind: 'connected', connection: { provider: 'wrong-provider', status: 'connected', account: 'must-not-leak' } }, { kind: 'connected', connection: { provider: 'openai-codex', status: 'connected' } }],
+  ] as const)('reconstructs each OAuth start result without provider data', async (start, expected) => {
+    const ctx = await setup()
+    const raw = controllerWithForeignResults('openai-codex', start as LlmOAuthStart)
+    ctx.llm.registerOAuthController(raw)
+    const publicController = ctx.llm.getOAuthController('openai-codex')
+    if (publicController === undefined) throw new Error('expected registered controller')
+
+    const first = await publicController.start()
+    expect(first).toEqual(expected)
+    first.connection.status = 'missing'
+    if (first.kind === 'device-code') first.deviceCode.userCode = 'mutated'
+    await expect(publicController.start()).resolves.toEqual(expected)
+  })
+
+  it('rejects controller results with a status outside the public lifecycle', async () => {
+    const ctx = await setup()
+    const raw = controllerWithForeignResults('openai-codex', {
+      kind: 'connected',
+      connection: { provider: 'openai-codex', status: 'connected' },
+    })
+    raw.status = () => Promise.resolve({ provider: 'openai-codex', status: 'invalid' } as never)
+    ctx.llm.registerOAuthController(raw)
+    const publicController = ctx.llm.getOAuthController('openai-codex')
+    if (publicController === undefined) throw new Error('expected registered controller')
+
+    await expect(publicController.status()).rejects.toMatchObject({ code: 'INVALID_OAUTH_CONNECTION' })
   })
 
   it('disposes a controller when its contributing fiber disposes', async () => {
@@ -250,7 +328,7 @@ describe('OAuth controller registry', () => {
       inject: ['llm'],
       apply: (child: Context) => { child.llm.registerOAuthController(registered) },
     })
-    expect(ctx.llm.getOAuthController(registered.provider)).toBe(registered)
+    expect(ctx.llm.getOAuthController(registered.provider)).not.toBe(registered)
 
     await fiber.dispose()
     expect(ctx.llm.getOAuthController(registered.provider)).toBeUndefined()
@@ -263,7 +341,7 @@ describe('OAuth controller registry', () => {
 
     expect(() => ctx.llm.registerOAuthController(controller(''))).toThrow(/non-empty provider/)
     expect(() => ctx.llm.registerOAuthController(controller())).toThrow(/already registered/)
-    expect(ctx.llm.getOAuthController(registered.provider)).toBe(registered)
+    expect(ctx.llm.getOAuthController(registered.provider)).not.toBe(registered)
   })
 
   it('rejects invalid connection updates and never exposes extra payload fields', async () => {
@@ -281,6 +359,18 @@ describe('OAuth controller registry', () => {
       deviceCode: 'do-not-publish',
     } as never)
     expect(events).toEqual([{ provider: 'openai-codex', status: 'connecting' }])
+  })
+
+  it('contains an OAuth update listener failure without starving later observers', async () => {
+    const ctx = await setup()
+    const warn = vi.spyOn(ctx.logger, 'warn').mockImplementation(() => undefined)
+    const later = vi.fn()
+    ctx.on('llm/oauth-connection-updated', () => { throw new Error('broken observer') })
+    ctx.on('llm/oauth-connection-updated', later)
+
+    expect(() => ctx.llm.emitOAuthConnectionUpdated({ provider: 'openai-codex', status: 'connected' })).not.toThrow()
+    expect(later).toHaveBeenCalledWith({ provider: 'openai-codex', status: 'connected' })
+    expect(warn).toHaveBeenCalledWith('llm: an llm/oauth-connection-updated listener failed')
   })
 })
 
