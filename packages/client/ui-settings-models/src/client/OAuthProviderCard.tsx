@@ -1,6 +1,6 @@
 /** OAuth-specific provider card with page-local device-code instructions. */
 
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import type { IApiClient } from '@deepseek-ai/dsh-api-remotes/client'
 import type { ModelsSectionInjected, ProviderIdentity } from './ModelsSection.tsx'
@@ -39,21 +39,50 @@ export function OAuthProviderCard({
   const [deviceCode, setDeviceCode] = useState<DeviceCodeView | undefined>(undefined)
   const [pending, setPending] = useState<PendingAction | undefined>(undefined)
   const [failure, setFailure] = useState<string | undefined>(undefined)
+  const startGeneration = useRef(0)
+  const activeStart = useRef<{
+    generation: number
+    entry: ProviderRow['entry']
+  } | undefined>(undefined)
   const connectionStatus = row.entry.connection?.status ?? 'missing'
-  const connecting = connectionStatus === 'connecting' || pending === 'start'
+  const connecting = connectionStatus === 'connecting'
+  const terminal = connectionStatus === 'connected'
+    || connectionStatus === 'missing'
+    || connectionStatus === 'reconnect-required'
   const disabled = readOnly || pending !== undefined
   const target = { provider: row.entry.provider, displayName: row.entry.displayName }
 
   useEffect(() => {
-    if (!connecting) setDeviceCode(undefined)
-  }, [connecting])
+    if (!terminal) return
+    setDeviceCode(undefined)
+    const start = activeStart.current
+    if (start === undefined || start.entry === row.entry) return
+    startGeneration.current += 1
+    activeStart.current = undefined
+    setPending(current => current === 'start' ? undefined : current)
+  }, [row.entry, terminal])
+
+  useEffect(() => () => {
+    startGeneration.current += 1
+    activeStart.current = undefined
+  }, [])
 
   const reload = async (): Promise<void> => {
     await controller.load()
   }
 
+  const startIsCurrent = (generation: number, entry: ProviderRow['entry']): boolean => {
+    if (generation !== startGeneration.current || activeStart.current?.generation !== generation) return false
+    const current = controller.store.getSnapshot().rows
+      .find(candidate => candidate.entry.provider === entry.provider)?.entry
+    if (current === undefined || current === entry) return true
+    return current.connection?.status === 'connecting'
+  }
+
   const connect = (): void => {
     if (disabled) return
+    const generation = ++startGeneration.current
+    activeStart.current = { generation, entry: row.entry }
     setPending('start')
     setFailure(undefined)
     void (async () => {
@@ -63,12 +92,14 @@ export function OAuthProviderCard({
             ns: row.entry.settingsNs,
             ops: [{ op: 'set', path: [...row.entry.settingsPath], value: {} }],
           })
+          if (!startIsCurrent(generation, row.entry)) return
           if (!profile.result.ok) {
             setFailure(t('oauthActionFailed'))
             return
           }
         }
         const response = await api.llm.oauthStart({ provider: row.entry.provider })
+        if (!startIsCurrent(generation, row.entry)) return
         if (!response.result.ok) {
           setFailure(t('oauthActionFailed'))
           return
@@ -77,10 +108,15 @@ export function OAuthProviderCard({
           ? response.result.value.start.deviceCode
           : undefined)
       } catch {
-        setFailure(t('oauthActionFailed'))
+        if (startIsCurrent(generation, row.entry)) setFailure(t('oauthActionFailed'))
       } finally {
-        await reload()
-        setPending(undefined)
+        if (startIsCurrent(generation, row.entry)) {
+          await reload()
+          if (startIsCurrent(generation, row.entry)) {
+            activeStart.current = undefined
+            setPending(undefined)
+          }
+        }
       }
     })()
   }

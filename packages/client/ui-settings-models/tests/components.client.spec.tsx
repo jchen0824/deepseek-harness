@@ -246,6 +246,7 @@ function scriptedOAuthFace(options: {
   configured?: boolean
   removeFailure?: string
   startFailure?: string
+  deferStart?: boolean
 } = {}) {
   let status = options.status ?? 'missing'
   let configured = options.configured ?? status !== 'missing'
@@ -268,21 +269,28 @@ function scriptedOAuthFace(options: {
     configured = operation?.op === 'set'
     return Promise.resolve(ok(oauthNamespace(configured)))
   })
+  let resolveDeferredStart: (() => void) | undefined
+  const deviceCodeStart = () => ok({
+    connection: { provider: 'openai-codex', status: 'connecting' as const },
+    start: {
+      kind: 'device-code' as const,
+      deviceCode: {
+        verificationUri: 'https://example.test/device',
+        userCode: 'ABCD-EFGH',
+        intervalSeconds: 5,
+        expiresInSeconds: 900,
+      },
+    },
+  })
   const oauthStart = vi.fn(() => {
     if (options.startFailure !== undefined) return Promise.resolve(fail(options.startFailure))
+    if (options.deferStart === true) {
+      return new Promise<ReturnType<typeof deviceCodeStart>>((resolve) => {
+        resolveDeferredStart = () => { resolve(deviceCodeStart()) }
+      })
+    }
     status = 'connecting'
-    return Promise.resolve(ok({
-      connection: { provider: 'openai-codex', status },
-      start: {
-        kind: 'device-code' as const,
-        deviceCode: {
-          verificationUri: 'https://example.test/device',
-          userCode: 'ABCD-EFGH',
-          intervalSeconds: 5,
-          expiresInSeconds: 900,
-        },
-      },
-    }))
+    return Promise.resolve(deviceCodeStart())
   })
   const oauthCancel = vi.fn(() => {
     status = 'missing'
@@ -324,6 +332,10 @@ function scriptedOAuthFace(options: {
     oauthCancel,
     oauthDisconnect,
     setStatus(next: OAuthStatus): void { status = next },
+    resolveStart(): void {
+      if (resolveDeferredStart === undefined) throw new Error('no deferred OAuth start is pending')
+      resolveDeferredStart()
+    },
     configured: (): boolean => configured,
   }
 }
@@ -403,6 +415,29 @@ describe('OAuth provider card', () => {
     completed.setStatus('connected')
     await act(async () => { await completed.controller.load() })
     expect(screen.queryByText('ABCD-EFGH')).toBeNull()
+    expect(screen.getByText('Connected')).toBeTruthy()
+  })
+
+  it('lets a terminal redacted snapshot invalidate a late device-code response', async () => {
+    const mounted = await mountOAuth({ status: 'missing', configured: false, deferStart: true })
+    fireEvent.click(screen.getByRole('button', { name: 'Connect ChatGPT' }))
+    await waitFor(() => { expect(mounted.oauthStart).toHaveBeenCalledOnce() })
+
+    mounted.setStatus('connected')
+    await act(async () => { await mounted.controller.load() })
+    expect(screen.getByText('Connected')).toBeTruthy()
+    expect(screen.queryByText('Connecting')).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Cancel' })).toBeNull()
+
+    // If the stale start response is accepted, its device code renders while
+    // the handler's post-start reload waits here.
+    mounted.face.llm.providers.mockImplementationOnce(() => new Promise(() => {}))
+    mounted.resolveStart()
+    await act(async () => { await Promise.resolve() })
+
+    expect(screen.queryByText('ABCD-EFGH')).toBeNull()
+    expect(screen.queryByText('Connecting')).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Cancel' })).toBeNull()
     expect(screen.getByText('Connected')).toBeTruthy()
   })
 
