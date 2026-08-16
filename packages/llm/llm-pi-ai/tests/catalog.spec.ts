@@ -948,7 +948,7 @@ describe('configurable-provider directory', () => {
     expect(ctx.llm.listProviders().map(entry => entry.id)).not.toContain('openai-codex')
   })
 
-  it('keeps a legacy explicit-key Codex profile active while advertising OAuth', async () => {
+  it('keeps a legacy explicit-key Codex profile active on the API-key path', async () => {
     const ctx = await harness({ providers: { 'openai-codex': { apiKeyEnv: KEY_ENV } } })
 
     expect(ctx.llm.listConfigurableProviders()).toContainEqual({
@@ -956,7 +956,7 @@ describe('configurable-provider directory', () => {
       displayName: 'openai-codex',
       settingsNs: 'llm-pi-ai',
       settingsPath: ['providers', 'openai-codex'],
-      auth: { kind: 'oauth' },
+      auth: { kind: 'api-key' },
       declared: false,
     })
     expect(ctx.llm.listProviders().map(entry => entry.id)).toContain('openai-codex')

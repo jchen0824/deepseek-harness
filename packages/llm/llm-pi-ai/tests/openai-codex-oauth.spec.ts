@@ -44,6 +44,7 @@ class SharedCredentials extends CredentialProvider {
   private readonly values = new Map<CredentialRef, string>()
   private operations: Promise<void> = Promise.resolve()
   private operationCount = 0
+  private modificationsBlocked = false
   private pause: {
     operation: number
     reached: Deferred<undefined>
@@ -55,6 +56,12 @@ class SharedCredentials extends CredentialProvider {
     const release = deferred<undefined>()
     this.pause = { operation, reached, release }
     return { reached: reached.promise, release: () => { release.resolve(undefined) } }
+  }
+
+  /** Reject every mutation until the returned release function restores the provider. */
+  blockModifications(): () => void {
+    this.modificationsBlocked = true
+    return () => { this.modificationsBlocked = false }
   }
 
   override resolve(ref: CredentialRef): Promise<ResolvedCredential | undefined> {
@@ -79,6 +86,7 @@ class SharedCredentials extends CredentialProvider {
     mutate: (current: string | undefined) => Promise<CredentialMutation<T>>,
   ): Promise<T> {
     const task = this.operations.then(async () => {
+      if (this.modificationsBlocked) throw new Error('credentials unavailable')
       this.operationCount += 1
       if (this.pause?.operation === this.operationCount) {
         const pause = this.pause
@@ -472,6 +480,26 @@ describe('OpenAICodexOAuthController', () => {
 
     await expect(second.status()).resolves.toEqual({ provider: PROVIDER, status: 'reconnect-required' })
     expect(secondEvents.at(-1)).toEqual({ provider: PROVIDER, status: 'reconnect-required' })
+  })
+
+  it('does not publish reconnect-required when the durable refresh marker cannot commit', async () => {
+    const credentials = new SharedCredentials(new Context())
+    const store = new OpenAICodexCredentialStore(() => credentials)
+    await store.modify(PROVIDER, async () => oauth())
+    const events: LlmOAuthConnection[] = []
+    const controller = controllerOf(credentials, new DeviceCodeModels(), events, { value: 0 })
+    await expect(controller.initialize()).resolves.toEqual({ provider: PROVIDER, status: 'connected' })
+    const generation = await controller.captureRequestGeneration()
+    const unblock = credentials.blockModifications()
+
+    try {
+      await controller.markReconnectRequired(generation)
+      expect(events).toEqual([{ provider: PROVIDER, status: 'connected' }])
+    } finally {
+      unblock()
+    }
+
+    await expect(controller.status()).resolves.toEqual({ provider: PROVIDER, status: 'connected' })
   })
 
   it('preserves an established credential when no login lease is pending', async () => {

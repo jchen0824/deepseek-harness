@@ -692,7 +692,8 @@ export class OpenAICodexOAuthController implements LlmOAuthController {
         })
       })
     } catch {
-      // The caller still receives only the redacted reconnect-required state.
+      // A failed private mutation has no durable state transition to publish.
+      return
     }
     if (current) this.publish('reconnect-required')
     else await this.inspectStatus()

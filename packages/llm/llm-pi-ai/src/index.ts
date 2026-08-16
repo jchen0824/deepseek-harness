@@ -156,12 +156,23 @@ function directoryEntries(
       declared: !catalog.has(provider),
     })
   }
+  /**
+   * Return the authentication path this resolved profile actually uses.
+   * An OAuth-only catalog provider whose profile explicitly names a key takes
+   * the harness API-key path, so OAuth lifecycle callers must not reach its
+   * shared credential controller.
+   */
+  const profileAuth = (provider: string, profile: ResolvedPiAiProviderProfile): LlmProviderAuth => {
+    const catalogAuth = catalogProviderAuth(provider)
+    if (catalogAuth?.kind === 'oauth' && profile.apiKeyEnv !== undefined) return { kind: 'api-key' }
+    return catalogAuth ?? { kind: 'api-key' }
+  }
   for (const provider of catalog) {
     const auth = catalogProviderAuth(provider)
     if (auth !== undefined) declare(provider, provider, auth)
   }
   for (const [provider, profile] of profiles) {
-    declare(provider, profile.displayName, catalogProviderAuth(provider) ?? { kind: 'api-key' })
+    declare(provider, profile.displayName, profileAuth(provider, profile))
   }
   return [...entries.values()]
 }

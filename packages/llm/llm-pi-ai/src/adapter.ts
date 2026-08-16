@@ -227,8 +227,9 @@ async function* sanitizeNativeCodexChunks(
   }
 }
 
-/** Convert a thrown native provider failure without retaining its message or cause. */
+/** Preserve Harness failures and redact thrown native provider or SDK failures. */
 function nativeCodexFailure(error: unknown): LlmError {
+  if (error instanceof LlmError) return error
   const message = typeof error === 'string'
     ? error
     : error instanceof Error

@@ -270,6 +270,45 @@ describe('PiAiAdapter provider routing', () => {
     expect(JSON.stringify(chunks)).not.toContain('hostile-native-throw-sentinel')
   })
 
+  it('preserves a Harness unsupported-content failure before native Codex provider I/O', async () => {
+    const resolved = resolveProfiles({ 'openai-codex': {} }).get('openai-codex')
+    if (resolved === undefined) throw new Error('expected Codex profile')
+    const model = resolved.piProvider.getModels().find(candidate => !candidate.input.includes('image'))
+    if (model === undefined) throw new Error('expected text-only Codex model')
+    const adapter = new PiAiAdapter({
+      profiles: () => new Map([['openai-codex', resolved]]),
+      resolveApiKey: () => Promise.resolve(undefined),
+      credentialStore: new MemoryOAuthStore(oauthCredential(Date.now() + 60_000)),
+    })
+    let streamCalls = 0
+    const requestModels = {
+      getAuth: () => Promise.resolve({ auth: {}, source: 'OAuth' as const }),
+      streamSimple: () => {
+        streamCalls += 1
+        throw new Error('native provider must not run for unsupported content')
+      },
+    } as unknown as Models
+    vi.spyOn(
+      adapter as unknown as { nativeOAuthRequest: () => { models: Models } },
+      'nativeOAuthRequest',
+    ).mockReturnValue({ models: requestModels })
+
+    await expect((async () => {
+      for await (const _chunk of adapter.stream({
+        provider: 'openai-codex',
+        model: model.id,
+        messages: [createUserMessage({
+          content: [{ type: 'image', attachment: IMAGE_REF }],
+          source: { kind: 'plugin', plugin: 'test' },
+        })],
+      })) { /* drain */ }
+    })()).rejects.toMatchObject({
+      code: 'UNSUPPORTED_CONTENT',
+      message: `pi-ai model "${model.id}" does not support image input`,
+    })
+    expect(streamCalls).toBe(0)
+  })
+
   it('normalizes a failed OAuth refresh before provider text reaches the stream', async () => {
     const resolved = resolveProfiles({ 'openai-codex': {} }).get('openai-codex')
     if (resolved === undefined) throw new Error('expected Codex profile')

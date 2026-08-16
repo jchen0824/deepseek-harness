@@ -681,4 +681,45 @@ describe('Web session model selection', () => {
     }
     await ctx.fiber.dispose()
   })
+
+  it('refuses OAuth lifecycle RPCs for a key-authenticated Codex profile before controller calls', async () => {
+    const { ctx } = await harness()
+    ctx.llm.registerConfigurableProviders([{
+      provider: 'openai-codex', displayName: 'OpenAI Codex', settingsNs: 'llm-pi-ai',
+      settingsPath: ['providers', 'openai-codex'], auth: { kind: 'api-key' },
+    }])
+    const status = vi.fn(() => Promise.resolve({ provider: 'openai-codex', status: 'connected' as const }))
+    const start = vi.fn(() => Promise.resolve({
+      kind: 'connected' as const,
+      connection: { provider: 'openai-codex', status: 'connected' as const },
+    }))
+    const cancel = vi.fn(() => Promise.resolve({ provider: 'openai-codex', status: 'missing' as const }))
+    const disconnect = vi.fn(() => Promise.resolve({ provider: 'openai-codex', status: 'missing' as const }))
+    ctx.llm.registerOAuthController({ provider: 'openai-codex', status, start, cancel, disconnect })
+    const api = createApiProxy(ctx, {
+      defaultModelSelection: () => ({ provider: 'deepseek-official', model: 'deepseek-chat' }),
+      cwd: '/tmp',
+    })
+
+    for (const invoke of [
+      () => api.llm.oauthStart(request({ provider: 'openai-codex' })),
+      () => api.llm.oauthStatus(request({ provider: 'openai-codex' })),
+      () => api.llm.oauthCancel(request({ provider: 'openai-codex' })),
+      () => api.llm.oauthDisconnect(request({ provider: 'openai-codex' })),
+    ]) {
+      expect((await invoke()).result).toEqual({
+        ok: false,
+        error: {
+          code: 'internal',
+          message: 'OAuth connection is unavailable. Refresh the provider list and try again.',
+          details: {},
+        },
+      })
+    }
+    expect(status).not.toHaveBeenCalled()
+    expect(start).not.toHaveBeenCalled()
+    expect(cancel).not.toHaveBeenCalled()
+    expect(disconnect).not.toHaveBeenCalled()
+    await ctx.fiber.dispose()
+  })
 })
