@@ -11,6 +11,7 @@ import { FileSettingsProvider } from '@deepseek-ai/dsh-settings-file'
 import * as LlmPiAi from '@deepseek-ai/dsh-llm-pi-ai'
 import { assemble } from './assemble.ts'
 import { closeMockServers, mockServer, textEvents } from './mock-server.ts'
+import { OPENAI_CODEX_LOGIN_LEASE_REF } from '../src/oauth-credential-store.ts'
 
 const NS = settingsNamespace('llm-pi-ai')
 
@@ -28,6 +29,7 @@ afterEach(async () => {
   while (cleanups.length > 0) await cleanups.pop()!()
   await closeMockServers()
   vi.unstubAllEnvs()
+  vi.useRealTimers()
 })
 
 async function home(): Promise<string> {
@@ -37,7 +39,12 @@ async function home(): Promise<string> {
 }
 
 /** Real dynamic composition mirroring the deepseek twin's harness. */
-async function boot(dir: string, config: LlmPiAi.Config, watch = false): Promise<Context> {
+async function boot(
+  dir: string,
+  config: LlmPiAi.Config,
+  watch = false,
+  beforeLlmPiAi?: (ctx: Context) => void,
+): Promise<Context> {
   const ctx = new Context()
   cleanups.push(async () => {
     await ctx.fiber.dispose()
@@ -45,6 +52,7 @@ async function boot(dir: string, config: LlmPiAi.Config, watch = false): Promise
   await ctx.plugin(LlmRuntime)
   await ctx.plugin(FileSettingsProvider, { path: join(dir, 'settings.yaml'), watch: false })
   await ctx.plugin(LocalCredentialProvider, { path: join(dir, '.credentials.yaml'), watch, debounceMs: 10 })
+  beforeLlmPiAi?.(ctx)
   await ctx.plugin(LlmPiAi, config)
   return ctx
 }
@@ -226,6 +234,47 @@ describe('request-level dynamic profiles', () => {
       expect(updates).toContainEqual({ provider: 'openai-codex', status: 'connected' })
     })
     expect(JSON.stringify(updates)).not.toMatch(/private-(?:access|refresh)-value/)
+  })
+
+  it('activates the dormant OAuth route when a peer lease expires after credential persistence', async () => {
+    const dir = await home()
+    const writer = await boot(dir, { providers: { 'openai-codex': {} } })
+    const store = new LlmPiAi.OpenAICodexCredentialStore(() => writer.credentials)
+    const loginStore = await store.beginLogin(0, 1)
+    await loginStore.modify('openai-codex', async () => ({
+      type: 'oauth',
+      access: 'private-access-value',
+      refresh: 'private-refresh-value',
+      expires: Date.now() + 60_000,
+    }))
+    await writer.credentials.modify(OPENAI_CODEX_LOGIN_LEASE_REF, async () => ({
+      value: JSON.stringify({
+        version: 2,
+        generation: 1,
+        reconnectRequired: false,
+        lease: { ownerId: 'abandoned-owner', state: 'pending', expiresAt: Date.now() + 500 },
+      }),
+      result: undefined,
+      visibility: 'private',
+    }))
+    await writer.fiber.dispose()
+
+    const updates: unknown[] = []
+    const peer = await boot(
+      dir,
+      { providers: { 'openai-codex': {} } },
+      false,
+      (ctx) => { ctx.on('llm/oauth-connection-updated', (connection) => { updates.push(connection) }) },
+    )
+
+    await vi.waitFor(() => {
+      expect(updates).toContainEqual({ provider: 'openai-codex', status: 'connecting' })
+    })
+    expect(peer.llm.listProviders().map(provider => provider.id)).not.toContain('openai-codex')
+
+    await vi.waitFor(() => {
+      expect(peer.llm.listProviders().map(provider => provider.id)).toContain('openai-codex')
+    }, { timeout: 2_000 })
   })
 
   it('refuses a settings write this adapter could not serve, leaving its routes alone', async () => {

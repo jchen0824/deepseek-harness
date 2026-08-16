@@ -15,7 +15,10 @@ import type {
 } from '@earendil-works/pi-ai'
 import type { LlmOAuthConnection } from '@deepseek-ai/dsh-llm'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { OpenAICodexCredentialStore } from '../src/oauth-credential-store.ts'
+import {
+  OPENAI_CODEX_LOGIN_LEASE_REF,
+  OpenAICodexCredentialStore,
+} from '../src/oauth-credential-store.ts'
 import { OpenAICodexOAuthController } from '../src/openai-codex-oauth.ts'
 
 const PROVIDER = 'openai-codex'
@@ -258,6 +261,36 @@ function controllerOf(
   })
   controllers.push(controller)
   return controller
+}
+
+async function writeGenerationOneLease(
+  credentials: SharedCredentials,
+  expiresAt: number,
+): Promise<void> {
+  await credentials.modify(OPENAI_CODEX_LOGIN_LEASE_REF, async () => ({
+    value: JSON.stringify({
+      version: 2,
+      generation: 1,
+      reconnectRequired: false,
+      lease: {
+        ownerId: 'abandoned-owner',
+        state: 'pending',
+        expiresAt,
+      },
+    }),
+    result: undefined,
+    visibility: 'private',
+  }))
+}
+
+async function persistGenerationOneCredentialWithLease(
+  credentials: SharedCredentials,
+  expiresAt: number,
+): Promise<void> {
+  const store = new OpenAICodexCredentialStore(() => credentials)
+  const loginStore = await store.beginLogin(0, 1)
+  await loginStore.modify(PROVIDER, async () => oauth())
+  await writeGenerationOneLease(credentials, expiresAt)
 }
 
 async function waitForStatus(
@@ -543,6 +576,69 @@ describe('OpenAICodexOAuthController', () => {
     await expect(third.start()).resolves.toMatchObject({ kind: 'already-connecting' })
     expect(secondModels.loginCount).toBe(1)
     expect(thirdModels.loginCount).toBe(0)
+  })
+
+  it('rechecks a peer after an observed lease expires following credential persistence', async () => {
+    vi.useFakeTimers()
+    const credentials = new SharedCredentials(new Context())
+    await persistGenerationOneCredentialWithLease(credentials, 100)
+    const now = { value: 0 }
+    const events: LlmOAuthConnection[] = []
+    const peer = controllerOf(credentials, new DeviceCodeModels(), events, now)
+
+    await expect(peer.initialize()).resolves.toEqual({ provider: PROVIDER, status: 'connecting' })
+
+    now.value = 100
+    await vi.advanceTimersByTimeAsync(100)
+
+    await vi.waitFor(() => {
+      expect(events).toEqual([
+        { provider: PROVIDER, status: 'connecting' },
+        { provider: PROVIDER, status: 'connected' },
+      ])
+    })
+  })
+
+  it('rearms a peer recheck when a live lease is extended before its observed expiry', async () => {
+    vi.useFakeTimers()
+    const credentials = new SharedCredentials(new Context())
+    await persistGenerationOneCredentialWithLease(credentials, 100)
+    const now = { value: 0 }
+    const events: LlmOAuthConnection[] = []
+    const peer = controllerOf(credentials, new DeviceCodeModels(), events, now)
+
+    await expect(peer.initialize()).resolves.toEqual({ provider: PROVIDER, status: 'connecting' })
+    await writeGenerationOneLease(credentials, 200)
+    await expect(peer.status()).resolves.toEqual({ provider: PROVIDER, status: 'connecting' })
+
+    now.value = 100
+    await vi.advanceTimersByTimeAsync(100)
+    expect(events).toEqual([{ provider: PROVIDER, status: 'connecting' }])
+
+    now.value = 200
+    await vi.advanceTimersByTimeAsync(100)
+    await vi.waitFor(() => {
+      expect(events).toEqual([
+        { provider: PROVIDER, status: 'connecting' },
+        { provider: PROVIDER, status: 'connected' },
+      ])
+    })
+  })
+
+  it('cancels an observed lease recheck when the peer is disposed', async () => {
+    vi.useFakeTimers()
+    const credentials = new SharedCredentials(new Context())
+    await persistGenerationOneCredentialWithLease(credentials, 100)
+    const now = { value: 0 }
+    const events: LlmOAuthConnection[] = []
+    const peer = controllerOf(credentials, new DeviceCodeModels(), events, now)
+
+    await expect(peer.initialize()).resolves.toEqual({ provider: PROVIDER, status: 'connecting' })
+    await peer.dispose()
+
+    now.value = 100
+    await vi.advanceTimersByTimeAsync(100)
+    expect(events).toEqual([{ provider: PROVIDER, status: 'connecting' }])
   })
 
   it('cancels and settles the poller before making its lease available', async () => {

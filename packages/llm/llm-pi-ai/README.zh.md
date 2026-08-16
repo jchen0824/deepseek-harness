@@ -126,7 +126,7 @@ profile 的 `models` 列表是*替换*该路由已安装 catalog，而不是扩�
 
 一个 Host 生命周期内只有一个 `OpenAICodexCredentialStore`，由控制器和每个不可变 pi-ai 模型集合共享。它通过 `CredentialProvider.modify()` 以私有原子修改方式存储带单调 generation 的版本化 OAuth 记录，因此来自不同模型快照与 Harness 进程的刷新操作会在本地凭据提供方的跨进程锁上串行执行。登录会得到一份限定到该 generation 的存储；generation 被撤销后，其写入会被拒绝。固定的私有凭据引用绝不会出现在插件配置、提供方 profile、settings、事件、日志或浏览器数据中；私有变更只会发出不带 payload、仅供 Host 使用的凭据失效通知，使同级控制器重新读取状态。
 
-登录用另一条固定私有记录保存 generation 与会过期的跨进程租约。pi-ai 轮询期间，只允许一个进程声明并续订它；其他进程报告 `already-connecting`，已过期的租约可以被接管。取消或断开连接会推进持久 generation 并清除租约，因此远程轮询器无法在撤销后存下凭据；有序插件资源释放会中止自身持有的工作，并且只释放所有者匹配的租约。同一记录还保存 `reconnect-required`，使刷新失败对共用 Harness 主目录的每个进程可见。`oauth.loginLeaseTtlMs` 是正数且有上限的顶层插件设置，默认为 30 秒，同时决定过期与续订时序：
+登录用另一条固定私有记录保存 generation 与会过期的跨进程租约。pi-ai 轮询期间，只允许一个进程声明并续订它；其他进程报告 `already-connecting`，已过期的租约可以被接管。每个观察到有效租约的同级进程都会在租约到期时安排本地重新读取，因此所有者崩溃前刚持久化的凭据无需另一条文件变更即可激活路由。取消或断开连接会推进持久 generation 并清除租约，因此远程轮询器无法在撤销后存下凭据；有序插件资源释放会中止自身持有的工作，并且只释放所有者匹配的租约。同一记录还保存 `reconnect-required`，使刷新失败对共用 Harness 主目录的每个进程可见。`oauth.loginLeaseTtlMs` 是正数且有上限的顶层插件设置，默认为 30 秒，同时决定过期与续订时序：
 
 ```yaml
 - id: llm

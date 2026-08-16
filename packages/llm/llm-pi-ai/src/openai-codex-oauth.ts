@@ -74,6 +74,13 @@ interface LoginAttempt {
   done: Promise<void>
 }
 
+/** One cancellable status recheck for a lease observed in another process. */
+interface LeaseExpiryRefresh {
+  expiresAt: number
+  abort: AbortController
+  done: Promise<void>
+}
+
 /** Dependencies retained for the controller's full host lifetime. */
 export interface OpenAICodexOAuthControllerOptions {
   /** Resolve the currently mounted private credential provider. */
@@ -188,6 +195,8 @@ export class OpenAICodexOAuthController implements LlmOAuthController {
   readonly provider = PROVIDER
   private connectionStatus: LlmOAuthConnectionStatus = 'missing'
   private attempt: LoginAttempt | undefined
+  private leaseExpiryRefresh: LeaseExpiryRefresh | undefined
+  private readonly leaseExpiryRefreshes = new Set<Promise<void>>()
   private disposed = false
   private disposal: Promise<void> | undefined
   private readonly now: () => number
@@ -428,10 +437,55 @@ export class OpenAICodexOAuthController implements LlmOAuthController {
     }
   }
 
+  /** Stop the one pending recheck without changing durable lease state. */
+  private cancelLeaseExpiryRefresh(): void {
+    const refresh = this.leaseExpiryRefresh
+    if (refresh === undefined) return
+    this.leaseExpiryRefresh = undefined
+    refresh.abort.abort('OpenAI Codex observed login lease changed')
+  }
+
+  /** Remove a settled recheck only when it is still the current one. */
+  private finishLeaseExpiryRefresh(refresh: LeaseExpiryRefresh, done: Promise<void>): void {
+    this.leaseExpiryRefreshes.delete(done)
+    if (this.leaseExpiryRefresh === refresh) this.leaseExpiryRefresh = undefined
+  }
+
+  /** Wait for an observed lease to expire, then re-read durable OAuth state. */
+  private async recheckLeaseExpiry(refresh: LeaseExpiryRefresh): Promise<void> {
+    try {
+      const delayMs = Math.max(1, refresh.expiresAt - this.now())
+      if (!await wait(delayMs, refresh.abort.signal) || this.disposed) return
+      await this.inspectStatus()
+    } catch {
+      // This detached recheck has no caller; inspectStatus already redacts durable-state failures.
+    }
+  }
+
+  /** Arm one local recheck for a live lease observed from another process. */
+  private scheduleLeaseExpiryRefresh(expiresAt: number): void {
+    if (this.disposed || this.leaseExpiryRefresh?.expiresAt === expiresAt) return
+    this.cancelLeaseExpiryRefresh()
+    const refresh: LeaseExpiryRefresh = {
+      expiresAt,
+      abort: new AbortController(),
+      done: Promise.resolve(),
+    }
+    this.leaseExpiryRefresh = refresh
+    const done = this.recheckLeaseExpiry(refresh)
+    refresh.done = done
+    this.leaseExpiryRefreshes.add(done)
+    void done.then(() => { this.finishLeaseExpiryRefresh(refresh, done) })
+  }
+
   /** Derive one redacted status entirely from durable cross-process state. */
   private async durableStatus(): Promise<LlmOAuthConnectionStatus> {
     const coordination = await this.readCoordination()
-    if (coordination.lease !== undefined && coordination.lease.expiresAt > this.now()) return 'connecting'
+    if (coordination.lease !== undefined && coordination.lease.expiresAt > this.now()) {
+      this.scheduleLeaseExpiryRefresh(coordination.lease.expiresAt)
+      return 'connecting'
+    }
+    this.cancelLeaseExpiryRefresh()
     if (coordination.reconnectRequired) return 'reconnect-required'
     const credential = await this.options.credentialStore.readForGeneration(coordination.generation)
     return credential === undefined ? 'missing' : 'connected'
@@ -653,9 +707,12 @@ export class OpenAICodexOAuthController implements LlmOAuthController {
   /** Ordered disposal implementation shared by repeat callers. */
   private async disposeOwnedAttempt(): Promise<void> {
     this.disposed = true
+    this.cancelLeaseExpiryRefresh()
     const attempt = this.attempt
-    if (attempt === undefined) return
-    attempt.abort.abort('OpenAI Codex OAuth controller disposed')
-    await attempt.done
+    if (attempt !== undefined) attempt.abort.abort('OpenAI Codex OAuth controller disposed')
+    await Promise.all([
+      ...this.leaseExpiryRefreshes,
+      ...attempt === undefined ? [] : [attempt.done],
+    ])
   }
 }
