@@ -20,7 +20,7 @@ import { Button, IconPlusOutline16, Modal } from '@deepseek-ai/dsh-client-ui-pri
 import type { SnapshotSelectorHook } from '@deepseek-ai/dsh-client-web-react'
 import { CustomProviderCard } from './CustomProviderCard.tsx'
 import { OAuthProviderCard } from './OAuthProviderCard.tsx'
-import { deriveKeyRef, messageOf, protocolChoices, providerUsable } from './store.ts'
+import { deriveKeyRef, messageOf, protocolChoices, providerUsable, usesOAuthLifecycle } from './store.ts'
 import type { ModelsSettingsState, ModelsSettingsStore, ProviderRow } from './store.ts'
 import { ProviderEditor, type ProviderEditorProps } from './ProviderEditor.tsx'
 import type { en } from './locales.ts'
@@ -179,7 +179,7 @@ function targetOf(row: ProviderRow): EditorTarget {
     // route-level fields only a declared route owns off the card, exactly as
     // it leaves the custom tag off the row.
     ...row.entry.declared === true ? { declared: true } : {},
-    ...row.entry.auth.kind === 'oauth' ? { oauth: true } : {},
+    ...usesOAuthLifecycle(row) ? { oauth: true } : {},
   }
 }
 
@@ -298,8 +298,8 @@ function Loaded({ injected }: { injected: ModelsSectionInjected }): ReactNode {
   // One fact decides both first-run postures on this page and the onboarding
   // step: whether the user already has a provider to talk to.
   const anyUsable = state.rows.some(providerUsable)
-  const oauthRows = state.rows.filter(row => row.entry.auth.kind === 'oauth' && row.entry.settingsNs !== '')
-  const configured = state.rows.filter(row => row.configured && row.entry.auth.kind !== 'oauth')
+  const oauthRows = state.rows.filter(row => usesOAuthLifecycle(row) && row.entry.settingsNs !== '')
+  const configured = state.rows.filter(row => row.configured && !usesOAuthLifecycle(row))
   const addable = state.rows.filter(row =>
     !row.configured && row.entry.auth.kind === 'api-key' && row.entry.settingsNs !== '')
   const addTarget = adding ? editing : undefined
@@ -364,6 +364,7 @@ function Loaded({ injected }: { injected: ModelsSectionInjected }): ReactNode {
             )
           }
           const editable = row.entry.auth.kind === 'api-key'
+            || (row.entry.auth.kind === 'oauth' && row.apiKeyEnv !== undefined)
           const open = editable && !adding && editing?.provider === row.entry.provider
           const credentialConfigured = row.credential?.configured === true
           const credentialMissing = !credentialConfigured

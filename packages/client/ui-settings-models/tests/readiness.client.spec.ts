@@ -96,6 +96,11 @@ describe('providerUsable', () => {
       apiKeyEnv: 'OPENAI_CODEX_API_KEY',
       credential: { configured: true, writable: true },
     })).toBe(true)
+    expect(providerUsable({
+      ...oauth('connected'),
+      apiKeyEnv: 'OPENAI_CODEX_API_KEY',
+      credential: missingCredential,
+    })).toBe(false)
   })
 })
 

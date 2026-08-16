@@ -31,8 +31,19 @@ export interface ProviderRow {
   apiKeyEnv: string | undefined
   /** Credential state for {@link apiKeyEnv}, once described. */
   credential: CredentialView | undefined
-  /** Loopback-only redacted OAuth state, when this route uses OAuth. */
+  /** Loopback-only redacted OAuth state, when this profile uses native OAuth. */
   connection?: OAuthConnectionView
+}
+
+/**
+ * Whether this profile uses the provider's native OAuth lifecycle. Directory
+ * metadata describes the installed route, but an existing profile that names
+ * a key keeps its explicit key-authentication path.
+ * @param row - one joined provider row.
+ * @returns whether OAuth lifecycle actions and state apply to this profile.
+ */
+export function usesOAuthLifecycle(row: ProviderRow): boolean {
+  return row.entry.auth.kind === 'oauth' && row.apiKeyEnv === undefined
 }
 
 /** Page snapshot. */
@@ -115,7 +126,7 @@ export class ModelsSettingsStore {
   /**
    * Refresh the whole page snapshot: directory and namespaces in parallel,
    * then one batched credential describe over every referenced ref and local
-   * OAuth status reads. A
+   * native-OAuth status reads. A
    * failure keeps the last good rows and surfaces the error.
    * @returns nothing; the snapshot carries the outcome.
    */
@@ -162,7 +173,7 @@ export class ModelsSettingsStore {
     })
     const refs = [...new Set(rows.flatMap(row => row.apiKeyEnv === undefined ? [] : [row.apiKeyEnv]))]
     const connections = new Map<string, OAuthConnectionView>()
-    await Promise.all(rows.filter(row => row.entry.auth.kind === 'oauth').map(async (row) => {
+    await Promise.all(rows.filter(usesOAuthLifecycle).map(async (row) => {
       try {
         const response = await this.api.llm.oauthStatus({ provider: row.entry.provider })
         if (response.result.ok) connections.set(row.entry.provider, response.result.value.connection)
@@ -207,22 +218,17 @@ export class ModelsSettingsStore {
 }
 
 /**
- * Whether a joined row can serve model requests as it stands. API-key routes
- * require their named key, OAuth routes require a connected state unless an
- * explicit legacy key remains configured, and native routes need only be live.
+ * Whether a joined row can serve model requests as it stands. Native OAuth
+ * routes require a connected state, key-authentication routes require their
+ * named key when they have one, and native routes need only be live.
  * @param row - one joined provider row.
  * @returns whether the user already has this provider to talk to.
  */
 export function providerUsable(row: ProviderRow): boolean {
   if (!row.entry.active) return false
-  if (row.entry.auth.kind === 'oauth') {
-    return row.connection?.status === 'connected'
-      || (row.apiKeyEnv !== undefined && row.credential?.configured === true)
-  }
-  if (row.entry.auth.kind === 'api-key') {
-    return row.apiKeyEnv === undefined || row.credential?.configured === true
-  }
-  return true
+  if (usesOAuthLifecycle(row)) return row.connection?.status === 'connected'
+  if (row.entry.auth.kind === 'native') return true
+  return row.apiKeyEnv === undefined || row.credential?.configured === true
 }
 
 /** First-run onboarding readiness derived only from the shared Models join. */

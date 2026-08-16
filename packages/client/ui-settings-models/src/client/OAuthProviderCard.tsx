@@ -15,6 +15,12 @@ interface DeviceCodeView {
 
 type PendingAction = 'start' | 'cancel' | 'disconnect'
 
+interface ActiveStart {
+  generation: number
+  entry: ProviderRow['entry']
+  profileCreationPending: boolean
+}
+
 // The browser has no forwarded OAuth lifecycle event: status is deliberately
 // loopback-only. Refresh while device-code login is live so a remote expiry or
 // cancellation cannot leave the card at Connecting forever.
@@ -47,10 +53,7 @@ export function OAuthProviderCard({
   const [failure, setFailure] = useState<string | undefined>(undefined)
   const startGeneration = useRef(0)
   const statusRefreshInFlight = useRef(false)
-  const activeStart = useRef<{
-    generation: number
-    entry: ProviderRow['entry']
-  } | undefined>(undefined)
+  const activeStart = useRef<ActiveStart | undefined>(undefined)
   const connectionStatus = row.connection?.status ?? 'missing'
   const connecting = connectionStatus === 'connecting'
   const terminal = connectionStatus === 'connected'
@@ -59,11 +62,26 @@ export function OAuthProviderCard({
   const disabled = readOnly || pending !== undefined
   const target = { provider: row.entry.provider, displayName: row.entry.displayName }
 
+  const rebaseProfileCreation = (start: ActiveStart, current: ProviderRow): boolean => {
+    if (
+      !start.profileCreationPending
+      || !current.configured
+      || current.apiKeyEnv !== undefined
+      || (current.connection?.status ?? 'missing') !== 'missing'
+    ) {
+      return false
+    }
+    start.entry = current.entry
+    start.profileCreationPending = false
+    return true
+  }
+
   useEffect(() => {
     if (!terminal) return
     setDeviceCode(undefined)
     const start = activeStart.current
     if (start === undefined || start.entry === row.entry) return
+    if (rebaseProfileCreation(start, row)) return
     startGeneration.current += 1
     activeStart.current = undefined
     setPending(current => current === 'start' ? undefined : current)
@@ -98,17 +116,19 @@ export function OAuthProviderCard({
   }
 
   const startIsCurrent = (generation: number, entry: ProviderRow['entry']): boolean => {
-    if (generation !== startGeneration.current || activeStart.current?.generation !== generation) return false
+    const start = activeStart.current
+    if (generation !== startGeneration.current || start?.generation !== generation) return false
     const current = controller.store.getSnapshot().rows
       .find(candidate => candidate.entry.provider === entry.provider)
-    if (current === undefined || current.entry === entry) return true
+    if (current === undefined || current.entry === start.entry) return true
+    if (rebaseProfileCreation(start, current)) return true
     return current.connection?.status === 'connecting'
   }
 
   const connect = (): void => {
     if (disabled) return
     const generation = ++startGeneration.current
-    activeStart.current = { generation, entry: row.entry }
+    activeStart.current = { generation, entry: row.entry, profileCreationPending: !row.configured }
     setPending('start')
     setFailure(undefined)
     void (async () => {
@@ -119,6 +139,7 @@ export function OAuthProviderCard({
             ops: [{ op: 'set', path: [...row.entry.settingsPath], value: {} }],
           })
           if (!startIsCurrent(generation, row.entry)) return
+          if (activeStart.current?.generation === generation) activeStart.current.profileCreationPending = false
           if (!profile.result.ok) {
             setFailure(t('oauthActionFailed'))
             return
