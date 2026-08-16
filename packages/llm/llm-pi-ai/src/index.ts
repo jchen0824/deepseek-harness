@@ -376,6 +376,25 @@ export function apply(ctx: Context, config: Config): void {
       await initialization
     }
   })
+  let privateRefresh: Promise<void> = Promise.resolve()
+  ctx.effect(() => {
+    const refreshFromPrivateCredential = (): void => {
+      if (!oauthLifecycleActive) return
+      privateRefresh = privateRefresh.then(async () => {
+        if (!oauthLifecycleActive) return
+        try {
+          await oauthController.status()
+        } catch {
+          ctx.logger.error('llm-pi-ai: OpenAI Codex authentication state could not refresh after a private credential update')
+        }
+      })
+    }
+    const dispose = ctx.on('credentials/private-updated', refreshFromPrivateCredential)
+    return async () => {
+      dispose()
+      await privateRefresh
+    }
+  }, 'llm-pi-ai: private OAuth credential invalidation')
   ctx.llm.registerOAuthController(oauthController)
   initialization = oauthController.initialize().then((connection) => {
     if (!oauthLifecycleActive) return

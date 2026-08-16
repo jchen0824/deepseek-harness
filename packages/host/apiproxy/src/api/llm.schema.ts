@@ -40,7 +40,6 @@ export const configurableProviderViewSchema = z.object({
   settingsPath: z.array(z.string()),
   active: z.boolean(),
   auth: llmProviderAuthSchema,
-  connection: oauthConnectionViewSchema.optional(),
   declared: z.boolean().optional(),
 }) satisfies z.ZodType<Wire<ConfigurableProviderView>>
 

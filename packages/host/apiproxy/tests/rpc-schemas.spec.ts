@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest'
+import { API_REMOTE_FORWARDED_EVENTS } from '@deepseek-ai/dsh-api-remotes'
 import { RpcId, transportError } from '../src/api/rpc.ts'
 import {
   clientRequestSchema, clientResponseSchema, rpcErrorSchema, rpcIdSchema, rpcMessageSchema,
@@ -447,7 +448,7 @@ describe('goals domain schemas', () => {
 })
 
 describe('llm OAuth schemas', () => {
-  it('keeps provider snapshots and lifecycle results on the redacted public fields', () => {
+  it('keeps OAuth connection state out of provider snapshots and redacts lifecycle results', () => {
     const connection = {
       provider: 'openai-codex', status: 'connecting', access: 'private-access',
       refresh: 'private-refresh', accountId: 'acct-private', leaseRef: 'OPENAI_CODEX_OAUTH',
@@ -468,7 +469,6 @@ describe('llm OAuth schemas', () => {
       settingsPath: ['providers', 'openai-codex'],
       auth: { kind: 'oauth' },
       active: false,
-      connection: { provider: 'openai-codex', status: 'connecting' },
     })
     expect(llmOAuthStartValueSchema.parse({
       connection,
@@ -626,10 +626,10 @@ describe('events frame schemas', () => {
       { type: 'host/remote-event', event: 'settings/document-updated', args: ['ns', 3] },
       { type: 'host/remote-event', event: 'agent-preset/selected', args: ['s', 'minimal'] },
       { type: 'host/remote-event', event: 'llm/adapters-updated', args: [] },
-      { type: 'host/remote-event', event: 'llm/oauth-connection-updated', args: [{ provider: 'openai-codex', status: 'connected' }] },
       { type: 'stream/error', error: { code: 'internal', message: 'm', details: {} } },
     ]
     for (const frame of frames) expect(hostFrameSchema.parse(frame)).toMatchObject({ type: frame.type })
+    expect(API_REMOTE_FORWARDED_EVENTS).not.toContain('llm/oauth-connection-updated')
   })
 })
 

@@ -151,8 +151,13 @@ function oauthReconnectFailure(): LlmError {
 }
 
 /** Throw the single public reconnect failure after committing durable controller state. */
-async function reconnectOAuth(controller: PiAiAdapterOptions['oauthController']): Promise<never> {
-  await controller?.markReconnectRequired()
+async function reconnectOAuth(
+  controller: PiAiAdapterOptions['oauthController'],
+  generation: number | undefined,
+): Promise<never> {
+  if (controller !== undefined && generation !== undefined) {
+    await controller.markReconnectRequired(generation)
+  }
   throw oauthReconnectFailure()
 }
 
@@ -177,6 +182,7 @@ async function* guardNativeOAuthEvents(
   model: Model<Api>,
   failureVersion: number | undefined,
   controller: PiAiAdapterOptions['oauthController'],
+  generation: number | undefined,
 ): AsyncGenerator<AssistantMessageEvent> {
   for await (const event of events) {
     const terminal = terminalMessage(event)
@@ -194,7 +200,7 @@ async function* guardNativeOAuthEvents(
           unavailable = true
         }
       }
-      if (unavailable) await reconnectOAuth(controller)
+      if (unavailable) await reconnectOAuth(controller, generation)
     }
     yield event
   }
@@ -258,8 +264,8 @@ export interface PiAiAdapterOptions {
   resolveApiKey: (provider: string, profile: ResolvedPiAiProviderProfile) => Promise<string | undefined>
   /** Stable pi-ai credential store shared beneath every request-local OAuth facade. */
   credentialStore?: CredentialStore
-  /** Raw host controller used only to persist a request-time refresh failure. */
-  oauthController?: Pick<OpenAICodexOAuthController, 'markReconnectRequired'>
+  /** Raw host controller used only to bind and persist one request-time OAuth failure. */
+  oauthController?: Pick<OpenAICodexOAuthController, 'captureRequestGeneration' | 'markReconnectRequired'>
   /** Resolve the optional durable attachment service at request time. */
   resolveAttachments?: () => AttachmentStore | undefined
 }
@@ -490,18 +496,20 @@ export class PiAiAdapter extends LlmAdapter {
       ? undefined
       : await this.config.resolveApiKey(options.provider, profile)
 
+    let oauthGeneration: number | undefined
     if (nativeCodexOAuth) {
       try {
+        oauthGeneration = await this.config.oauthController?.captureRequestGeneration()
         // Preflight pi-ai's locked refresh while the typed ModelsError is still
         // available. `streamSimple()` is lazy and otherwise flattens it into a
         // provider-text event, which must not enter the Harness stream.
         const auth = await requestModels.getAuth(model)
         if (auth === undefined) {
-          await reconnectOAuth(this.config.oauthController)
+          await reconnectOAuth(this.config.oauthController, oauthGeneration)
         }
       } catch (error) {
-        if (error instanceof ModelsError) {
-          await reconnectOAuth(this.config.oauthController)
+        if (error instanceof ModelsError || error instanceof LlmError) {
+          await reconnectOAuth(this.config.oauthController, oauthGeneration)
         }
         throw error
       }
@@ -545,6 +553,7 @@ export class PiAiAdapter extends LlmAdapter {
           model,
           oauthFailureVersion,
           this.config.oauthController,
+          oauthGeneration,
         )
         : sourceEvents
       const chunks = nativeCodexOAuth
@@ -578,7 +587,7 @@ export class PiAiAdapter extends LlmAdapter {
       if (nativeCodexOAuth
         && (oauthFailureVersion !== oauthRequest?.oauthFailures?.version()
           || error instanceof ModelsError)) {
-        await reconnectOAuth(this.config.oauthController)
+        await reconnectOAuth(this.config.oauthController, oauthGeneration)
       }
       if (timeoutOf(watchdog.signal, 'LLM_STREAM_IDLE_TIMEOUT') !== undefined) {
         throw new LlmError(

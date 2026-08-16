@@ -145,13 +145,15 @@ describe('read-modify-write', () => {
     expect(await second.credentials.resolve(ALPHA)).toEqual({ value: 'private-first', source: 'file' })
   })
 
-  it('keeps a private cross-instance update out of watcher notifications', async () => {
+  it('notifies host-private peers without naming a watched private credential', async () => {
     const dir = await tempDir()
     const path = join(dir, '.credentials.yaml')
     const first = await boot({ path, watch: false })
     const second = await boot({ path, debounceMs: 10 })
-    const secondEvents: string[] = []
-    second.on('credentials/updated', (ref) => { secondEvents.push(ref) })
+    const publicEvents: string[] = []
+    let privateUpdates = 0
+    second.on('credentials/updated', (ref) => { publicEvents.push(ref) })
+    second.on('credentials/private-updated', () => { privateUpdates += 1 })
 
     await first.credentials.modify(ALPHA, async () => ({
       value: 'private-first',
@@ -161,8 +163,9 @@ describe('read-modify-write', () => {
 
     await vi.waitFor(async () => {
       expect(await second.credentials.resolve(ALPHA)).toEqual({ value: 'private-first', source: 'file' })
+      expect(privateUpdates).toBe(1)
     })
-    expect(secondEvents).toEqual([])
+    expect(publicEvents).toEqual([])
   })
 
   it('keeps a private update silent after a fresh provider module reconciles it', async () => {

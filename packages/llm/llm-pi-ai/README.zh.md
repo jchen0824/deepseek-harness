@@ -122,9 +122,9 @@ profile 的 `models` 列表是*替换*该路由已安装 catalog，而不是扩�
 
 `openai-codex` 始终以 OAuth 认证元数据出现在可配置提供方目录中，但其模型路由在 profile 完成连接之前保持休眠。Web 模型页会创建空 profile 并发起连接；控制器报告 `connected` 后，适配器注册普通 pi-ai catalog 路由，因此普通模型选择器、默认值、会话级选择、推理元数据和请求路径仍然具有权威性。已连接订阅能使用 catalog 中哪些模型由 OpenAI 控制；catalog 成员身份不是授权检查。
 
-控制器只接受 pi-ai 的 OpenAI Codex 设备码选择器。发起调用的 Host 会收到验证 URL 与一次性验证码；浏览器回调、手动输入码、secret、粘贴 token 和其他提示词都会以本包的脱敏 OAuth 错误失败。设备码数据只在发起交互期间存在，并在完成或取消时清除。连接广播只包含 `provider` 与 `status`。
+控制器只接受 pi-ai 的 OpenAI Codex 设备码选择器。发起调用的 Host 会收到验证 URL 与一次性验证码；浏览器回调、手动输入码、secret、粘贴 token 和其他提示词都会以本包的脱敏 OAuth 错误失败。设备码数据只在发起交互期间存在，并在完成或取消时清除。Host 内部的连接广播只包含 `provider` 与 `status`；公开提供方目录与转发给浏览器的事件均不包含连接状态。
 
-一个 Host 生命周期内只有一个 `OpenAICodexCredentialStore`，由控制器和每个不可变 pi-ai 模型集合共享。它通过 `CredentialProvider.modify()` 以私有原子修改方式存储带单调 generation 的版本化 OAuth 记录，因此来自不同模型快照与 Harness 进程的刷新操作会在本地凭据提供方的跨进程锁上串行执行。登录会得到一份限定到该 generation 的存储；generation 被撤销后，其写入会被拒绝。固定的私有凭据引用绝不会出现在插件配置、提供方 profile、settings、事件、日志或浏览器数据中，私有修改也不会发出 `credentials/updated`。
+一个 Host 生命周期内只有一个 `OpenAICodexCredentialStore`，由控制器和每个不可变 pi-ai 模型集合共享。它通过 `CredentialProvider.modify()` 以私有原子修改方式存储带单调 generation 的版本化 OAuth 记录，因此来自不同模型快照与 Harness 进程的刷新操作会在本地凭据提供方的跨进程锁上串行执行。登录会得到一份限定到该 generation 的存储；generation 被撤销后，其写入会被拒绝。固定的私有凭据引用绝不会出现在插件配置、提供方 profile、settings、事件、日志或浏览器数据中；私有变更只会发出不带 payload、仅供 Host 使用的凭据失效通知，使同级控制器重新读取状态。
 
 登录用另一条固定私有记录保存 generation 与会过期的跨进程租约。pi-ai 轮询期间，只允许一个进程声明并续订它；其他进程报告 `already-connecting`，已过期的租约可以被接管。取消或断开连接会推进持久 generation 并清除租约，因此远程轮询器无法在撤销后存下凭据；有序插件资源释放会中止自身持有的工作，并且只释放所有者匹配的租约。同一记录还保存 `reconnect-required`，使刷新失败对共用 Harness 主目录的每个进程可见。`oauth.loginLeaseTtlMs` 是正数且有上限的顶层插件设置，默认为 30 秒，同时决定过期与续订时序：
 
@@ -136,7 +136,7 @@ profile 的 `models` 列表是*替换*该路由已安装 catalog，而不是扩�
       loginLeaseTtlMs: 30000
 ```
 
-断开连接会推进 generation、清除已存 OAuth 凭据，并调用 pi-ai logout。凭据被撤销、刷新失败、记录不可读或凭据提供方缺失时，生命周期会进入脱敏的 `reconnect-required` 状态，请求则以 `OAUTH_RECONNECT_REQUIRED` 失败；原生 OAuth profile 绝不会回退到 API 密钥、进程环境或其他提供方。其他任何原生 Codex 提供方错误都只在内部分类，对流分片与抛出的失败仅呈现为 `OpenAI Codex request failed`，因此提供方持有的消息无法进入会话、历史响应、日志或快照。已经显式点名 `apiKeyEnv` 的既有 profile 仍是一条独立的旧式密钥认证路由，不会变成 OAuth 的回退路径。
+断开连接会推进 generation、清除已存 OAuth 凭据，并通过该已撤销 generation 的存储调用 pi-ai logout，因此过时 logout 无法移除后来的连接。每个原生 OAuth 请求都会在认证前捕获 generation；刷新失败只会在该 generation 仍是当前 generation 时标记 `reconnect-required`。凭据被撤销、刷新失败、记录不可读或凭据提供方缺失时，生命周期会进入脱敏的 `reconnect-required` 状态，请求则以 `OAUTH_RECONNECT_REQUIRED` 失败；原生 OAuth profile 绝不会回退到 API 密钥、进程环境或其他提供方。其他任何原生 Codex 提供方错误都只在内部分类，对流分片与抛出的失败仅呈现为 `OpenAI Codex request failed`，因此提供方持有的消息无法进入会话、历史响应、日志或快照。已经显式点名 `apiKeyEnv` 的既有 profile 仍是一条独立的旧式密钥认证路由，不会变成 OAuth 的回退路径。
 
 Web 与 Headless profile 使用同一个 Harness 主目录时会共享连接。Headless 绝不会发起交互式登录：它只消费已连接的 profile 与同一份凭据存储，否则该路由保持不可用。由实现持有的 OAuth 记录与租约引用绝不是用户要复制进 `settings.yaml` 或 `cordis.yml` 的字段。
 

@@ -377,7 +377,7 @@ export class OpenAICodexOAuthController implements LlmOAuthController {
   private async revokeAuthority(
     clearCredential: 'always' | 'when-leased',
     clearReconnectRequired: boolean,
-  ): Promise<void> {
+  ): Promise<AuthorityRevocation> {
     let revocation: AuthorityRevocation
     try {
       revocation = await this.credentials().modify(OPENAI_CODEX_LOGIN_LEASE_REF, (currentValue) => {
@@ -400,6 +400,7 @@ export class OpenAICodexOAuthController implements LlmOAuthController {
         revocation.generation,
         revocation.clearCredential,
       )
+      return revocation
     } catch {
       throw oauthFailure()
     }
@@ -537,6 +538,14 @@ export class OpenAICodexOAuthController implements LlmOAuthController {
     return this.status()
   }
 
+  /**
+   * Capture the durable generation that authorizes one outgoing model request.
+   * @returns the generation that may later mark a refresh failure.
+   */
+  async captureRequestGeneration(): Promise<number> {
+    return (await this.readCoordination()).generation
+  }
+
   /** Read current cross-process lease and credential state. */
   async status(): Promise<LlmOAuthConnection> {
     if (this.attempt?.phase === 'setup'
@@ -594,34 +603,45 @@ export class OpenAICodexOAuthController implements LlmOAuthController {
   /** Cancel login, remove the OAuth credential through pi-ai, and publish missing. */
   async disconnect(): Promise<LlmOAuthConnection> {
     const settled = this.abortLocalAttempt('OpenAI Codex login disconnected')
+    let revocation: AuthorityRevocation
     try {
-      await this.revokeAuthority('always', true)
+      revocation = await this.revokeAuthority('always', true)
     } finally {
       await settled
     }
     try {
-      await this.options.models(this.options.credentialStore).logout(PROVIDER)
+      await this.options.models(this.options.credentialStore.logoutStoreForGeneration(revocation.generation))
+        .logout(PROVIDER)
     } catch {
       throw oauthFailure()
     }
     return this.inspectStatus()
   }
 
-  /** Persist a request-time OAuth refresh failure without retaining provider data. */
-  async markReconnectRequired(): Promise<void> {
+  /**
+   * Persist a request-time OAuth refresh failure without retaining provider data.
+   * @param generation - the generation captured for the failing request.
+   * @returns nothing; stale generations instead refresh the local status.
+   */
+  async markReconnectRequired(generation: number): Promise<void> {
+    let current = false
     try {
-      await this.credentials().modify(OPENAI_CODEX_LOGIN_LEASE_REF, (currentValue) => {
-        const current = decodeCoordination(currentValue)
+      current = await this.credentials().modify(OPENAI_CODEX_LOGIN_LEASE_REF, (currentValue) => {
+        const coordination = decodeCoordination(currentValue)
+        if (coordination.generation !== generation) {
+          return Promise.resolve({ value: currentValue, result: false, visibility: 'private' as const })
+        }
         return Promise.resolve({
-          value: encodeCoordination({ ...current, reconnectRequired: true }),
-          result: undefined,
+          value: encodeCoordination({ ...coordination, reconnectRequired: true }),
+          result: true,
           visibility: 'private' as const,
         })
       })
     } catch {
       // The caller still receives only the redacted reconnect-required state.
     }
-    this.publish('reconnect-required')
+    if (current) this.publish('reconnect-required')
+    else await this.inspectStatus()
   }
 
   /** Abort and await every locally owned lifecycle task before disposal returns. */

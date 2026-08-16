@@ -114,6 +114,7 @@ class DeviceCodeModels {
   lastSignal: AbortSignal | undefined
   private persistencePause: { reached: Deferred<undefined>; release: Deferred<undefined> } | undefined
   private persistedPause: { reached: Deferred<undefined>; release: Deferred<undefined> } | undefined
+  private logoutPause: { reached: Deferred<undefined>; release: Deferred<undefined> } | undefined
 
   /** Pause after provider completion but before the generation-scoped write. */
   pausePersistence(): { reached: Promise<undefined>; release: () => void } {
@@ -128,6 +129,14 @@ class DeviceCodeModels {
     const reached = deferred<undefined>()
     const release = deferred<undefined>()
     this.persistedPause = { reached, release }
+    return { reached: reached.promise, release: () => { release.resolve(undefined) } }
+  }
+
+  /** Pause immediately before pi-ai deletes the generation-scoped credential. */
+  pauseLogout(): { reached: Promise<undefined>; release: () => void } {
+    const reached = deferred<undefined>()
+    const release = deferred<undefined>()
+    this.logoutPause = { reached, release }
     return { reached: reached.promise, release: () => { release.resolve(undefined) } }
   }
 
@@ -216,6 +225,12 @@ class DeviceCodeModels {
 
   private async logout(store: CredentialStore, providerId: string): Promise<void> {
     this.logoutCount += 1
+    const pause = this.logoutPause
+    if (pause !== undefined) {
+      pause.reached.resolve(undefined)
+      await pause.release.promise
+      if (this.logoutPause === pause) this.logoutPause = undefined
+    }
     await store.delete(providerId)
   }
 }
@@ -420,7 +435,7 @@ describe('OpenAICodexOAuthController', () => {
     const second = controllerOf(credentials, new DeviceCodeModels(), secondEvents, now)
     await expect(second.initialize()).resolves.toEqual({ provider: PROVIDER, status: 'connected' })
 
-    await first.markReconnectRequired()
+    await first.markReconnectRequired(await first.captureRequestGeneration())
 
     await expect(second.status()).resolves.toEqual({ provider: PROVIDER, status: 'reconnect-required' })
     expect(secondEvents.at(-1)).toEqual({ provider: PROVIDER, status: 'reconnect-required' })
@@ -434,6 +449,53 @@ describe('OpenAICodexOAuthController', () => {
     await expect(controller.initialize()).resolves.toEqual({ provider: PROVIDER, status: 'connected' })
 
     await expect(controller.cancel()).resolves.toEqual({ provider: PROVIDER, status: 'connected' })
+    await expect(store.read(PROVIDER)).resolves.toMatchObject({ type: 'oauth' })
+  })
+
+  it('does not apply a stale request refresh failure to a newer connection generation', async () => {
+    const credentials = new SharedCredentials(new Context())
+    const store = new OpenAICodexCredentialStore(() => credentials)
+    await store.modify(PROVIDER, async () => oauth())
+    const now = { value: 0 }
+    const first = controllerOf(credentials, new DeviceCodeModels(), [], now)
+    await expect(first.initialize()).resolves.toEqual({ provider: PROVIDER, status: 'connected' })
+    const staleGeneration = await first.captureRequestGeneration()
+
+    await expect(first.disconnect()).resolves.toEqual({ provider: PROVIDER, status: 'missing' })
+    const secondModels = new DeviceCodeModels()
+    const second = controllerOf(credentials, secondModels, [], now)
+    await expect(second.start()).resolves.toMatchObject({ kind: 'device-code' })
+    secondModels.completion.resolve(oauth())
+    await waitForStatus(second, 'connected')
+
+    await first.markReconnectRequired(staleGeneration)
+
+    await expect(first.status()).resolves.toEqual({ provider: PROVIDER, status: 'connected' })
+    await expect(second.status()).resolves.toEqual({ provider: PROVIDER, status: 'connected' })
+    await expect(store.read(PROVIDER)).resolves.toMatchObject({ type: 'oauth' })
+  })
+
+  it('does not let a stale pi-ai logout delete a newer connection generation', async () => {
+    const credentials = new SharedCredentials(new Context())
+    const store = new OpenAICodexCredentialStore(() => credentials)
+    await store.modify(PROVIDER, async () => oauth())
+    const now = { value: 0 }
+    const firstModels = new DeviceCodeModels()
+    const first = controllerOf(credentials, firstModels, [], now)
+    await expect(first.initialize()).resolves.toEqual({ provider: PROVIDER, status: 'connected' })
+    const logout = firstModels.pauseLogout()
+    const disconnecting = first.disconnect()
+    await logout.reached
+
+    const secondModels = new DeviceCodeModels()
+    const second = controllerOf(credentials, secondModels, [], now)
+    await expect(second.start()).resolves.toMatchObject({ kind: 'device-code' })
+    secondModels.completion.resolve(oauth())
+    await waitForStatus(second, 'connected')
+
+    logout.release()
+    await expect(disconnecting).resolves.toEqual({ provider: PROVIDER, status: 'connected' })
+    await expect(second.status()).resolves.toEqual({ provider: PROVIDER, status: 'connected' })
     await expect(store.read(PROVIDER)).resolves.toMatchObject({ type: 'oauth' })
   })
 
@@ -637,7 +699,7 @@ describe('OpenAICodexOAuthController', () => {
     await controller.initialize()
     await expect(controller.status()).resolves.toEqual({ provider: PROVIDER, status: 'connected' })
 
-    await controller.markReconnectRequired()
+    await controller.markReconnectRequired(await controller.captureRequestGeneration())
     await expect(controller.status()).resolves.toEqual({ provider: PROVIDER, status: 'reconnect-required' })
     await expect(controller.disconnect()).resolves.toEqual({ provider: PROVIDER, status: 'missing' })
     await expect(store.read(PROVIDER)).resolves.toBeUndefined()

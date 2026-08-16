@@ -263,6 +263,24 @@ export class OpenAICodexCredentialStore implements CredentialStore {
     })
   }
 
+  /**
+   * Return the pi-ai store used only to log out one already-revoked generation.
+   * Its delete is a no-op after a newer generation wins, so a stale logout
+   * cannot erase a later successful connection.
+   * @param generation - generation whose credential pi-ai is allowed to remove.
+   * @returns a generation-scoped credential store for `Models.logout()`.
+   */
+  logoutStoreForGeneration(generation: number): CredentialStore {
+    const loginStore = this.loginStore(generation)
+    return {
+      ...loginStore,
+      delete: async (providerId) => {
+        if (providerId !== PROVIDER) throw storageFailure()
+        await this.revokeGeneration(generation, true)
+      },
+    }
+  }
+
   /** Create the pi-ai store used only by one currently authorized login. */
   private loginStore(generation: number): CredentialStore {
     const read = async (providerId: string): Promise<Credential | undefined> => {

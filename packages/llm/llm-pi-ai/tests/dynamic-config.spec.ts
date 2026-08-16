@@ -37,14 +37,14 @@ async function home(): Promise<string> {
 }
 
 /** Real dynamic composition mirroring the deepseek twin's harness. */
-async function boot(dir: string, config: LlmPiAi.Config): Promise<Context> {
+async function boot(dir: string, config: LlmPiAi.Config, watch = false): Promise<Context> {
   const ctx = new Context()
   cleanups.push(async () => {
     await ctx.fiber.dispose()
   })
   await ctx.plugin(LlmRuntime)
   await ctx.plugin(FileSettingsProvider, { path: join(dir, 'settings.yaml'), watch: false })
-  await ctx.plugin(LocalCredentialProvider, { path: join(dir, '.credentials.yaml'), watch: false })
+  await ctx.plugin(LocalCredentialProvider, { path: join(dir, '.credentials.yaml'), watch, debounceMs: 10 })
   await ctx.plugin(LlmPiAi, config)
   return ctx
 }
@@ -203,6 +203,29 @@ describe('request-level dynamic profiles', () => {
     await expect(controller.status()).resolves.toEqual({ provider: 'openai-codex', status: 'connected' })
     expect(ctx.llm.listProviders()).toContainEqual({ id: 'openai-codex', name: 'Codex subscription' })
     await expect(ctx.llm.listModels('openai-codex')).resolves.not.toHaveLength(0)
+  })
+
+  it('activates the OAuth-only route after a peer commits a private credential', async () => {
+    const dir = await home()
+    const first = await boot(dir, { providers: { 'openai-codex': {} } })
+    const second = await boot(dir, { providers: { 'openai-codex': {} } }, true)
+    const updates: unknown[] = []
+    second.on('llm/oauth-connection-updated', (connection) => { updates.push(connection) })
+
+    expect(second.llm.listProviders().map(provider => provider.id)).not.toContain('openai-codex')
+    const store = new LlmPiAi.OpenAICodexCredentialStore(() => first.credentials)
+    await store.modify('openai-codex', async () => ({
+      type: 'oauth',
+      access: 'private-access-value',
+      refresh: 'private-refresh-value',
+      expires: Date.now() + 60_000,
+    }))
+
+    await vi.waitFor(() => {
+      expect(second.llm.listProviders().map(provider => provider.id)).toContain('openai-codex')
+      expect(updates).toContainEqual({ provider: 'openai-codex', status: 'connected' })
+    })
+    expect(JSON.stringify(updates)).not.toMatch(/private-(?:access|refresh)-value/)
   })
 
   it('refuses a settings write this adapter could not serve, leaving its routes alone', async () => {

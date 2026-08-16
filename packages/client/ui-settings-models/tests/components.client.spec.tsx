@@ -259,7 +259,6 @@ function scriptedOAuthFace(options: {
       settingsPath: ['providers', 'openai-codex'],
       active: status === 'connected',
       auth: { kind: 'oauth' as const },
-      connection: { provider: 'openai-codex', status },
     }],
   })))
   const mutate = vi.fn((request: { ops: { op: 'set' | 'unset' }[] }) => {
@@ -419,6 +418,24 @@ describe('OAuth provider card', () => {
     expect(screen.getByText('Connected')).toBeTruthy()
   })
 
+  it('polls loopback status while connecting so a device-code expiry cannot leave the card stale', async () => {
+    const mounted = await mountOAuth({ status: 'missing', configured: false })
+    fireEvent.click(screen.getByRole('button', { name: 'Connect ChatGPT' }))
+    expect(await screen.findByText('ABCD-EFGH')).toBeTruthy()
+    const statusCalls = mounted.face.llm.oauthStatus.mock.calls.length
+
+    // This stands in for an expiry or cancellation owned by another Harness
+    // process. No forwarded OAuth event exists for the browser to consume.
+    mounted.setStatus('missing')
+
+    await waitFor(() => {
+      expect(screen.queryByText('ABCD-EFGH')).toBeNull()
+      expect(screen.queryByText('Connecting')).toBeNull()
+      expect(screen.getByRole('button', { name: 'Connect ChatGPT' })).toBeTruthy()
+      expect(mounted.face.llm.oauthStatus.mock.calls.length).toBeGreaterThan(statusCalls)
+    }, { timeout: 3_000 })
+  })
+
   it('lets a terminal redacted snapshot invalidate a late device-code response', async () => {
     const mounted = await mountOAuth({ status: 'missing', configured: false, deferStart: true })
     fireEvent.click(screen.getByRole('button', { name: 'Connect ChatGPT' }))
@@ -494,7 +511,7 @@ describe('OAuth provider card', () => {
     expect(mounted.mutate).toHaveBeenCalledOnce()
     expect(mounted.controller.store.getSnapshot().rows[0]).toMatchObject({
       configured: true,
-      entry: { connection: { status: 'missing' } },
+      connection: { status: 'missing' },
     })
     expect(screen.getByRole('button', { name: 'Connect ChatGPT' })).toBeTruthy()
   })

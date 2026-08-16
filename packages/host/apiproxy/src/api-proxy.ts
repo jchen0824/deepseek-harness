@@ -3466,34 +3466,19 @@ export function createApiProxy(ctx: Context, defaults: ApiProxyDefaults): ApiPro
     },
 
     llm: {
-      async providers(request) {
+      providers(request) {
         const registered = ctx.llm.listProviders()
         const active = new Set(registered.map(provider => provider.id))
         const directory = ctx.llm.listConfigurableProviders()
         const declared = new Set(directory.map(entry => entry.provider))
-        const views: ConfigurableProviderView[] = await Promise.all(directory.map(async (entry) => {
-          let connection: OAuthConnectionView | undefined
-          const controller = entry.auth.kind === 'oauth'
-            ? ctx.llm.getOAuthController(entry.provider)
-            : undefined
-          if (controller !== undefined) {
-            try {
-              connection = oauthConnectionView(await controller.status())
-            } catch {
-              // A provider status failure leaves the optional snapshot absent;
-              // direct lifecycle actions return stable retry guidance.
-            }
-          }
-          return {
-            provider: entry.provider,
-            displayName: entry.displayName,
-            settingsNs: entry.settingsNs,
-            settingsPath: [...entry.settingsPath],
-            active: active.has(entry.provider),
-            auth: { ...entry.auth },
-            ...connection === undefined ? {} : { connection },
-            ...entry.declared === undefined ? {} : { declared: entry.declared },
-          }
+        const views: ConfigurableProviderView[] = directory.map(entry => ({
+          provider: entry.provider,
+          displayName: entry.displayName,
+          settingsNs: entry.settingsNs,
+          settingsPath: [...entry.settingsPath],
+          active: active.has(entry.provider),
+          auth: { ...entry.auth },
+          ...entry.declared === undefined ? {} : { declared: entry.declared },
         }))
         // Routes registered without a directory declaration still appear —
         // they exist and serve models — just with no settings address. No
@@ -3509,7 +3494,7 @@ export function createApiProxy(ctx: Context, defaults: ApiProxyDefaults): ApiPro
             auth: { kind: 'native' },
           })
         }
-        return ok(request, { providers: views })
+        return Promise.resolve(ok(request, { providers: views }))
       },
 
       async models(request) {

@@ -57,7 +57,8 @@ export class MemoryCredentials extends CredentialProvider {
       if (before !== mutation.value) {
         if (mutation.value === undefined) this.store.delete(ref)
         else this.store.set(ref, mutation.value)
-        if (mutation.visibility === 'public') this.ctx.emit('credentials/updated', ref)
+        if (mutation.visibility === 'public') this.notifyUpdated(ref)
+        else this.notifyPrivateUpdated()
       }
       return mutation.result
     })

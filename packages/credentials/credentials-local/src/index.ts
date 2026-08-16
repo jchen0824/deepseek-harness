@@ -445,6 +445,7 @@ export class LocalCredentialProvider extends CredentialProvider {
         const changed = await this.commitMutation(ref, mutation.value, mutation.visibility)
         if (!changed) return mutation.result
         if (mutation.visibility === 'public') this.notifyUpdated(ref)
+        else this.notifyPrivateUpdated()
         return mutation.result
       })
     })
@@ -471,7 +472,7 @@ export class LocalCredentialProvider extends CredentialProvider {
     const privateRefsChanged = nextPrivateRefs.size !== previousPrivateRefs.size
     if (this.values.get(ref) === value) {
       if (privateRefsChanged) await writePrivateReferences(this.privateReferencesFilename, nextPrivateRefs)
-      return false
+      return privateRefsChanged
     }
     const nextText = renderDocument(this.text, ref, value)
     // Mark the visibility before changing the document: a peer that sees the
@@ -575,9 +576,12 @@ export class LocalCredentialProvider extends CredentialProvider {
     const changed = this.changedRefs(this.values, next)
     this.text = text
     this.values = next
+    let privateChanged = false
     for (const ref of changed) {
-      if (!privateRefs.has(ref)) this.notifyUpdated(ref)
+      if (privateRefs.has(ref)) privateChanged = true
+      else this.notifyUpdated(ref)
     }
+    if (privateChanged) this.notifyPrivateUpdated()
   }
   /* jscpd:ignore-end */
 

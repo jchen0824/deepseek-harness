@@ -54,7 +54,9 @@ describe('the credentials seam through the memory provider', () => {
   it('stores a private mutation without publishing its value change', async () => {
     const ctx = await boot()
     const events: CredentialRef[] = []
+    let privateUpdates = 0
     ctx.on('credentials/updated', ref => void events.push(ref))
+    ctx.on('credentials/private-updated', () => { privateUpdates += 1 })
 
     const result = await ctx.credentials.modify(REF, async current => ({
       value: current === undefined ? 'rotated-secret' : undefined,
@@ -64,6 +66,7 @@ describe('the credentials seam through the memory provider', () => {
 
     expect(result).toBeUndefined()
     expect(events).toEqual([])
+    expect(privateUpdates).toBe(1)
     expect(await ctx.credentials.resolve(REF)).toEqual({ value: 'rotated-secret', source: 'memory' })
   })
 

@@ -19,7 +19,7 @@
 - 不得让访问令牌、刷新令牌、授权载荷、账户身份、套餐数据、私有凭据引用名或原始提供商失败信息进入设置、浏览器 RPC、会话事件、诊断、日志或快照。
 - 在固定私有引用 `DSH_OPENAI_CODEX_OAUTH` 和 `DSH_OPENAI_CODEX_LOGIN_LEASE` 下存储 OAuth 记录和登录租约；二者均不可配置也不可显示。
 - 在每次异步 OAuth 记录或租约变更期间持有本地凭据提供商的跨进程锁；不得加入面向浏览器的通用凭据变更 RPC。
-- 私有凭据变更不得发出 `credentials/updated`，因为该事件目前会将其引用名送达浏览器客户端。OAuth 状态变更改用经过脱敏的 `llm/oauth-connection-updated` 事件。
+- 私有凭据变更不得发出 `credentials/updated`，因为该事件会将其引用名送达浏览器客户端。它只发出不带 payload、仅供 Host 使用的 `credentials/private-updated`，OAuth 状态则不出现在公开目录或转发给浏览器的事件中。
 - OAuth 目录行在 dormant 时仍保持可见；模型路由仅在 OAuth 配置已连接，或已有配置显式命名 `apiKeyEnv` 后才变为 active。
 - `openai-codex` 可以使用已经存在的、显式配置 `apiKeyEnv` 的旧配置；但原生 OAuth 配置在 OAuth 刷新失败或被撤销后，绝不能回退到 API key、环境变量或另一提供商。
 - 无头配置不能启动交互式登录。它只能使用存储在同一 Harness home 中的成功连接。
@@ -35,13 +35,13 @@
 ## 文件结构
 
 - 修改 `packages/credentials/credentials/src/index.ts` 和 `packages/credentials/credentials/src/types.ts`，定义具备原子性和可见性意识的凭据变更服务操作。
-- 修改 `packages/credentials/credentials-local/src/index.ts`，使该操作在现有队列和跨进程文件锁下运行，且不发布私有引用事件。
+- 修改 `packages/credentials/credentials-local/src/index.ts`，使该操作在现有队列和跨进程文件锁下运行，同时仅为私有变更发布不带 payload、仅供 Host 使用的失效通知。
 - 修改 `packages/llm/llm/src/{types.ts,index.ts,error.ts}`，声明提供商认证元数据、OAuth 连接类型、控制器注册表、经过脱敏的 LLM 事件和 reconnect-required 错误代码。
 - 创建 `packages/llm/llm-pi-ai/src/{oauth-credential-store}.ts`，以私有 OAuth 记录实现 pi-ai 的 `CredentialStore`。
 - 创建 `packages/llm/llm-pi-ai/src/{openai-codex-oauth}.ts`，负责设备代码交互、会过期的登录租约、取消、状态和脱敏。
 - 修改 `packages/llm/llm-pi-ai/src/{adapter,index,catalog,provider,config}.ts`，为每个 pi-ai 模型快照提供共享存储、注册控制器、公布 `openai-codex`，并规范化 OAuth 请求失败。
 - 修改 `packages/host/apiproxy/src/api/{llm.ts,llm.schema.ts,index.ts,rpc-map.ts}` 和 `packages/host/apiproxy/src/{api-proxy.ts,fetch/client.ts,fetch/handler.ts}`，仅承载类型化的脱敏 OAuth 操作和连接视图。
-- 修改 `packages/api/remotes/src/remote-events.ts` 及其客户端导出，使 Models UI 能收到经过脱敏的连接更新，但绝不会收到私有凭据更新。
+- 修改 `packages/api/remotes/src/remote-events.ts` 及其客户端导出，使私有凭据失效通知与 OAuth 连接状态均不会到达浏览器客户端；Models 在公开拓扑更新后读取本地生命周期状态。
 - 修改 `packages/client/ui-settings-models/src/client/{store.ts,ModelsSection.tsx,index.ts,locales.ts}` 并创建 `OAuthProviderCard.tsx`，实现设备代码卡片和认证感知的提供商就绪状态。
 - 在现有测试套件旁添加聚焦单元、宿主载体、客户端组件、加载器组合和无密钥 Web 测试；仅向快照添加确定性 fixture 记录。
 - 更新配对的包、子系统和用户文档，以及非简单功能所需的 Agent Note。
@@ -361,7 +361,7 @@
 **接口：**
 - 使用 LLM 能力层中的 `LlmOAuthController`、`LlmOAuthConnection` 和 `LlmOAuthStart`。
 - 产出 `ConfigurableProviderView.auth`、`ConfigurableProviderView.connection`、`llm.oauthStart`、`llm.oauthStatus`、`llm.oauthCancel` 和 `llm.oauthDisconnect`。
-- 产出仅包含脱敏连接视图的转发 `llm/oauth-connection-updated` 事件。
+- 让 `llm/oauth-connection-updated` 保持 Host 内部事件；仅直接的仅限回环地址生命周期答复携带脱敏连接视图。
 
 - [ ] **步骤 1：编写 schema 和载体测试，断言精确公开字段。**
 
@@ -402,7 +402,7 @@
   }
   ```
 
-  将 `auth` 和可选 `connection` 加入 `ConfigurableProviderView`。将 `verificationUri` 验证为 URL，将代码字符串验证为非空且有界文本，并将间隔和过期时间验证为正整数。仅在直接 start 响应中保留设备代码字段；不得将其加入提供商快照或远程事件。
+  将 `auth` 加入 `ConfigurableProviderView`；把连接状态保留在直接的仅限回环地址生命周期答复中。将 `verificationUri` 验证为 URL，将代码字符串验证为非空且有界文本，并将间隔和过期时间验证为正整数。仅在直接 start 响应中保留设备代码字段；不得将其加入提供商快照或远程事件。
 
 - [ ] **步骤 4：分派四个宿主方法并净化失败。**
 
@@ -413,7 +413,7 @@
   llm.oauthDisconnect({ provider })
   ```
 
-  从 `ctx.llm` 解析控制器，拒绝未知提供商和非 OAuth 路由，将包错误映射到稳定且面向操作的消息，并使用控制器返回的连接作为唯一状态响应。转发 `llm/oauth-connection-updated`；保持 `credentials/updated` 行为不变，绝不在代理中按私有名称作特殊处理。
+  从 `ctx.llm` 解析控制器，拒绝未知提供商和非 OAuth 路由，将包错误映射到稳定且面向操作的消息，并使用控制器返回的连接作为唯一状态响应。让 `llm/oauth-connection-updated` 保持 Host 内部事件，绝不在代理中按私有名称作特殊处理。
 
 - [ ] **步骤 5：扩展 fetch handler、生成的 API map、假客户端和 fixture 传输。**
 
@@ -465,7 +465,7 @@
   expect(screen.queryByLabelText(/API key/i)).toBeNull()
   ```
 
-  覆盖 Connect、Connecting、Connected、Reconnect、Cancel、Disconnect、Remove provider、成功 disconnect 后失败的 remove、脱敏事件重载，以及旧显式 `apiKeyEnv` 就绪状态但不渲染 OAuth API-key 输入。
+  覆盖 Connect、Connecting、Connected、Reconnect、Cancel、Disconnect、Remove provider、成功 disconnect 后失败的 remove、拓扑更新后的本地状态重载，以及旧显式 `apiKeyEnv` 就绪状态但不渲染 OAuth API-key 输入。
 
 - [ ] **步骤 2：运行 Models UI 测试并确认尚无 OAuth 编辑器。**
 
@@ -479,15 +479,15 @@
   export function providerUsable(row: ProviderRow): boolean {
     if (!row.entry.active) return false
     if (row.entry.auth.kind === 'oauth') {
-      return row.entry.connection?.status === 'connected'
+      return row.connection?.status === 'connected'
         || (row.apiKeyEnv !== undefined && row.credential?.configured === true)
     }
-    if (row.entry.auth.kind === 'api-key') return row.credential?.configured === true
+    if (row.entry.auth.kind === 'api-key') return row.apiKeyEnv === undefined || row.credential?.configured === true
     return true
   }
   ```
 
-  仅为命名的配置 API-key 引用请求 `credentials.describe`。从 `llm.providers` 复制 `auth` 和 `connection`；绝不从凭据 badge 或 OAuth 记录引用推导 OAuth 状态。
+  仅为命名的配置 API-key 引用请求 `credentials.describe`。从 `llm.providers` 复制 `auth`，并从仅限回环地址的 `llm.oauthStatus` 关联 `connection`；绝不从凭据 badge 或 OAuth 记录引用推导 OAuth 状态。
 
 - [ ] **步骤 4：加入包含安全浏览器操作和复制功能的专用卡片。**
 
@@ -500,7 +500,7 @@
   </button>
   ```
 
-  从类型化连接视图渲染 `Connect ChatGPT`、`Connecting`、`Connected`、`Reconnect`、`Cancel` 和 `Disconnect`。在直接 `oauthStart` 响应后仅将 URL 和代码保留在本地组件状态，在取消、disconnect、卸载或终态事件后清除它们，并使用普通安全链接而不是加入宿主 URL 打开 RPC。
+  从本地关联的类型化连接视图渲染 `Connect ChatGPT`、`Connecting`、`Connected`、`Reconnect`、`Cancel` 和 `Disconnect`。在直接 `oauthStart` 响应后仅将 URL 和代码保留在本地组件状态，在取消、disconnect、卸载或终态状态刷新后清除它们，并使用普通安全链接而不是加入宿主 URL 打开 RPC。
 
 - [ ] **步骤 5：接入配置创建、重新连接、断开、移除和事件失效。**
 
@@ -511,7 +511,7 @@
   await removeProviderProfile('openai-codex')
   ```
 
-  在 start 前创建或保留空配置。移除时，先 await disconnect，再执行现有配置移除；第二步失败时显示仍已配置但已断开的结果。除当前 LLM/设置失效器外还订阅 `llm/oauth-connection-updated`，并保持普通 `ProviderEditor` API-key 行为不变。
+  在 start 前创建或保留空配置。移除时，先 await disconnect，再执行现有配置移除；第二步失败时显示仍已配置但已断开的结果。除当前设置失效器外还订阅公开的 `llm/adapters-updated`，再本地读取 OAuth 状态，并保持普通 `ProviderEditor` API-key 行为不变。
 
 - [ ] **步骤 6：运行聚焦 Models UI 测试。**
 

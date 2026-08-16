@@ -248,7 +248,7 @@ function forwardedSettings(ns: string): HostFrame {
     type: 'host/remote-event',
     event: 'settings/document-updated',
     // The revision is the Host's own counter, so the matcher is the assertion.
-    args: [ns, expect.any(Number)], // oxlint-disable-line typescript/no-unsafe-assignment
+    args: [ns, expect.any(Number) as number],
   }
 }
 
@@ -701,7 +701,7 @@ describe('llm domain', () => {
     ])
   })
 
-  it('projects OAuth snapshots and updates without exposing private credential activity', async () => {
+  it('keeps OAuth state out of the public provider catalog', async () => {
     const ctx = await harness({ configurableProviders: false })
     ctx.llm.registerConfigurableProviders([{
       provider: 'openai-codex', displayName: 'OpenAI Codex', settingsNs: 'llm-pi-ai',
@@ -719,25 +719,10 @@ describe('llm domain', () => {
     expect(expectOk(await api.llm.providers(request({})))).toEqual({ providers: [{
       provider: 'openai-codex', displayName: 'OpenAI Codex', settingsNs: 'llm-pi-ai',
       settingsPath: ['providers', 'openai-codex'], auth: { kind: 'oauth' }, active: false,
-      connection: { provider: 'openai-codex', status: 'connecting' },
     }] })
-
-    const frames = await collectHost(api, ['host/remote-event'], 1, async () => {
-      await ctx.credentials.modify(credentialRef('OPENAI_CODEX_OAUTH'), () => Promise.resolve({
-        value: JSON.stringify({ access: 'private-access', refresh: 'private-refresh' }),
-        result: undefined,
-        visibility: 'private',
-      }))
-      ctx.llm.emitOAuthConnectionUpdated({
-        provider: 'openai-codex', status: 'connected', accountId: 'acct-private', error: 'provider error',
-      } as never)
+    expect(expectOk(await api.llm.oauthStatus(request({ provider: 'openai-codex' })))).toEqual({
+      connection: { provider: 'openai-codex', status: 'connecting' },
     })
-    expect(frames).toEqual([{
-      type: 'host/remote-event',
-      event: 'llm/oauth-connection-updated',
-      args: [{ provider: 'openai-codex', status: 'connected' }],
-    }])
-    expect(JSON.stringify(frames)).not.toMatch(/OPENAI_CODEX_OAUTH|access|refresh|account|provider error/)
   })
 
   it('serves the host-scoped catalog with per-provider failures contained', async () => {

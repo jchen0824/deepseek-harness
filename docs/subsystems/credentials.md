@@ -49,11 +49,11 @@ interface CredentialInfo {
 
 `modify(ref, mutate)` reads and changes one provider-managed stored value as a single operation. The callback receives the stored value only, never an inherited environment value, and the local provider holds its cross-process file lock across the awaited callback and owner-only atomic commit. This is the serialization point for records such as OAuth refresh state and a login lease shared by several Harness processes.
 
-Each mutation declares `public` or `private` visibility. A changed public value emits `credentials/updated` after commit. A private mutation updates durable private-reference metadata under the same lock and emits no credential event from the writer, another process, or a later file-watcher reconciliation. Private references and `modify` remain Host-only; browsers receive the capability-specific redacted event instead.
+Each mutation declares `public` or `private` visibility. A changed public value emits `credentials/updated` after commit. A private mutation updates durable private-reference metadata under the same lock and emits one payload-free host-only `credentials/private-updated` invalidation from the writer or a later file-watcher reconciliation; it never names the reference or reaches browser clients. Private references and `modify` remain Host-only; browsers receive the capability-specific redacted event instead.
 
 ## Change commits
 
-`credentials/updated (ref)` fires after a committed change to a provider-managed source — a `set`, an `unset`, or an external edit observed in storage. Ambient process-environment changes are not observable and never emit. Consumers do not need the event (they re-resolve per operation); it exists for configuration surfaces refreshing a "configured" badge.
+`credentials/updated (ref)` fires after a committed public change to a provider-managed source — a `set`, an `unset`, or an external edit observed in storage. Ambient process-environment changes are not observable and never emit. Consumers do not need the event (they re-resolve per operation); it exists for configuration surfaces refreshing a "configured" badge. Private consumers instead react to the payload-free `credentials/private-updated` invalidation.
 
 <!-- BEGIN GENERATED cordis-surface (gen-cordis-catalog.ts) — do not edit between markers -->
 
@@ -124,6 +124,25 @@ Source: [`packages/credentials/credentials/src/index.ts:60`](../../packages/cred
 <a id="credentials-events"></a>
 
 ### `credentials/*` events
+
+<a id="credentialsprivate-updated--emit"></a>
+
+#### `credentials/private-updated` — emit
+
+A privately classified provider-managed credential changed. The event carries no reference or value, so host-only consumers can refresh derived private state without exposing the changed credential through the browser event channel.
+
+```ts cordis-catalog
+/**
+ * A privately classified provider-managed credential changed. The event
+ * carries no reference or value, so host-only consumers can refresh
+ * derived private state without exposing the changed credential through
+ * the browser event channel.
+ * @mode emit
+ */
+'credentials/private-updated'(): void
+```
+
+Source: [`packages/credentials/credentials/src/types.ts:56`](../../packages/credentials/credentials/src/types.ts)
 
 <a id="credentialsupdated--emit"></a>
 

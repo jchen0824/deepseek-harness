@@ -26,7 +26,7 @@ export interface CredentialMutation<T> {
   value: string | undefined
   /** Caller-defined result returned after a successful commit. */
   result: T
-  /** Whether a changed stored value emits `credentials/updated`. */
+  /** Whether a changed stored value emits the public or host-private invalidation event. */
   visibility: CredentialMutationVisibility
 }
 
@@ -45,5 +45,14 @@ declare module '@deepseek-ai/cordis' {
      * @mode emit
      */
     'credentials/updated'(ref: CredentialRef): void
+
+    /**
+     * A privately classified provider-managed credential changed. The event
+     * carries no reference or value, so host-only consumers can refresh
+     * derived private state without exposing the changed credential through
+     * the browser event channel.
+     * @mode emit
+     */
+    'credentials/private-updated'(): void
   }
 }

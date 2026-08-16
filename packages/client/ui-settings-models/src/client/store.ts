@@ -7,7 +7,7 @@
  */
 
 import type {
-  ConfigurableProviderView, CredentialView, IApiClient, SettingsNamespaceView,
+  ConfigurableProviderView, CredentialView, IApiClient, OAuthConnectionView, SettingsNamespaceView,
 } from '@deepseek-ai/dsh-api-remotes/client'
 import type { SnapshotStore } from '@deepseek-ai/dsh-client-runtime/client'
 import { createSnapshotStore } from '@deepseek-ai/dsh-client-runtime/client'
@@ -31,6 +31,8 @@ export interface ProviderRow {
   apiKeyEnv: string | undefined
   /** Credential state for {@link apiKeyEnv}, once described. */
   credential: CredentialView | undefined
+  /** Loopback-only redacted OAuth state, when this route uses OAuth. */
+  connection?: OAuthConnectionView
 }
 
 /** Page snapshot. */
@@ -112,7 +114,8 @@ export class ModelsSettingsStore {
 
   /**
    * Refresh the whole page snapshot: directory and namespaces in parallel,
-   * then one batched credential describe over every referenced ref. A
+   * then one batched credential describe over every referenced ref and local
+   * OAuth status reads. A
    * failure keeps the last good rows and surfaces the error.
    * @returns nothing; the snapshot carries the outcome.
    */
@@ -158,6 +161,16 @@ export class ModelsSettingsStore {
       }
     })
     const refs = [...new Set(rows.flatMap(row => row.apiKeyEnv === undefined ? [] : [row.apiKeyEnv]))]
+    const connections = new Map<string, OAuthConnectionView>()
+    await Promise.all(rows.filter(row => row.entry.auth.kind === 'oauth').map(async (row) => {
+      try {
+        const response = await this.api.llm.oauthStatus({ provider: row.entry.provider })
+        if (response.result.ok) connections.set(row.entry.provider, response.result.value.connection)
+      } catch {
+        // OAuth status is privileged enrichment. The directory remains useful
+        // when a remote or unavailable caller cannot read it.
+      }
+    }))
     let credentials: Record<string, CredentialView> = {}
     let credentialError: string | null = null
     if (refs.length > 0) {
@@ -178,12 +191,16 @@ export class ModelsSettingsStore {
       s.error = null
       s.credentialError = credentialError
       s.writable = writable
-      s.rows = rows.map(row => ({
-        ...row,
-        ...row.apiKeyEnv !== undefined && credentials[row.apiKeyEnv] !== undefined
-          ? { credential: credentials[row.apiKeyEnv] }
-          : {},
-      }))
+      s.rows = rows.map((row) => {
+        const connection = connections.get(row.entry.provider)
+        return {
+          ...row,
+          ...(row.apiKeyEnv !== undefined && credentials[row.apiKeyEnv] !== undefined
+            ? { credential: credentials[row.apiKeyEnv] }
+            : {}),
+          ...(connection === undefined ? {} : { connection }),
+        }
+      })
       s.namespaces = namespaces
     })
   }
@@ -199,10 +216,12 @@ export class ModelsSettingsStore {
 export function providerUsable(row: ProviderRow): boolean {
   if (!row.entry.active) return false
   if (row.entry.auth.kind === 'oauth') {
-    return row.entry.connection?.status === 'connected'
+    return row.connection?.status === 'connected'
       || (row.apiKeyEnv !== undefined && row.credential?.configured === true)
   }
-  if (row.entry.auth.kind === 'api-key') return row.credential?.configured === true
+  if (row.entry.auth.kind === 'api-key') {
+    return row.apiKeyEnv === undefined || row.credential?.configured === true
+  }
   return true
 }
 

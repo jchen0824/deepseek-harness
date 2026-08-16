@@ -19,7 +19,7 @@ English | [中文](2026-08-16-openai-codex-oauth-implementation.zh.md)
 - Keep access tokens, refresh tokens, authorization payloads, account identity, plan data, private credential-reference names, and raw provider failures out of settings, browser RPC, session events, diagnostics, logs, and snapshots.
 - Store the OAuth record and login lease under the fixed private references `DSH_OPENAI_CODEX_OAUTH` and `DSH_OPENAI_CODEX_LOGIN_LEASE`; neither is configurable or displayed.
 - Hold the local credential provider's cross-process lock across each asynchronous OAuth record or lease mutation; do not add a browser-facing generic credential-mutation RPC.
-- A private credential mutation must not emit `credentials/updated`, because that event currently reaches browser clients with its reference name. OAuth state changes use the redacted `llm/oauth-connection-updated` event instead.
+- A private credential mutation must not emit `credentials/updated`, because that event reaches browser clients with its reference name. It emits only payload-free host-private `credentials/private-updated`, and OAuth state remains absent from the public directory and forwarded browser events.
 - The OAuth directory row remains visible while dormant; the model route becomes active only after an OAuth profile is connected or an existing profile explicitly names `apiKeyEnv`.
 - `openai-codex` may use legacy explicitly configured `apiKeyEnv` profiles that already exist, but a native OAuth profile never falls back to an API key, environment value, or another provider after OAuth refresh fails or is revoked.
 - A headless profile cannot start login. It can only consume a successful connection stored in the same Harness home.
@@ -35,13 +35,13 @@ The credential, LLM, host, and UI changes are one dependency chain rather than i
 ## File Structure
 
 - Modify `packages/credentials/credentials/src/index.ts` and `packages/credentials/credentials/src/types.ts` to define an atomic, visibility-aware credential mutation service operation.
-- Modify `packages/credentials/credentials-local/src/index.ts` to run that operation under its existing queue and cross-process file lock without publishing private-reference events.
+- Modify `packages/credentials/credentials-local/src/index.ts` to run that operation under its existing queue and cross-process file lock while publishing only payload-free host-private invalidation for private changes.
 - Modify `packages/llm/llm/src/{types.ts,index.ts,error.ts}` to declare provider authentication metadata, OAuth connection types, a controller registry, the redacted LLM event, and the reconnect-required error code.
 - Create `packages/llm/llm-pi-ai/src/{oauth-credential-store}.ts` to implement pi-ai's `CredentialStore` over the private OAuth record.
 - Create `packages/llm/llm-pi-ai/src/{openai-codex-oauth}.ts` to own the device-code interaction, expiring login lease, cancellation, status, and redaction.
 - Modify `packages/llm/llm-pi-ai/src/{adapter,index,catalog,provider,config}.ts` to give every pi-ai model snapshot the shared store, register the controller, advertise `openai-codex`, and normalize OAuth request failures.
 - Modify `packages/host/apiproxy/src/api/{llm.ts,llm.schema.ts,index.ts,rpc-map.ts}` and `packages/host/apiproxy/src/{api-proxy.ts,fetch/client.ts,fetch/handler.ts}` to carry only typed redacted OAuth operations and connection views.
-- Modify `packages/api/remotes/src/remote-events.ts` and its client exports so the Models UI can receive the redacted connection update but never a private credential update.
+- Modify `packages/api/remotes/src/remote-events.ts` and its client exports so neither private credential invalidation nor OAuth connection state reaches browser clients; Models reads its local lifecycle status after a public topology update.
 - Modify `packages/client/ui-settings-models/src/client/{store.ts,ModelsSection.tsx,index.ts,locales.ts}` and create `OAuthProviderCard.tsx` for the device-code card and auth-aware provider readiness.
 - Add focused unit, host-carrier, client-component, loader-composition, and keyless web tests beside the existing test suites; add only deterministic fixture records to snapshots.
 - Update the paired package, subsystem, and user documentation plus the Agent Note required for a non-trivial feature.
@@ -361,7 +361,7 @@ Future filenames use `{literal-name}` only to distinguish a not-yet-created targ
 **Interfaces:**
 - Consumes `LlmOAuthController`, `LlmOAuthConnection`, and `LlmOAuthStart` from the LLM seam.
 - Produces `ConfigurableProviderView.auth`, `ConfigurableProviderView.connection`, `llm.oauthStart`, `llm.oauthStatus`, `llm.oauthCancel`, and `llm.oauthDisconnect`.
-- Produces a forwarded `llm/oauth-connection-updated` event with only the redacted connection view.
+- Keeps `llm/oauth-connection-updated` Host-internal; only direct loopback lifecycle replies carry the redacted connection view.
 
 - [ ] **Step 1: Write schema and carrier tests that assert the exact public fields.**
 
@@ -402,7 +402,7 @@ Future filenames use `{literal-name}` only to distinguish a not-yet-created targ
   }
   ```
 
-  Add `auth` and optional `connection` to `ConfigurableProviderView`. Validate `verificationUri` as a URL, code strings as non-empty bounded text, and interval/expiry as positive integers. Retain device-code fields only in the direct start response; do not add them to provider snapshots or remote events.
+  Add `auth` to `ConfigurableProviderView`; keep connection state in direct loopback lifecycle replies. Validate `verificationUri` as a URL, code strings as non-empty bounded text, and interval/expiry as positive integers. Retain device-code fields only in the direct start response; do not add them to provider snapshots or remote events.
 
 - [ ] **Step 4: Dispatch the four host methods and sanitize failures.**
 
@@ -413,7 +413,7 @@ Future filenames use `{literal-name}` only to distinguish a not-yet-created targ
   llm.oauthDisconnect({ provider })
   ```
 
-  Resolve the controller from `ctx.llm`, refuse unknown providers and non-OAuth routes, map package errors to stable action-oriented messages, and use the controller's returned connection as the sole state response. Forward `llm/oauth-connection-updated`; keep `credentials/updated` behavior unchanged and never special-case private names in the proxy.
+  Resolve the controller from `ctx.llm`, refuse unknown providers and non-OAuth routes, map package errors to stable action-oriented messages, and use the controller's returned connection as the sole state response. Keep `llm/oauth-connection-updated` Host-internal and never special-case private names in the proxy.
 
 - [ ] **Step 5: Extend the fetch handler, generated API map, fake client, and fixture transport.**
 
@@ -465,7 +465,7 @@ Future filenames use `{literal-name}` only to distinguish a not-yet-created targ
   expect(screen.queryByLabelText(/API key/i)).toBeNull()
   ```
 
-  Cover Connect, Connecting, Connected, Reconnect, Cancel, Disconnect, Remove provider, a failed remove after successful disconnect, redacted event reload, and legacy explicit `apiKeyEnv` readiness without rendering an OAuth API-key field.
+  Cover Connect, Connecting, Connected, Reconnect, Cancel, Disconnect, Remove provider, a failed remove after successful disconnect, local status reload after a topology update, and legacy explicit `apiKeyEnv` readiness without rendering an OAuth API-key field.
 
 - [ ] **Step 2: Run the Models UI tests and confirm there is no OAuth editor.**
 
@@ -479,15 +479,15 @@ Future filenames use `{literal-name}` only to distinguish a not-yet-created targ
   export function providerUsable(row: ProviderRow): boolean {
     if (!row.entry.active) return false
     if (row.entry.auth.kind === 'oauth') {
-      return row.entry.connection?.status === 'connected'
+      return row.connection?.status === 'connected'
         || (row.apiKeyEnv !== undefined && row.credential?.configured === true)
     }
-    if (row.entry.auth.kind === 'api-key') return row.credential?.configured === true
+    if (row.entry.auth.kind === 'api-key') return row.apiKeyEnv === undefined || row.credential?.configured === true
     return true
   }
   ```
 
-  Request `credentials.describe` only for named profile API-key references. Copy `auth` and `connection` from `llm.providers`; never derive OAuth status from a credential badge or an OAuth record reference.
+  Request `credentials.describe` only for named profile API-key references. Copy `auth` from `llm.providers` and join `connection` from loopback-only `llm.oauthStatus`; never derive OAuth status from a credential badge or an OAuth record reference.
 
 - [ ] **Step 4: Add a dedicated card with safe browser actions and copy.**
 
@@ -500,7 +500,7 @@ Future filenames use `{literal-name}` only to distinguish a not-yet-created targ
   </button>
   ```
 
-  Render `Connect ChatGPT`, `Connecting`, `Connected`, `Reconnect`, `Cancel`, and `Disconnect` from the typed connection view. Keep URL and code only in local component state after a direct `oauthStart` response, clear them after cancellation, disconnect, unmount, or a terminal status event, and use an ordinary safe link rather than adding a host URL-opening RPC.
+  Render `Connect ChatGPT`, `Connecting`, `Connected`, `Reconnect`, `Cancel`, and `Disconnect` from the locally joined typed connection view. Keep URL and code only in local component state after a direct `oauthStart` response, clear them after cancellation, disconnect, unmount, or a terminal status refresh, and use an ordinary safe link rather than adding a host URL-opening RPC.
 
 - [ ] **Step 5: Wire profile creation, reconnect, disconnect, removal, and event invalidation.**
 
@@ -511,7 +511,7 @@ Future filenames use `{literal-name}` only to distinguish a not-yet-created targ
   await removeProviderProfile('openai-codex')
   ```
 
-  Create or retain the empty profile before start. On removal, await disconnect first, then the existing profile removal; show the configured-but-disconnected result when the second action fails. Subscribe to `llm/oauth-connection-updated` along with the current LLM/settings invalidators, and leave ordinary `ProviderEditor` API-key behavior unchanged.
+  Create or retain the empty profile before start. On removal, await disconnect first, then the existing profile removal; show the configured-but-disconnected result when the second action fails. Subscribe to public `llm/adapters-updated` alongside the current settings invalidators, then read OAuth status locally, and leave ordinary `ProviderEditor` API-key behavior unchanged.
 
 - [ ] **Step 6: Run focused Models UI tests.**
 

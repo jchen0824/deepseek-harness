@@ -1,6 +1,6 @@
 // Keyless browser proof for the complete Codex OAuth-to-selection path. The
 // scaffold owns the device-code transition, while the real Models store,
-// remote event, pi-ai catalog, Host model gate, and composer selection paths
+// topology event, pi-ai catalog, Host model gate, and composer selection paths
 // remain assembled exactly as the Web bundle ships them. A deterministic
 // native-provider failure drives a real model request and proves that stream,
 // persistence, Host history, browser events, visible copy, and logs expose
@@ -105,14 +105,14 @@ describe.skipIf(MODE === 'record')('web e2e: Codex OAuth reaches normal model se
     expect(await verificationLink.getAttribute('href')).toBe('https://auth.openai.com/codex/device')
     const deviceCode = await captureStableAria(page, '[role="dialog"]', scaffold.workspaceCwd)
 
-    let connectedFromEvent = ''
+    let connectedFromTopology = ''
     await scaffold.completeOAuthLogin('openai-codex', async () => {
-      // The fixture has emitted only llm/oauth-connection-updated here. Its
-      // adapter is deliberately withheld until this callback returns, so a
-      // connected card at this barrier proves the actual event invalidation.
+      // The OAuth state remains loopback-only. Registering the connected route
+      // emits the public topology invalidation that causes the Models page to
+      // read its own local OAuth status.
       await dialog.getByText('Connected', { exact: true }).waitFor({ timeout: 10_000 })
-      expect((await models(initialSession)).groups.some(group => group.id === 'openai-codex')).toBe(false)
-      connectedFromEvent = await captureStableAria(page, '[role="dialog"]', scaffold.workspaceCwd)
+      expect((await models(initialSession)).groups.some(group => group.id === 'openai-codex')).toBe(true)
+      connectedFromTopology = await captureStableAria(page, '[role="dialog"]', scaffold.workspaceCwd)
     })
     await expect.poll(
       async () => (await models(initialSession)).groups.some(group => group.id === 'openai-codex'),
@@ -243,7 +243,7 @@ describe.skipIf(MODE === 'record')('web e2e: Codex OAuth reaches normal model se
     const flow = [
       stage('Disconnected Models card', missing),
       stage('Fixed device code', deviceCode),
-      stage('Connected through the OAuth event', connectedFromEvent),
+      stage('Connected through the provider topology update', connectedFromTopology),
       stage('Connected Codex catalog in the normal picker', picker),
       stage('Current session Codex selection', currentSelection),
       stage('Provider-neutral model failure', providerFailure),
@@ -261,9 +261,10 @@ describe.skipIf(MODE === 'record')('web e2e: Codex OAuth reaches normal model se
     expect(rpcPayload).toContain('ABCD-EFGH')
     expect(rpcPayload).toContain('openai-codex')
     await expect.poll(
-      () => oauthEventPayloads.some(payload => payload.includes('llm/oauth-connection-updated')),
+      () => oauthEventPayloads.some(payload => payload.includes('llm/adapters-updated')),
       { timeout: 10_000 },
     ).toBe(true)
+    expect(oauthEventPayloads.some(payload => payload.includes('llm/oauth-connection-updated'))).toBe(false)
     const browserPayload = `${rpcPayload}\n${oauthEventPayloads.join('\n')}`
     expect(browserPayload).toContain('"status":"connected"')
     expect(browserPayload).toContain(PROVIDER_FAILURE_MESSAGE)

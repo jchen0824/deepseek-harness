@@ -207,7 +207,10 @@ describe('PiAiAdapter provider routing', () => {
         return Promise.resolve('legacy-override')
       },
       credentialStore: new MemoryOAuthStore(oauthCredential(Date.now() + 60_000)),
-      oauthController: { markReconnectRequired: () => { reconnects += 1; return Promise.resolve() } },
+      oauthController: {
+        captureRequestGeneration: () => Promise.resolve(1),
+        markReconnectRequired: () => { reconnects += 1; return Promise.resolve() },
+      },
     })
 
     const chunkTypes: string[] = []
@@ -287,19 +290,22 @@ describe('PiAiAdapter provider routing', () => {
       },
     }
     const profile = { ...resolved, piProvider: provider }
-    let reconnects = 0
+    const reconnectGenerations: number[] = []
     const adapter = new PiAiAdapter({
       profiles: () => new Map([['openai-codex', profile]]),
       resolveApiKey: () => Promise.resolve(undefined),
       credentialStore: new MemoryOAuthStore(oauthCredential(0)),
-      oauthController: { markReconnectRequired: () => { reconnects += 1; return Promise.resolve() } },
+      oauthController: {
+        captureRequestGeneration: () => Promise.resolve(17),
+        markReconnectRequired: (generation) => { reconnectGenerations.push(generation); return Promise.resolve() },
+      },
     })
     await expect(drainCodex(adapter, resolved.piProvider.getModels()[0]!.id))
       .rejects.toEqual(expect.objectContaining({
         code: OAUTH_RECONNECT_REQUIRED_CODE,
         message: 'OpenAI Codex connection needs to be reconnected',
       }))
-    expect(reconnects).toBe(1)
+    expect(reconnectGenerations).toEqual([17])
     expect(providerStreams).toBe(0)
   })
 
@@ -313,7 +319,10 @@ describe('PiAiAdapter provider routing', () => {
       profiles: () => new Map([['openai-codex', resolved]]),
       resolveApiKey: () => Promise.resolve(undefined),
       credentialStore: store,
-      oauthController: { markReconnectRequired: () => { reconnects += 1; return Promise.resolve() } },
+      oauthController: {
+        captureRequestGeneration: () => Promise.resolve(1),
+        markReconnectRequired: () => { reconnects += 1; return Promise.resolve() },
+      },
     })
     await expect(drainCodex(adapter, resolved.piProvider.getModels()[0]!.id)).rejects.toMatchObject({
       code: OAUTH_RECONNECT_REQUIRED_CODE,
@@ -332,7 +341,10 @@ describe('PiAiAdapter provider routing', () => {
       profiles: () => new Map([['openai-codex', resolved]]),
       resolveApiKey: () => Promise.resolve(undefined),
       credentialStore: store,
-      oauthController: { markReconnectRequired: () => { reconnects += 1; return Promise.resolve() } },
+      oauthController: {
+        captureRequestGeneration: () => Promise.resolve(1),
+        markReconnectRequired: () => { reconnects += 1; return Promise.resolve() },
+      },
     })
     const chunkTypes: string[] = []
     const consume = async (): Promise<void> => {
@@ -381,7 +393,10 @@ describe('PiAiAdapter provider routing', () => {
       profiles: () => profiles,
       resolveApiKey: () => Promise.resolve(undefined),
       credentialStore: store,
-      oauthController: { markReconnectRequired: () => { reconnects += 1; return Promise.resolve() } },
+      oauthController: {
+        captureRequestGeneration: () => Promise.resolve(1),
+        markReconnectRequired: () => { reconnects += 1; return Promise.resolve() },
+      },
     })
     const firstChunkTypes: string[] = []
     const secondChunkTypes: string[] = []

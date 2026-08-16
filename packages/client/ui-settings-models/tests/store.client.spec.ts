@@ -43,12 +43,19 @@ function api(overrides: {
   providers?: () => Promise<RpcResponse<{ providers: typeof DIRECTORY }>>
   describeSettings?: () => Promise<RpcResponse<{ writable: boolean; namespaces: typeof NAMESPACES }>>
   describeCredentials?: (refs: string[]) => Promise<RpcResponse<{ credentials: Record<string, unknown> }>>
+  oauthStatus?: (provider: string) => Promise<RpcResponse<{ connection: {
+    provider: string
+    status: 'missing' | 'connecting' | 'connected' | 'reconnect-required'
+  } }>>
 } = {}) {
   const seenRefs: string[][] = []
   const face = {
     llm: {
       providers: overrides.providers ?? (() => Promise.resolve(ok({ providers: DIRECTORY }))),
       models: () => Promise.resolve(ok({ groups: [], failures: [] })),
+      oauthStatus: (payload: { provider: string }) => (overrides.oauthStatus ?? ((provider: string) => Promise.resolve(ok({
+        connection: { provider, status: 'missing' as const },
+      }))))(payload.provider),
     },
     settings: {
       describe: overrides.describeSettings ?? (() => Promise.resolve(ok({ writable: true, hasDocument: false, namespaces: NAMESPACES }))),
@@ -98,7 +105,7 @@ describe('ModelsSettingsStore', () => {
     expect(state.namespaces.get('llm-pi-ai')?.ns).toBe('llm-pi-ai')
   })
 
-  it('keeps OAuth authentication and redacted connection state out of credential lookup', async () => {
+  it('reads OAuth state through the local lifecycle endpoint without a credential lookup', async () => {
     const { face, seenRefs } = api({
       describeSettings: () => Promise.resolve(ok({
         writable: true,
@@ -117,9 +124,9 @@ describe('ModelsSettingsStore', () => {
           settingsPath: ['providers', 'openai-codex'],
           active: false,
           auth: { kind: 'oauth' },
-          connection: { provider: 'openai-codex', status: 'connecting' },
         }],
       } as never)),
+      oauthStatus: provider => Promise.resolve(ok({ connection: { provider, status: 'connecting' } })),
     })
     const store = new ModelsSettingsStore(face)
     await store.load()
@@ -129,10 +136,8 @@ describe('ModelsSettingsStore', () => {
       configured: true,
       apiKeyEnv: undefined,
       credential: undefined,
-      entry: {
-        auth: { kind: 'oauth' },
-        connection: { provider: 'openai-codex', status: 'connecting' },
-      },
+      entry: { auth: { kind: 'oauth' } },
+      connection: { provider: 'openai-codex', status: 'connecting' },
     })
   })
 

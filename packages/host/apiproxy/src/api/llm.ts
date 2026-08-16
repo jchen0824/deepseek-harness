@@ -60,8 +60,6 @@ export interface ConfigurableProviderView {
   active: boolean
   /** Authentication method the provider exposes to configuration surfaces. */
   auth: LlmProviderAuth
-  /** Current redacted OAuth state, when an OAuth controller is registered. */
-  connection?: OAuthConnectionView
   /**
    * Whether the owning adapter knows this route only because configuration
    * declared it. Absent when the adapter draws no such distinction, so a

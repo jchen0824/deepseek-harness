@@ -10,9 +10,15 @@ import styles from './ModelsSection.module.css'
 interface DeviceCodeView {
   verificationUri: string
   userCode: string
+  intervalSeconds?: number
 }
 
 type PendingAction = 'start' | 'cancel' | 'disconnect'
+
+// The browser has no forwarded OAuth lifecycle event: status is deliberately
+// loopback-only. Refresh while device-code login is live so a remote expiry or
+// cancellation cannot leave the card at Connecting forever.
+const OAUTH_STATUS_REFRESH_DELAY_MS = 1_000
 
 /** Props for one OAuth provider route. */
 export interface OAuthProviderCardProps {
@@ -40,11 +46,12 @@ export function OAuthProviderCard({
   const [pending, setPending] = useState<PendingAction | undefined>(undefined)
   const [failure, setFailure] = useState<string | undefined>(undefined)
   const startGeneration = useRef(0)
+  const statusRefreshInFlight = useRef(false)
   const activeStart = useRef<{
     generation: number
     entry: ProviderRow['entry']
   } | undefined>(undefined)
-  const connectionStatus = row.entry.connection?.status ?? 'missing'
+  const connectionStatus = row.connection?.status ?? 'missing'
   const connecting = connectionStatus === 'connecting'
   const terminal = connectionStatus === 'connected'
     || connectionStatus === 'missing'
@@ -67,6 +74,25 @@ export function OAuthProviderCard({
     activeStart.current = undefined
   }, [])
 
+  useEffect(() => {
+    if (!connecting) return
+    let disposed = false
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const refresh = (): void => {
+      if (disposed || statusRefreshInFlight.current) return
+      statusRefreshInFlight.current = true
+      void controller.load().finally(() => {
+        statusRefreshInFlight.current = false
+        if (!disposed) timer = setTimeout(refresh, OAUTH_STATUS_REFRESH_DELAY_MS)
+      })
+    }
+    timer = setTimeout(refresh, OAUTH_STATUS_REFRESH_DELAY_MS)
+    return () => {
+      disposed = true
+      if (timer !== undefined) clearTimeout(timer)
+    }
+  }, [connecting, controller])
+
   const reload = async (): Promise<void> => {
     await controller.load()
   }
@@ -74,8 +100,8 @@ export function OAuthProviderCard({
   const startIsCurrent = (generation: number, entry: ProviderRow['entry']): boolean => {
     if (generation !== startGeneration.current || activeStart.current?.generation !== generation) return false
     const current = controller.store.getSnapshot().rows
-      .find(candidate => candidate.entry.provider === entry.provider)?.entry
-    if (current === undefined || current === entry) return true
+      .find(candidate => candidate.entry.provider === entry.provider)
+    if (current === undefined || current.entry === entry) return true
     return current.connection?.status === 'connecting'
   }
 

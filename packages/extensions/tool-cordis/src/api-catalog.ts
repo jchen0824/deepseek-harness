@@ -2357,6 +2357,14 @@ export const EVENT_API: readonly EventApiEntry[] = [
     parameters: [{ name: 'resolved', description: 'request identity and outcome.' }],
   },
   {
+    name: 'credentials/private-updated',
+    mode: 'emit',
+    signature: '\'credentials/private-updated\'(): void',
+    summary: 'A privately classified provider-managed credential changed.',
+    description: 'A privately classified provider-managed credential changed. The event carries no reference or value, so host-only consumers can refresh derived private state without exposing the changed credential through the browser event channel.',
+    parameters: [],
+  },
+  {
     name: 'credentials/updated',
     mode: 'emit',
     signature: '\'credentials/updated\'(ref: CredentialRef): void',

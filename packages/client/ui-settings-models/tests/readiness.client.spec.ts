@@ -63,12 +63,12 @@ describe('providerUsable', () => {
     expect(providerUsable(otherRow({ credential: undefined }))).toBe(false)
   })
 
-  it('requires the authentication method to be ready before exposing an active route', () => {
+  it('keeps active reference-free API-key routes usable for ambient authentication', () => {
     expect(providerUsable(otherRow({
       entry: { ...otherRow().entry, auth: { kind: 'api-key' } },
       apiKeyEnv: undefined,
       credential: undefined,
-    }))).toBe(false)
+    }))).toBe(true)
     expect(providerUsable(otherRow({
       entry: { ...otherRow().entry, auth: { kind: 'native' } },
       apiKeyEnv: undefined,
@@ -82,8 +82,8 @@ describe('providerUsable', () => {
         ...otherRow().entry,
         provider: 'openai-codex',
         auth: { kind: 'oauth' },
-        connection: { provider: 'openai-codex', status },
       },
+      connection: { provider: 'openai-codex', status },
       apiKeyEnv: undefined,
       credential: undefined,
     })
@@ -120,6 +120,10 @@ describe('onboardingReadiness', () => {
 
   it('ends onboarding once any other registered provider can serve requests', () => {
     expect(onboardingReadiness(state({ rows: [row(), otherRow()] }))).toEqual({ kind: 'provider-ready' })
+    expect(onboardingReadiness(state({ rows: [row(), otherRow({
+      apiKeyEnv: undefined,
+      credential: undefined,
+    })] }))).toEqual({ kind: 'provider-ready' })
     // A provider the user cannot reach yet leaves the prompt in place.
     expect(onboardingReadiness(state({
       rows: [row(), otherRow({ credential: missingCredential })],

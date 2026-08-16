@@ -151,8 +151,8 @@ export interface OAuthRedactionEvidence {
 
 /** Test-owned control over the deterministic Codex OAuth lifecycle. */
 interface OpenAICodexOAuthFixture {
-  /** Complete the pending login, optionally observing the event-driven UI before the model route appears. */
-  complete(observeConnectionEvent?: () => Promise<void>): Promise<void>
+  /** Complete the pending login, then optionally observe the topology-driven UI refresh. */
+  complete(observeConnection?: () => Promise<void>): Promise<void>
   /** Inspect whether non-secret private sentinels reached the real redaction seams. */
   redactionEvidence(): OAuthRedactionEvidence
 }
@@ -256,18 +256,18 @@ async function installOpenAICodexOAuthFixture(ctx: Context): Promise<OpenAICodex
   ctx.llm.registerOAuthController(controller)
 
   return {
-    async complete(observeConnectionEvent): Promise<void> {
+    async complete(observeConnection): Promise<void> {
       if (status !== 'connecting') {
         throw new Error('web e2e scaffold: Codex OAuth completion needs a pending device-code login')
       }
       status = 'connected'
       publish()
-      await observeConnectionEvent?.()
       if (route === undefined) {
         route = ctx.llm.registerAdapter([OPENAI_CODEX_PROVIDER], adapter)
       } else {
         route.replace([OPENAI_CODEX_PROVIDER])
       }
+      await observeConnection?.()
     },
     redactionEvidence(): OAuthRedactionEvidence {
       if (lastPrivatePayload === undefined) {

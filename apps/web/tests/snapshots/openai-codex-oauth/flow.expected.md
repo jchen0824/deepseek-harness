@@ -73,7 +73,7 @@
     - img
     - text: Add a custom provider
 
-# Connected through the OAuth event
+# Connected through the provider topology update
 
 - dialog "Settings":
   - navigation:
