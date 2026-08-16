@@ -61,9 +61,9 @@ describe('web e2e: Models settings page configures a dormant provider', () => {
     const dialog = page.getByRole('dialog', { name: '设置' })
     await dialog.waitFor({ timeout: 10_000 })
     await dialog.getByRole('button', { name: '模型' }).click()
-    await dialog.getByText('填入各提供方的 API 密钥即可使用其模型。').waitFor({ timeout: 10_000 })
-    // The dormant pi-ai adapter contributes its whole installed catalog; no
-    // provider is configured yet, so the page is one add button.
+    await dialog.getByText('连接帐号或填入各提供方的 API 密钥，即可使用其模型。').waitFor({ timeout: 10_000 })
+    // The dormant pi-ai adapter contributes its installed catalog and the
+    // redacted Codex connection card before any provider route is configured.
     const add = dialog.getByRole('button', { name: '添加提供方' })
     await add.waitFor({ timeout: 10_000 })
     // The button enables once the dormant catalog lands in the join.

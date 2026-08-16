@@ -374,8 +374,10 @@ interface LlmConfigurableProvider {
   /**
    * Path from that namespace's section root to this provider's profile
    * object; empty when the whole section is the profile.
-   */
+  */
   settingsPath: readonly string[]
+  /** Authentication method this provider route exposes to configuration surfaces. */
+  auth: LlmProviderAuth
   /**
    * Whether the owning adapter knows this route only because configuration
    * declared it — a gateway or self-hosted server it ships nothing about.
@@ -385,6 +387,69 @@ interface LlmConfigurableProvider {
    * from outside.
    */
   declared?: boolean
+}
+```
+
+Each directory entry declares one provider-neutral authentication method. OAuth lifecycle details stay with a controller registered for that provider; the directory exposes only the method, never connection or credential data.
+
+```ts type-equiv
+/** Provider-neutral authentication method a configurable provider supports. */
+type LlmProviderAuth =
+  | { kind: 'api-key' }
+  | { kind: 'oauth' }
+  | { kind: 'native' }
+```
+
+```ts type-equiv
+/** Public lifecycle state for one OAuth provider connection. */
+type LlmOAuthConnectionStatus = 'missing' | 'connecting' | 'connected' | 'reconnect-required'
+```
+
+```ts type-equiv
+/** Redacted connection state for one OAuth-capable provider route. */
+interface LlmOAuthConnection {
+  /** Provider route the controller owns. */
+  provider: string
+  /** Current connection lifecycle state. */
+  status: LlmOAuthConnectionStatus
+}
+```
+
+```ts type-equiv
+/** Device-code instructions returned only from the initiating controller call. */
+interface LlmOAuthDeviceCode {
+  /** URL at which the user verifies the device. */
+  verificationUri: string
+  /** Short code the user enters at the verification URL. */
+  userCode: string
+  /** Optional polling interval requested by the provider. */
+  intervalSeconds?: number
+  /** Optional lifetime of the device code. */
+  expiresInSeconds?: number
+}
+```
+
+```ts type-equiv
+/** Result of starting an OAuth connection lifecycle. */
+type LlmOAuthStart =
+  | { kind: 'device-code'; connection: LlmOAuthConnection; deviceCode: LlmOAuthDeviceCode }
+  | { kind: 'already-connecting'; connection: LlmOAuthConnection }
+  | { kind: 'connected'; connection: LlmOAuthConnection }
+```
+
+```ts type-equiv
+/** Provider-owned OAuth lifecycle operations. */
+interface LlmOAuthController {
+  /** Provider route this controller exclusively owns. */
+  readonly provider: string
+  /** Return the provider's current redacted connection state. */
+  status(): Promise<LlmOAuthConnection>
+  /** Start or resume connecting the provider account. */
+  start(): Promise<LlmOAuthStart>
+  /** Stop an in-progress connection attempt. */
+  cancel(): Promise<LlmOAuthConnection>
+  /** Remove the provider connection. */
+  disconnect(): Promise<LlmOAuthConnection>
 }
 ```
 
@@ -751,6 +816,33 @@ registerConfigurableProviders(entries: readonly LlmConfigurableProvider[]): Dire
 listConfigurableProviders(): LlmConfigurableProvider[]
 
 /**
+ * Register the controller that exclusively owns one OAuth-capable provider route.
+ * Public reads receive a facade bound to this provider, never the controller
+ * itself; every lifecycle result is reconstructed with only public fields.
+ * The contribution disposes with its registering fiber.
+ * @param controller - provider-owned lifecycle operations.
+ * @returns a disposer that withdraws the provider-bound facade.
+ */
+registerOAuthController(controller: LlmOAuthController): () => void
+
+/**
+ * Look up the provider-bound facade registered for a provider route. Every
+ * lifecycle call returns detached connection data containing only its owner
+ * provider and declared public fields.
+ * @param provider - provider route whose controller to read.
+ * @returns the provider-bound public controller, when one is registered.
+ */
+getOAuthController(provider: string): LlmOAuthController | undefined
+
+/**
+ * Broadcast a redacted OAuth lifecycle update. Device codes, account data,
+ * credentials, and provider errors are intentionally not accepted here.
+ * Listener failures are contained after the caller committed its transition.
+ * @param connection - provider route and valid public lifecycle status.
+ */
+emitOAuthConnectionUpdated(connection: LlmOAuthConnection): void
+
+/**
  * Offer to interrogate provider endpoints on behalf of the settings
  * namespace this plugin owns. The namespace is the key because that is what
  * a configuration surface already holds from the configurable-provider
@@ -835,7 +927,7 @@ async prepareCall(config: LlmCallConfig, signal?: AbortSignal): Promise<Prepared
 stream(options: GenerateOptions): AsyncIterable<StreamChunk>
 ```
 
-Source: [`packages/llm/llm/src/index.ts:284`](../../packages/llm/llm/src/index.ts)
+Source: [`packages/llm/llm/src/index.ts:296`](../../packages/llm/llm/src/index.ts)
 
 <a id="llm-events"></a>
 
@@ -862,6 +954,26 @@ The provider topology changed: an adapter registered or unregistered routes, or 
 
 Source: [`packages/llm/llm/src/types.ts:23`](../../packages/llm/llm/src/types.ts)
 
+<a id="llmoauth-connection-updated--emit"></a>
+
+#### `llm/oauth-connection-updated` — emit
+
+One OAuth connection changed. The payload deliberately contains only the provider route and lifecycle status: device codes, account data, credentials, and provider errors remain owned by the controller call that produced them and never enter this broadcast.
+
+```ts cordis-catalog
+/**
+ * One OAuth connection changed. The payload deliberately contains only
+ * the provider route and lifecycle status: device codes, account data,
+ * credentials, and provider errors remain owned by the controller call
+ * that produced them and never enter this broadcast.
+ * @param connection - detached provider route and connection status.
+ * @mode emit
+ */
+'llm/oauth-connection-updated'(connection: LlmOAuthConnection): void
+```
+
+Source: [`packages/llm/llm/src/types.ts:33`](../../packages/llm/llm/src/types.ts)
+
 <a id="llmstream--waterfall"></a>
 
 #### `llm/stream` — waterfall
@@ -884,5 +996,5 @@ Waterfall around every streaming model call (retry, replay, routing). Bound to t
 'llm/stream'(this: LlmRuntime, options: GenerateOptions, next: () => AsyncIterable<StreamChunk>): AsyncIterable<StreamChunk>
 ```
 
-Source: [`packages/llm/llm/src/index.ts:64`](../../packages/llm/llm/src/index.ts)
+Source: [`packages/llm/llm/src/index.ts:68`](../../packages/llm/llm/src/index.ts)
 <!-- END GENERATED cordis-surface -->

@@ -8,6 +8,7 @@ import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
+import { withFileLock, writeFileAtomic } from '@deepseek-ai/dsh-atomic-write'
 import { LocalCredentialProvider } from '../src/index.ts'
 
 /** Credential documents are seeded owner-only, exactly as the provider creates them. */
@@ -34,6 +35,17 @@ async function tempDir(): Promise<string> {
 async function boot(config: ConstructorParameters<typeof LocalCredentialProvider>[1]): Promise<Context> {
   const ctx = new Context()
   const fiber = ctx.plugin(LocalCredentialProvider, config)
+  cleanups.push(async () => { await fiber.dispose() })
+  await fiber
+  return ctx
+}
+
+/** Boot a fresh local-provider module instance to model another Node process. */
+async function bootFreshModule(path: string, watch = false): Promise<Context> {
+  vi.resetModules()
+  const { LocalCredentialProvider: FreshLocalCredentialProvider } = await import('../src/index.ts')
+  const ctx = new Context()
+  const fiber = ctx.plugin(FreshLocalCredentialProvider, { path, watch, debounceMs: 10 })
   cleanups.push(async () => { await fiber.dispose() })
   await fiber
   return ctx
@@ -71,6 +83,265 @@ describe('read-modify-write', () => {
     const third = await boot({ path, watch: false })
     expect(await third.credentials.resolve(ALPHA)).toEqual({ value: '3', source: 'file' })
     expect(await third.credentials.resolve(BETA)).toEqual({ value: '3', source: 'file' })
+  })
+
+  it('holds the shared writer lock through a mutation callback', async () => {
+    const dir = await tempDir()
+    const path = join(dir, '.credentials.yaml')
+    const first = await boot({ path, watch: false })
+    const second = await boot({ path, watch: false })
+    const firstEvents: string[] = []
+    first.on('credentials/updated', (ref) => { firstEvents.push(ref) })
+    let callbackStarted!: () => void
+    const started = new Promise<void>((resolve) => { callbackStarted = resolve })
+    let release!: () => void
+    const held = new Promise<void>((resolve) => { release = resolve })
+
+    const pending = first.credentials.modify(ALPHA, async (current) => {
+      expect(current).toBeUndefined()
+      callbackStarted()
+      await held
+      return { value: 'first', result: undefined, visibility: 'public' as const }
+    })
+    await started
+    let secondCurrent: string | undefined
+    let secondCallbackStarted = false
+    const after = second.credentials.modify(ALPHA, async (current) => {
+      secondCallbackStarted = true
+      secondCurrent = current
+      return { value: 'second', result: undefined, visibility: 'private' as const }
+    })
+    await new Promise(resolve => setTimeout(resolve, 20))
+    expect(secondCallbackStarted).toBe(false)
+    release()
+    await Promise.all([pending, after])
+
+    expect(secondCurrent).toBe('first')
+    expect(firstEvents).toEqual([ALPHA])
+    const reread = await boot({ path, watch: false })
+    expect(await reread.credentials.resolve(ALPHA)).toEqual({ value: 'second', source: 'file' })
+  })
+
+  it('keeps a private cross-instance update out of a later mutation reconciliation', async () => {
+    const dir = await tempDir()
+    const path = join(dir, '.credentials.yaml')
+    const first = await boot({ path, watch: false })
+    const second = await boot({ path, watch: false })
+    const secondEvents: string[] = []
+    second.on('credentials/updated', (ref) => { secondEvents.push(ref) })
+
+    await first.credentials.modify(ALPHA, async () => ({
+      value: 'private-first',
+      result: undefined,
+      visibility: 'private',
+    }))
+    await second.credentials.modify(BETA, async () => ({
+      value: 'private-second',
+      result: undefined,
+      visibility: 'private',
+    }))
+
+    expect(secondEvents).toEqual([])
+    expect(await second.credentials.resolve(ALPHA)).toEqual({ value: 'private-first', source: 'file' })
+  })
+
+  it('notifies host-private peers without naming a watched private credential', async () => {
+    const dir = await tempDir()
+    const path = join(dir, '.credentials.yaml')
+    const first = await boot({ path, watch: false })
+    const second = await boot({ path, debounceMs: 10 })
+    const publicEvents: string[] = []
+    let privateUpdates = 0
+    second.on('credentials/updated', (ref) => { publicEvents.push(ref) })
+    second.on('credentials/private-updated', () => { privateUpdates += 1 })
+
+    await first.credentials.modify(ALPHA, async () => ({
+      value: 'private-first',
+      result: undefined,
+      visibility: 'private',
+    }))
+
+    await vi.waitFor(async () => {
+      expect(await second.credentials.resolve(ALPHA)).toEqual({ value: 'private-first', source: 'file' })
+      expect(privateUpdates).toBe(1)
+    })
+    expect(publicEvents).toEqual([])
+  })
+
+  it('keeps a private update silent after a fresh provider module reconciles it', async () => {
+    const dir = await tempDir()
+    const path = join(dir, '.credentials.yaml')
+    const first = await boot({ path, watch: false })
+    await first.credentials.modify(ALPHA, async () => ({
+      value: 'private-one',
+      result: undefined,
+      visibility: 'private',
+    }))
+    const fresh = await bootFreshModule(path)
+    const freshEvents: string[] = []
+    fresh.on('credentials/updated', (ref) => { freshEvents.push(ref) })
+
+    await first.credentials.modify(ALPHA, async () => ({
+      value: 'private-two',
+      result: undefined,
+      visibility: 'private',
+    }))
+    await fresh.credentials.modify(BETA, async () => ({
+      value: 'private-peer',
+      result: undefined,
+      visibility: 'private',
+    }))
+
+    expect(freshEvents).toEqual([])
+  })
+
+  it('publishes a public peer replacement through later mutation reconciliation', async () => {
+    const dir = await tempDir()
+    const path = join(dir, '.credentials.yaml')
+    const first = await boot({ path, watch: false })
+    const stale = await boot({ path, watch: false })
+    const publicPeer = await boot({ path, watch: false })
+    const staleEvents: string[] = []
+    stale.on('credentials/updated', (ref) => { staleEvents.push(ref) })
+
+    await first.credentials.modify(ALPHA, async () => ({
+      value: 'private-first',
+      result: undefined,
+      visibility: 'private',
+    }))
+    await publicPeer.credentials.modify(ALPHA, async () => ({
+      value: 'public-peer',
+      result: undefined,
+      visibility: 'public',
+    }))
+    await stale.credentials.modify(BETA, async () => ({
+      value: 'private-stale',
+      result: undefined,
+      visibility: 'private',
+    }))
+
+    expect(staleEvents).toEqual([ALPHA])
+  })
+
+  it('publishes a public peer replacement through watcher reconciliation', async () => {
+    const dir = await tempDir()
+    const path = join(dir, '.credentials.yaml')
+    const first = await boot({ path, watch: false })
+    const watched = await boot({ path, debounceMs: 10 })
+    const publicPeer = await boot({ path, watch: false })
+    const watchedEvents: string[] = []
+    watched.on('credentials/updated', (ref) => { watchedEvents.push(ref) })
+
+    await first.credentials.modify(ALPHA, async () => ({
+      value: 'private-first',
+      result: undefined,
+      visibility: 'private',
+    }))
+    await vi.waitFor(async () => {
+      expect(await watched.credentials.resolve(ALPHA)).toEqual({ value: 'private-first', source: 'file' })
+    })
+    await publicPeer.credentials.modify(ALPHA, async () => ({
+      value: 'public-peer',
+      result: undefined,
+      visibility: 'public',
+    }))
+    await vi.waitFor(async () => {
+      expect(await watched.credentials.resolve(ALPHA)).toEqual({ value: 'public-peer', source: 'file' })
+    })
+
+    expect(watchedEvents).toEqual([ALPHA])
+  })
+
+  it('waits for the writer lock before reconciling a public visibility transition', async () => {
+    const dir = await tempDir()
+    const path = join(dir, '.credentials.yaml')
+    await writeCredentials(path, `${ALPHA}: old-public\n`)
+    const watched = await boot({ path, debounceMs: 200 })
+    const writer = await boot({ path, watch: false })
+    const watchedEvents: string[] = []
+    watched.on('credentials/updated', (ref) => { watchedEvents.push(ref) })
+
+    await writer.credentials.modify(ALPHA, async () => ({
+      value: 'private-pending',
+      result: undefined,
+      visibility: 'private',
+    }))
+    let locked!: () => void
+    const lockHeld = new Promise<void>((resolve) => { locked = resolve })
+    let release!: () => void
+    const held = new Promise<void>((resolve) => { release = resolve })
+    const transition = withFileLock(path, async () => {
+      await writeFileAtomic(`${path}.private-references.json`, '[]\n', { mode: 0o600, dirMode: 0o700 })
+      locked()
+      await held
+      await writeFileAtomic(path, `${ALPHA}: public-final\n`, { mode: 0o600, dirMode: 0o700 })
+    })
+    await lockHeld
+    await new Promise(resolve => setTimeout(resolve, 300))
+
+    expect(watchedEvents).toEqual([])
+    expect(await watched.credentials.resolve(ALPHA)).toEqual({ value: 'old-public', source: 'file' })
+    release()
+    await transition
+    await vi.waitFor(async () => {
+      expect(await watched.credentials.resolve(ALPHA)).toEqual({ value: 'public-final', source: 'file' })
+    })
+    expect(watchedEvents).toEqual([ALPHA])
+  })
+
+  it('keeps comments and the credential mapping when a private mutation is classified', async () => {
+    const dir = await tempDir()
+    const path = join(dir, '.credentials.yaml')
+    const source = `# alpha note\n${ALPHA}: old\n# beta note\n${BETA}: keep\n`
+    await writeCredentials(path, source)
+    const ctx = await boot({ path, watch: false })
+
+    await ctx.credentials.modify(ALPHA, async () => ({
+      value: 'private-next',
+      result: undefined,
+      visibility: 'private',
+    }))
+
+    expect(await readFile(path, 'utf8')).toBe(`# alpha note\n${ALPHA}: private-next\n# beta note\n${BETA}: keep\n`)
+  })
+
+  it.skipIf(process.platform === 'win32')('stores private reference metadata owner-only without its value', async () => {
+    const dir = await tempDir()
+    const path = join(dir, '.credentials.yaml')
+    const ctx = await boot({ path, watch: false })
+    const secret = 'private-value-not-metadata'
+
+    await ctx.credentials.modify(ALPHA, async () => ({
+      value: secret,
+      result: undefined,
+      visibility: 'private',
+    }))
+
+    const metadataPath = `${path}.private-references.json`
+    const metadata = await readFile(metadataPath, 'utf8')
+    expect(metadata).toBe(`${JSON.stringify([ALPHA])}\n`)
+    expect(metadata).not.toContain(secret)
+    expect((await stat(metadataPath)).mode & 0o777).toBe(0o600)
+  })
+
+  it('publishes a changed public cross-instance update to watcher notifications', async () => {
+    const dir = await tempDir()
+    const path = join(dir, '.credentials.yaml')
+    const first = await boot({ path, watch: false })
+    const second = await boot({ path, debounceMs: 10 })
+    const secondEvents: string[] = []
+    second.on('credentials/updated', (ref) => { secondEvents.push(ref) })
+
+    await first.credentials.modify(ALPHA, async () => ({
+      value: 'public-first',
+      result: undefined,
+      visibility: 'public',
+    }))
+
+    await vi.waitFor(async () => {
+      expect(await second.credentials.resolve(ALPHA)).toEqual({ value: 'public-first', source: 'file' })
+    })
+    expect(secondEvents).toEqual([ALPHA])
   })
 
   it('creates the credentials directory owner-only', async () => {

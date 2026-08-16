@@ -126,6 +126,10 @@ function scriptedApi(overrides: {
       providers: r => ok(r, { providers: [] }),
       models: r => ok(r, { groups: [], failures: [] }),
       discoverModels: err,
+      oauthStart: err,
+      oauthStatus: err,
+      oauthCancel: err,
+      oauthDisconnect: err,
       ...overrides.llm,
     },
     events: { mux: () => empty<MuxFrame>(), host: () => empty<HostFrame>(), ...overrides.events },
@@ -733,7 +737,21 @@ describe('config unary surface', () => {
       displayName: 'openai',
       settingsNs: 'llm-pi-ai',
       settingsPath: ['providers', 'openai'],
+      auth: { kind: 'api-key' as const },
       active: false,
+    }
+    const oauthConnection = { provider: 'openai-codex', status: 'connecting' as const }
+    const oauthStart = {
+      connection: oauthConnection,
+      start: {
+        kind: 'device-code' as const,
+        deviceCode: {
+          verificationUri: 'https://auth.openai.com/codex/device',
+          userCode: 'ABCD-EFGH',
+          intervalSeconds: 5,
+          expiresInSeconds: 900,
+        },
+      },
     }
     const group = { id: 'deepseek-official', name: 'DeepSeek', models: [{ id: 'deepseek-v4-flash', name: 'Flash' }] }
     const api = scriptedApi({
@@ -753,6 +771,10 @@ describe('config unary surface', () => {
         providers: record('llm.providers', r => ok(r, { providers: [providerRow] })),
         models: record('llm.models', r => ok(r, { groups: [group], failures: [] })),
         discoverModels: record('llm.discoverModels', r => ok(r, { models: [{ id: 'acme-large', contextWindow: 65536 }] })),
+        oauthStart: record('llm.oauthStart', r => ok(r, oauthStart)),
+        oauthStatus: record('llm.oauthStatus', r => ok(r, { connection: oauthConnection })),
+        oauthCancel: record('llm.oauthCancel', r => ok(r, { connection: { provider: 'openai-codex', status: 'missing' as const } })),
+        oauthDisconnect: record('llm.oauthDisconnect', r => ok(r, { connection: { provider: 'openai-codex', status: 'missing' as const } })),
       },
     })
     const c = client(api)
@@ -785,11 +807,20 @@ describe('config unary surface', () => {
       apiKey: 'probe-key',
     })
     expect(discovered.result).toEqual({ ok: true, value: { models: [{ id: 'acme-large', contextWindow: 65536 }] } })
+    expect((await c.llm.oauthStart({ provider: 'openai-codex' })).result)
+      .toEqual({ ok: true, value: oauthStart })
+    expect((await c.llm.oauthStatus({ provider: 'openai-codex' })).result)
+      .toEqual({ ok: true, value: { connection: oauthConnection } })
+    expect((await c.llm.oauthCancel({ provider: 'openai-codex' })).result)
+      .toEqual({ ok: true, value: { connection: { provider: 'openai-codex', status: 'missing' } } })
+    expect((await c.llm.oauthDisconnect({ provider: 'openai-codex' })).result)
+      .toEqual({ ok: true, value: { connection: { provider: 'openai-codex', status: 'missing' } } })
 
     expect(seen.map(call => call.method)).toEqual([
       'settings.describe', 'settings.openDocument', 'settings.update', 'settings.replace', 'settings.mutate',
       'credentials.describe', 'credentials.set', 'credentials.unset',
       'llm.providers', 'llm.models', 'llm.discoverModels',
+      'llm.oauthStart', 'llm.oauthStatus', 'llm.oauthCancel', 'llm.oauthDisconnect',
     ])
     expect(seen[2]?.payload).toEqual({ ns: 'llm-deepseek', patch: { baseURL: 'https://next' } })
     expect(seen[4]?.payload)

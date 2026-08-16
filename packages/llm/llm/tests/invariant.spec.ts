@@ -98,7 +98,7 @@ describe('adapters-updated invariants', () => {
     await ctx.plugin(LlmRuntime)
     const dispose = ctx.llm.registerAdapter(['coherent'], new NoopAdapter())
     ctx.llm.registerConfigurableProviders([
-      { provider: 'dormant', displayName: 'Dormant', settingsNs: 'ns', settingsPath: [] },
+      { provider: 'dormant', displayName: 'Dormant', settingsNs: 'ns', settingsPath: [], auth: { kind: 'api-key' } },
     ])
     dispose()
     expect(ctx.llm.listProviders()).toEqual([])

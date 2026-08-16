@@ -14,6 +14,40 @@ const sid = (id: string): SessionId => id as SessionId
 const req = <P>(payload: P): RpcRequest<P> => ({ rpcId: RpcId(`t-${Math.abs(Math.sin(reqCount++)).toString(36).slice(2, 10)}`), payload })
 let reqCount = 0
 
+const fixtureOAuthCases = [
+  {
+    method: 'oauthStart',
+    call: (client: FixtureApiClient, provider: string) => client.llm.oauthStart({ provider }),
+    value: {
+      connection: { provider: 'openai-codex', status: 'connecting' },
+      start: {
+        kind: 'device-code',
+        deviceCode: {
+          verificationUri: 'https://auth.openai.com/codex/device',
+          userCode: 'ABCD-EFGH',
+          intervalSeconds: 5,
+          expiresInSeconds: 900,
+        },
+      },
+    },
+  },
+  {
+    method: 'oauthStatus',
+    call: (client: FixtureApiClient, provider: string) => client.llm.oauthStatus({ provider }),
+    value: { connection: { provider: 'openai-codex', status: 'missing' } },
+  },
+  {
+    method: 'oauthCancel',
+    call: (client: FixtureApiClient, provider: string) => client.llm.oauthCancel({ provider }),
+    value: { connection: { provider: 'openai-codex', status: 'missing' } },
+  },
+  {
+    method: 'oauthDisconnect',
+    call: (client: FixtureApiClient, provider: string) => client.llm.oauthDisconnect({ provider }),
+    value: { connection: { provider: 'openai-codex', status: 'missing' } },
+  },
+] as const
+
 interface TimingHooks {
   setHistoryDelay(ms: number): void
   failNextHistory(): void
@@ -997,6 +1031,24 @@ describe('FixtureApiClient (protocol-level fake carrier)', () => {
     const request = tapped.find(m => m.type === 'client-request')
     const reply = tapped.find(m => m.type === 'server-response')
     expect(request?.rpcId).toBe(reply?.rpcId) // echo discipline holds through the fake carrier
+  })
+
+  it.each(fixtureOAuthCases)('$method accepts the configured OAuth provider with redacted output', async ({ call, value }) => {
+    const response = await call(new FixtureApiClient(), 'openai-codex')
+    expect(response.result).toEqual({ ok: true, value })
+    expect(JSON.stringify(response)).not.toMatch(/access|refresh|accountId|plan|lease|token/)
+  })
+
+  it.each(fixtureOAuthCases)('$method refuses an arbitrary provider id', async ({ call }) => {
+    const response = await call(new FixtureApiClient(), 'arbitrary-provider')
+    expect(response.result).toEqual({
+      ok: false,
+      error: {
+        code: 'internal',
+        message: 'OAuth connection is unavailable. Refresh the provider list and try again.',
+        details: {},
+      },
+    })
   })
 
   it('covers the whole unary dispatch table', async () => {

@@ -13,17 +13,27 @@
  * way down: switching models mid-reply takes effect on the next step, never
  * inside the one in flight.
  *
- * Credentials stay outside that collection. The harness resolves a route's key
- * through its own seam and passes it as the request's `apiKey` option, which
- * pi-ai treats as the highest-priority auth override — so `Models` never holds
- * a credential store and the harness keeps its fail-loud reference semantics.
+ * Each native Codex request receives a private failure tracker over the same
+ * host-scoped OAuth credential store. Its request-local `Models` collection is
+ * built only from the already-captured profile snapshot and serves preflight,
+ * lazy dispatch, and the final stream guard. The guard can therefore identify
+ * that request's late auth failure without retaining provider diagnostics or
+ * observing a concurrent request. An explicit `apiKeyEnv` still resolves
+ * through the Harness seam and becomes the highest-priority request override;
+ * the native Codex OAuth profile omits that override and lets pi-ai resolve and
+ * refresh its stored credential.
  *
  * @module dsh-llm-pi-ai/adapter
  */
 
-import { createModels, getSupportedThinkingLevels } from '@earendil-works/pi-ai'
+import { createModels, getSupportedThinkingLevels, ModelsError } from '@earendil-works/pi-ai'
 import type {
   Api,
+  AssistantMessage,
+  AssistantMessageEvent,
+  Credential,
+  CredentialInfo,
+  CredentialStore,
   Model,
   Models,
   ModelThinkingLevel,
@@ -36,6 +46,7 @@ import {
   contentHasImage,
   LlmAdapter,
   LlmError,
+  OAUTH_RECONNECT_REQUIRED_CODE,
   ReasoningEffortId,
 } from '@deepseek-ai/dsh-llm'
 import type {
@@ -51,7 +62,11 @@ import type { AttachmentStore } from '@deepseek-ai/dsh-attachment'
 import { idleWatchdog, timeoutOf } from '@deepseek-ai/dsh-timeout'
 import type { ResolvedPiAiProviderProfile } from './config.ts'
 import { toPiContext } from './context.ts'
-import { toStreamChunks } from './stream.ts'
+import type { OpenAICodexOAuthController } from './openai-codex-oauth.ts'
+import { classifyPiAiError, mapStopReason, toStreamChunks } from './stream.ts'
+
+const OPENAI_CODEX_PROVIDER = 'openai-codex'
+const OPENAI_CODEX_REQUEST_FAILURE = 'OpenAI Codex request failed'
 
 /** One resolution's frozen view: the profiles and the collection built from them. */
 interface PiAiSnapshot {
@@ -59,6 +74,228 @@ interface PiAiSnapshot {
   profiles: ReadonlyMap<string, ResolvedPiAiProviderProfile>
   /** Providers for exactly those profiles; never mutated once published. */
   models: Models
+}
+
+/** Request-owned auth collection and its optional durable-store failure tracker. */
+interface NativeOAuthRequest {
+  /** Providers copied only from the profile snapshot captured at request entry. */
+  models: Models
+  /** Failures raised while this request alone uses the shared durable store. */
+  oauthFailures?: OAuthFailureTrackingStore
+}
+
+/** Track typed Codex credential failures until lazy pi-ai setup reaches its terminal event. */
+class OAuthFailureTrackingStore implements CredentialStore {
+  private failureVersion = 0
+
+  constructor(private readonly delegate: CredentialStore) {}
+
+  /** Current monotonic failure marker for request-local comparisons. */
+  version(): number {
+    return this.failureVersion
+  }
+
+  /** Record a failure only for the host-owned native OAuth provider. */
+  private mark(providerId: string): void {
+    if (providerId === OPENAI_CODEX_PROVIDER) this.failureVersion += 1
+  }
+
+  async read(providerId: string): Promise<Credential | undefined> {
+    try {
+      return await this.delegate.read(providerId)
+    } catch (error) {
+      this.mark(providerId)
+      throw error
+    }
+  }
+
+  list(): Promise<readonly CredentialInfo[]> {
+    return this.delegate.list()
+  }
+
+  async modify(
+    providerId: string,
+    fn: (current: Credential | undefined) => Promise<Credential | undefined>,
+  ): Promise<Credential | undefined> {
+    try {
+      return await this.delegate.modify(providerId, async (current) => {
+        try {
+          return await fn(current)
+        } catch (error) {
+          this.mark(providerId)
+          throw error
+        }
+      })
+    } catch (error) {
+      this.mark(providerId)
+      throw error
+    }
+  }
+
+  async delete(providerId: string): Promise<void> {
+    try {
+      await this.delegate.delete(providerId)
+    } catch (error) {
+      this.mark(providerId)
+      throw error
+    }
+  }
+}
+
+/** Fence native OAuth's read/refresh path after the owning request stops. */
+function abortableCredentialStore(delegate: CredentialStore, signal: AbortSignal): CredentialStore {
+  const throwIfAborted = (): void => { signal.throwIfAborted() }
+  return {
+    async read(providerId): Promise<Credential | undefined> {
+      throwIfAborted()
+      const credential = await delegate.read(providerId)
+      throwIfAborted()
+      return credential
+    },
+    list: delegate.list.bind(delegate),
+    async modify(providerId, fn): Promise<Credential | undefined> {
+      throwIfAborted()
+      const credential = await delegate.modify(providerId, async (current) => {
+        throwIfAborted()
+        const proposed = await fn(current)
+        // A refresh result must not cross the durable-store commit point after
+        // its request has stopped.
+        throwIfAborted()
+        return proposed
+      })
+      throwIfAborted()
+      return credential
+    },
+    delete: delegate.delete.bind(delegate),
+  }
+}
+
+/** Resolve an operation or stop waiting as soon as the request signal aborts. */
+async function awaitWithAbort<T>(
+  operation: () => PromiseLike<T> | T,
+  signal: AbortSignal,
+): Promise<T> {
+  signal.throwIfAborted()
+  const aborted = Promise.withResolvers<never>()
+  const onAbort = (): void => { aborted.reject(signal.reason) }
+  signal.addEventListener('abort', onAbort, { once: true })
+  const pending = Promise.resolve().then(() => {
+    signal.throwIfAborted()
+    return operation()
+  })
+  try {
+    return await Promise.race([pending, aborted.promise])
+  } finally {
+    signal.removeEventListener('abort', onAbort)
+  }
+}
+
+/** Return the provider-neutral failure for any unusable native Codex OAuth state. */
+function oauthReconnectFailure(): LlmError {
+  return new LlmError(
+    'OpenAI Codex connection needs to be reconnected',
+    OAUTH_RECONNECT_REQUIRED_CODE,
+  )
+}
+
+/** Throw the single public reconnect failure after committing durable controller state. */
+async function reconnectOAuth(
+  controller: PiAiAdapterOptions['oauthController'],
+  generation: number | undefined,
+): Promise<never> {
+  if (controller !== undefined && generation !== undefined) {
+    await controller.markReconnectRequired(generation)
+  }
+  throw oauthReconnectFailure()
+}
+
+/** Return the terminal message carried by a pi-ai terminal event. */
+function terminalMessage(event: AssistantMessageEvent): AssistantMessage | undefined {
+  switch (event.type) {
+    case 'done': return event.message
+    case 'error': return event.error
+    default: return undefined
+  }
+}
+
+/**
+ * Stop native OAuth setup/auth failures before pi-ai's flattened terminal data
+ * reaches stream translation. Ordinary provider failures retain their normal
+ * finish chunk after a successful final auth check.
+ */
+async function* guardNativeOAuthEvents(
+  events: AsyncIterable<AssistantMessageEvent>,
+  models: Models,
+  oauthFailures: OAuthFailureTrackingStore | undefined,
+  model: Model<Api>,
+  failureVersion: number | undefined,
+  controller: PiAiAdapterOptions['oauthController'],
+  generation: number | undefined,
+): AsyncGenerator<AssistantMessageEvent> {
+  for await (const event of events) {
+    const terminal = terminalMessage(event)
+    if (terminal?.stopReason === 'error') {
+      const trackedFailure = failureVersion !== undefined
+        && oauthFailures?.version() !== failureVersion
+      const reason = mapStopReason(terminal, model.contextWindow)
+      const providerAuthFailure = reason.kind === 'error' && reason.failure.code === 'AUTH'
+      let unavailable = trackedFailure || providerAuthFailure
+      if (!unavailable) {
+        try {
+          unavailable = await models.getAuth(model) === undefined
+        } catch (error) {
+          if (!(error instanceof ModelsError)) throw error
+          unavailable = true
+        }
+      }
+      if (unavailable) await reconnectOAuth(controller, generation)
+    }
+    yield event
+  }
+}
+
+/** Replace every native Codex terminal failure message before yielding a chunk. */
+async function* sanitizeNativeCodexChunks(
+  events: AsyncIterable<AssistantMessageEvent>,
+  contextWindow: number | undefined,
+): AsyncGenerator<StreamChunk> {
+  for await (const chunk of toStreamChunks(events, contextWindow)) {
+    if (chunk.type !== 'finish'
+      || (chunk.reason.kind !== 'error' && chunk.reason.kind !== 'aborted')) {
+      yield chunk
+      continue
+    }
+    yield {
+      ...chunk,
+      reason: {
+        ...chunk.reason,
+        failure: { ...chunk.reason.failure, message: OPENAI_CODEX_REQUEST_FAILURE },
+      },
+    }
+  }
+}
+
+/** Preserve Harness failures and redact thrown native provider or SDK failures. */
+function nativeCodexFailure(error: unknown): LlmError {
+  if (error instanceof LlmError) return error
+  const message = typeof error === 'string'
+    ? error
+    : error instanceof Error
+      ? error.message
+      : ''
+  return new LlmError(OPENAI_CODEX_REQUEST_FAILURE, classifyPiAiError(message))
+}
+
+/** Build a Models collection from one captured profile map and credential store. */
+function modelsFrom(
+  profiles: ReadonlyMap<string, ResolvedPiAiProviderProfile>,
+  credentialStore: CredentialStore | undefined,
+): Models {
+  const models: MutableModels = createModels(
+    credentialStore === undefined ? {} : { credentials: credentialStore },
+  )
+  for (const profile of profiles.values()) models.setProvider(profile.piProvider)
+  return models
 }
 
 /** Constructor options for {@link PiAiAdapter}: the two resolution hooks the plugin owns. */
@@ -74,6 +311,10 @@ export interface PiAiAdapterOptions {
    * `MISSING_CREDENTIAL` rather than falling back.
    */
   resolveApiKey: (provider: string, profile: ResolvedPiAiProviderProfile) => Promise<string | undefined>
+  /** Stable pi-ai credential store shared beneath every request-local OAuth facade. */
+  credentialStore?: CredentialStore
+  /** Raw host controller used only to bind and persist one request-time OAuth failure. */
+  oauthController?: Pick<OpenAICodexOAuthController, 'captureRequestGeneration' | 'markReconnectRequired'>
   /** Resolve the optional durable attachment service at request time. */
   resolveAttachments?: () => AttachmentStore | undefined
 }
@@ -199,10 +440,21 @@ export class PiAiAdapter extends LlmAdapter {
   private current(): PiAiSnapshot {
     const profiles = this.config.profiles()
     if (this.snapshot?.profiles === profiles) return this.snapshot
-    const models: MutableModels = createModels()
-    for (const profile of profiles.values()) models.setProvider(profile.piProvider)
+    const models = modelsFrom(profiles, this.config.credentialStore)
     this.snapshot = { profiles, models }
     return this.snapshot
+  }
+
+  /** Create one cancellable native OAuth collection without consulting profiles again. */
+  private nativeOAuthRequest(snapshot: PiAiSnapshot, signal: AbortSignal): NativeOAuthRequest {
+    const oauthFailures = this.config.credentialStore === undefined
+      ? undefined
+      : new OAuthFailureTrackingStore(this.config.credentialStore)
+    const credentialStore = oauthFailures === undefined
+      ? undefined
+      : abortableCredentialStore(oauthFailures, signal)
+    const models = modelsFrom(snapshot.profiles, credentialStore)
+    return { models, ...oauthFailures === undefined ? {} : { oauthFailures } }
   }
 
   /** The profile for one route within one snapshot, or the not-owned failure. */
@@ -289,7 +541,10 @@ export class PiAiAdapter extends LlmAdapter {
       model,
       options.reasoningEffort ?? profile.reasoning,
     )
-    const apiKey = await this.config.resolveApiKey(options.provider, profile)
+    const nativeCodexOAuth = profile.provider === OPENAI_CODEX_PROVIDER && profile.apiKeyEnv === undefined
+    const apiKey = nativeCodexOAuth
+      ? undefined
+      : await this.config.resolveApiKey(options.provider, profile)
 
     const consumer = new AbortController()
     const upstream = options.signal === undefined
@@ -297,8 +552,35 @@ export class PiAiAdapter extends LlmAdapter {
       : AbortSignal.any([options.signal, consumer.signal])
     const streamIdleTimeoutMs = profile.streamIdleTimeoutMs
     using watchdog = idleWatchdog(upstream, streamIdleTimeoutMs, 'LLM_STREAM_IDLE_TIMEOUT')
+    const oauthRequest = nativeCodexOAuth ? this.nativeOAuthRequest(snapshot, watchdog.signal) : undefined
+    const requestModels = oauthRequest?.models ?? snapshot.models
+    let oauthGeneration: number | undefined
+    let oauthFailureVersion: number | undefined
 
     try {
+      if (nativeCodexOAuth) {
+        try {
+          oauthGeneration = await awaitWithAbort(
+            () => this.config.oauthController?.captureRequestGeneration(),
+            watchdog.signal,
+          )
+          // Preflight pi-ai's locked refresh while the typed ModelsError is still
+          // available. `streamSimple()` is lazy and otherwise flattens it into a
+          // provider-text event, which must not enter the Harness stream.
+          const auth = await awaitWithAbort(() => requestModels.getAuth(model), watchdog.signal)
+          watchdog.signal.throwIfAborted()
+          if (auth === undefined) {
+            await reconnectOAuth(this.config.oauthController, oauthGeneration)
+          }
+        } catch (error) {
+          if (watchdog.signal.aborted) throw error
+          if (error instanceof ModelsError || error instanceof LlmError) {
+            await reconnectOAuth(this.config.oauthController, oauthGeneration)
+          }
+          throw error
+        }
+      }
+      oauthFailureVersion = oauthRequest?.oauthFailures?.version()
       const containsImage = options.messages.some(message => contentHasImage(message.content))
       if (containsImage && !model.input.includes('image')) {
         throw new LlmError(`pi-ai model "${model.id}" does not support image input`, 'UNSUPPORTED_CONTENT')
@@ -310,7 +592,7 @@ export class PiAiAdapter extends LlmAdapter {
       const context = attachments === undefined
         ? toPiContext(options)
         : await toPiContext(options, attachments)
-      const events = snapshot.models.streamSimple(model, context, {
+      const sourceEvents = requestModels.streamSimple(model, context, {
         ...profileOptions(profile, reasoning, apiKey),
         ...options.temperature === undefined ? {} : { temperature: options.temperature },
         ...options.maxTokens === undefined ? {} : { maxTokens: options.maxTokens },
@@ -320,7 +602,21 @@ export class PiAiAdapter extends LlmAdapter {
         // Harness-owned and therefore win collisions.
         headers: requestHeaders(profile.headers),
       })
-      const iterator = toStreamChunks(events, model.contextWindow)[Symbol.asyncIterator]()
+      const events = nativeCodexOAuth
+        ? guardNativeOAuthEvents(
+          sourceEvents,
+          requestModels,
+          oauthRequest?.oauthFailures,
+          model,
+          oauthFailureVersion,
+          this.config.oauthController,
+          oauthGeneration,
+        )
+        : sourceEvents
+      const chunks = nativeCodexOAuth
+        ? sanitizeNativeCodexChunks(events, model.contextWindow)
+        : toStreamChunks(events, model.contextWindow)
+      const iterator = chunks[Symbol.asyncIterator]()
       let exhausted = false
       try {
         while (true) {
@@ -345,11 +641,28 @@ export class PiAiAdapter extends LlmAdapter {
       }
     } catch (error: unknown) {
       if (timeoutOf(watchdog.signal, 'LLM_STREAM_IDLE_TIMEOUT') !== undefined) {
-        throw new LlmError(`pi-ai stream idle timeout after ${streamIdleTimeoutMs}ms`, 'TIMEOUT', { cause: error })
+        throw new LlmError(
+          nativeCodexOAuth
+            ? `OpenAI Codex stream idle timeout after ${streamIdleTimeoutMs}ms`
+            : `pi-ai stream idle timeout after ${streamIdleTimeoutMs}ms`,
+          'TIMEOUT',
+          nativeCodexOAuth ? undefined : { cause: error },
+        )
       }
       if (options.signal?.aborted) {
-        throw new LlmError('pi-ai request aborted by caller', 'ABORTED', { cause: error })
+        throw new LlmError(
+          nativeCodexOAuth ? 'OpenAI Codex request aborted by caller' : 'pi-ai request aborted by caller',
+          'ABORTED',
+          nativeCodexOAuth ? undefined : { cause: error },
+        )
       }
+      if (error instanceof LlmError && error.code === OAUTH_RECONNECT_REQUIRED_CODE) throw error
+      if (nativeCodexOAuth
+        && (oauthFailureVersion !== oauthRequest?.oauthFailures?.version()
+          || error instanceof ModelsError)) {
+        await reconnectOAuth(this.config.oauthController, oauthGeneration)
+      }
+      if (nativeCodexOAuth) throw nativeCodexFailure(error)
       throw error
     } finally {
       consumer.abort('pi-ai stream consumer stopped')

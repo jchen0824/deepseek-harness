@@ -18,8 +18,11 @@
     - img
     - text: 关闭
   - heading "模型" [level=2]
-  - paragraph: 填入各提供方的 API 密钥即可使用其模型。
+  - paragraph: 连接帐号或填入各提供方的 API 密钥，即可使用其模型。
   - list:
+    - listitem:
+      - text: openai-codex
+      - button "连接 ChatGPT"
     - listitem:
       - text: DeepSeek
       - img "API 密钥已配置"

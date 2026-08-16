@@ -383,6 +383,55 @@ describe('document writes', () => {
     expect(await readFile(path, 'utf8')).toBe('DSH_CRED_TEST: one\nDSH_CRED_OTHER: two\n')
   })
 
+  it('keeps a private mutation host-only while committing its stored value', async () => {
+    const dir = await tempDir()
+    const path = join(dir, '.credentials.yaml')
+    const ctx = await boot({ path, watch: false })
+    const seen = updates(ctx)
+
+    const result = await ctx.credentials.modify(KEY, async current => ({
+      value: current === undefined ? 'rotated-secret' : undefined,
+      result: current,
+      visibility: 'private',
+    }))
+
+    expect(result).toBeUndefined()
+    expect(seen).toEqual([])
+    expect(await ctx.credentials.resolve(KEY)).toEqual({ value: 'rotated-secret', source: 'file' })
+  })
+
+  it('keeps a rejected mutation and an unchanged public mutation silent', async () => {
+    const dir = await tempDir()
+    const path = join(dir, '.credentials.yaml')
+    await writeCredentials(path, 'DSH_CRED_TEST: stable\n')
+    const ctx = await boot({ path, watch: false })
+    const seen = updates(ctx)
+
+    await expect(ctx.credentials.modify(KEY, async () => {
+      throw new Error('rotation failed')
+    })).rejects.toThrow('rotation failed')
+    await ctx.credentials.modify(KEY, async current => ({
+      value: current,
+      result: undefined,
+      visibility: 'public',
+    }))
+
+    expect(seen).toEqual([])
+    expect(await ctx.credentials.resolve(KEY)).toEqual({ value: 'stable', source: 'file' })
+  })
+
+  it('rejects a mutation that the launching environment shadows', async () => {
+    const dir = await tempDir()
+    const ctx = await boot({ path: join(dir, '.credentials.yaml'), watch: false })
+    vi.stubEnv('DSH_CRED_TEST', 'from-shell')
+
+    await expect(ctx.credentials.modify(KEY, async () => ({
+      value: 'next',
+      result: undefined,
+      visibility: 'private',
+    }))).rejects.toThrow(/shadowed/)
+  })
+
   it('refuses writes after disposal', async () => {
     const dir = await tempDir()
     const ctx = new Context()
@@ -392,6 +441,21 @@ describe('document writes', () => {
     const service = ctx.credentials
     await fiber.dispose()
     await expect(service.set(KEY, 'late')).rejects.toThrow(/disposed/)
+  })
+
+  it('refuses mutations after disposal', async () => {
+    const dir = await tempDir()
+    const ctx = new Context()
+    const fiber = ctx.plugin(LocalCredentialProvider, { path: join(dir, '.credentials.yaml'), watch: false })
+    await fiber
+    const service = ctx.credentials
+    await fiber.dispose()
+
+    await expect(service.modify(KEY, async () => ({
+      value: 'late',
+      result: undefined,
+      visibility: 'private',
+    }))).rejects.toThrow(/disposed/)
   })
 })
 

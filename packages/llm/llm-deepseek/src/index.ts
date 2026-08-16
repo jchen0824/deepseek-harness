@@ -249,7 +249,7 @@ export function apply(ctx: Context, config: Config): void {
   const resolveUserId = (): AnonymousUserId => userId ??= getOrCreateAnonymousUserId()
   const adapter = new DeepSeekAdapter({ options, resolveApiKey, resolveUserId })
   ctx.llm.registerConfigurableProviders([
-    { provider: PROVIDER, displayName: 'DeepSeek', settingsNs: NS, settingsPath: [] },
+    { provider: PROVIDER, displayName: 'DeepSeek', settingsNs: NS, settingsPath: [], auth: { kind: 'api-key' } },
   ])
   // Route effects bind to this apply fiber via the stable `ctx` reference,
   // even when a swap runs inside the scoped settings callback below.

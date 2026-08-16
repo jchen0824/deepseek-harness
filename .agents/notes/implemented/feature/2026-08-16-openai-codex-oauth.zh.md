@@ -1,0 +1,57 @@
+# Agent Note: OpenAI Codex 订阅 OAuth
+
+Status: implemented
+
+[English](2026-08-16-openai-codex-oauth.md) | 中文
+
+## 问题
+
+已安装的 pi-ai catalog 包含 `openai-codex`，但该路由只通过 OAuth 认证。要真正提供这条路由，就需要通用 API 密钥路径没有提供的三样东西：持久化的 pi-ai `CredentialStore`、交互式登录生命周期，以及绝不暴露所得凭据的配置界面。缺少其中任意一项，API 密钥卡片或无密钥 profile 都只是在提供一条会在请求发出前失败的路由。
+
+此前的安全姿态是不提供仅支持 OAuth 的 catalog 条目，同时让已经存储的 profile 保持可见、可删除。只有在未连接条目保持无害、连接不会扩大凭据可见范围，而且成功连接会进入与其他主模型相同的模型选择和请求路径时，才能改变这一姿态。
+
+## 决策
+
+`openai-codex` 使用 pi-ai 的持久化 OAuth 凭据存储，以及一条保存 generation、登录租约与重连状态的私有跨进程权威记录。通用 pi-ai 适配器在整个 Host 生命周期内持有一个凭据存储和一个 OAuth 控制器；每个不可变模型集合都把 Codex 认证与刷新委托给这份共用存储。
+
+可配置提供方目录将未配置 profile 的已安装路由展示为 `{ kind: 'oauth' }`。profile 存在后，适配器会依照[OAuth 公开拓扑隐私决策](../bug-fix/2026-08-16-oauth-public-topology-privacy.md)，独立于 OAuth 状态注册普通 pi-ai catalog 路由。模型页会在登录之前创建空 profile，并提供专用的连接、取消、重新连接、断开连接和删除操作。已经存在且显式指定 `apiKeyEnv` 的 profile 在模型页中展示为密钥认证行，走普通编辑和删除行为，并拒绝 OAuth 生命周期 RPC。普通 pi-ai catalog、模型选择器、已保存默认值、会话级选择、推理元数据和 LLM 请求路径都会直接适用，不会增加 Codex 专用的选择路径；未连接的原生请求会返回 `OAUTH_RECONNECT_REQUIRED`。
+
+控制器只接受 pi-ai 的确切设备码选择器。它只向发起调用返回验证 URL 与一次性验证码，拒绝浏览器回调、手动输入码、secret、粘贴 token 和相似但不相同的交互，并在尝试完成或取消时清除设备码状态。Headless profile 无法发起登录；当它与 Web profile 共用 Harness 主目录和提供方 settings 时，会消费已经建立的连接。
+
+## 安全与生命周期不变量
+
+OAuth 凭据与权威记录存放在由实现持有的固定私有引用下。这些引用不属于配置：它们绝不会出现在 `settings.yaml`、`cordis.yml`、提供方 profile、浏览器 RPC、事件、日志、诊断、会话或快照中。Host 会在查询提供方之前拒绝通用凭据 describe、set 与 unset 对任一引用的操作，并统一返回 details 为空的答复，因此探测不会暴露存在性或状态，也无法修改可见性或发出事件。凭据提供方会在每个异步读取—修改—写入回调和原子提交期间持续持有跨进程文件锁。私有变更只会发出不带 payload、仅供 Host 使用的 `credentials/private-updated` 失效通知，使同级控制器能够重新读取持久状态而不点名引用。OAuth 状态留在仅限回环地址的生命周期答复中；公开的 `llm.providers`、`llm.models` 与 `session.models` 成员身份由 profile 而非该状态决定，转发给浏览器的事件不携带二者。
+
+权威记录带有单调 generation，且最多只有一条会过期的租约；租约有一个不透明所有者，使用经过校验且可配置的生命周期，在生命周期一半处续订，过期后允许接管，并只由匹配所有者释放。声明登录会推进 generation、清除先前 authority 的所有凭据，并把限定到该 generation 的凭据存储包装层交给 pi-ai。因此，取消或断开连接即使与替换登录竞争，也无法把旧凭据重新标记为后一次失败登录的连接。取消与断开连接会推进持久 generation 并清除租约，因此远程或延迟完成的轮询器无法在撤销后存下或重建凭据；pi-ai logout 获得已撤销 generation 的包装层，无法删除后来的凭据。模型请求会在认证前捕获 generation；调用方取消覆盖 generation 捕获和 pi-ai 的 `getAuth()` 预检，因此已取消的请求二者都不会启动。pi-ai 不提供对在途刷新的外部取消，因此请求会停止等待，中止感知的凭据存储包装层会在持久提交点阻止提交；延迟完成的刷新无法持久化轮换后的凭据。刷新失败只会在该 generation 仍是当前 generation 且其私有协调记录修改已提交时改变状态。插件资源释放只会中止并等待自身持有的工作，然后释放匹配租约而不撤销连接。另一个进程观察到有效租约时，只会收到脱敏的 `already-connecting` 状态，而不会拿到第二个设备码；同级进程会在租约到期时重新读取持久状态，因此所有者在凭据持久化后崩溃时不需要后续文件变更也能让连接状态收敛。
+
+pi-ai 通过同一份共用凭据存储串行执行刷新。撤销以及当前 generation 的刷新失败（其私有协调记录修改已提交）会持久标记路由为 `reconnect-required`，每个进程都能观察到该状态。无法提交其标记的请求仍以稳定的 `OAUTH_RECONNECT_REQUIRED` 失败，不会携带原始提供方数据，但会保留最后一次已发布的连接状态。控制器读取格式错误的存储时会将其脱敏。Harness 自身产生的 `LlmError`（包括提供方 I/O 之前的内容校验）会保留其稳定错误码和消息。其他所有原生 Codex 终止事件以及外部提供方或 SDK 异常会先在内部分类，再于任何流分片或抛出的失败离开适配器之前替换成 `OpenAI Codex request failed`。原生 OAuth 绝不会回退到 API 密钥、进程环境或其他提供方。已经存在且显式点名 `apiKeyEnv` 的 profile 保留为独立的旧式密钥认证路由；OAuth 回退无法抵达它，OAuth 设置卡片也绝不会索要密钥。
+
+Models 卡片处于 connecting 时，会轮询直接的回环状态直至达到终态。这是唯一的浏览器侧生命周期刷新：它让过期和同级进程取消保持收敛，同时不把 OAuth 状态放进公开目录或转发事件流。
+
+## 曾考虑的替代方案
+
+**采用主要的 Codex app-server 适配器。** 不采用：这会在既有 pi-ai 路由旁边创建第二套模型运行时与选择路径。pi-ai 已经持有 Codex catalog、协议实现、OAuth 交换、刷新和模型元数据；通过既有 LLM seam 适配这些能力，可以继续由普通主模型行为掌握权威性。
+
+**导入 Codex CLI 凭据文件。** 不采用：另一个程序的私有文件格式、位置、生命周期和修改归属都不构成 Harness 凭据约定。导入会把单个提供方绑定到外部状态，使刷新归属不明确，而且仍然无法解决 Web 登录和主目录共享协调问题。
+
+**在 V1 中采用浏览器回调和粘贴 token 登录。** 不采用：回调会增加监听器、重定向、可达性与取消行为，并且这些行为在本地、远程和 Headless 使用方式之间不同；粘贴 token 则会暴露会过期的 secret，并绕过 pi-ai 刷新生命周期。设备码登录在这些部署中使用同一种交互，并把 token 材料留在凭据存储内。
+
+**将路由注册与 OAuth 状态耦合。** [OAuth 公开拓扑隐私决策](../bug-fix/2026-08-16-oauth-public-topology-privacy.md)不采用此方案：提供方和模型成员身份是公开的，会泄露订阅是否已连接。已配置 profile 会注册其 catalog 路由，而模型页只有在直接的仅限回环地址状态报告 `connected` 后才可用。
+
+**在 profile 解析期间拒绝未连接且无密钥的 Codex profile。** 不采用：校验会在启动和写入时作用于整个 settings namespace；否则一个未连接 profile 会拒绝该 namespace 中的每条路由，并让这份 profile 滞留在 UI 之外。解析会接受 profile，目录让它保持可操作，适配器注册其 catalog 路由，而原生请求在连接可用前返回 `OAUTH_RECONNECT_REQUIRED`。
+
+**把 `Provider is not configured` 映射成具名 `LlmError`。** 仍暂缓此项，因为它是通用 pi-ai 诊断，而非 OAuth 生命周期失败：未点名凭据的 API 密钥 catalog 路由，在提供方原生环境发现也找不到凭据时，仍可能产生这句话。原生 Codex OAuth 会把凭据缺失、撤销和刷新失败状态改为 `OAUTH_RECONNECT_REQUIRED`，因此扩大本功能的范围并不会加强其禁止回退保证。
+
+## 后果
+
+用户可以从模型页连接 ChatGPT 订阅，再像使用普通主模型一样选择其中的 Codex 模型。已配置但未连接的 profile 会提供公开 catalog 元数据，但不表示订阅授权；模型页只会在直接的仅限回环地址状态为 `connected` 后可用，原生请求则返回 `OAUTH_RECONNECT_REQUIRED`。已安装 catalog 中哪些模型可供该订阅使用由 OpenAI 控制；连接和列出 catalog 不会通过模型请求探测授权。断开连接会保留 profile 供之后重新连接；删除则只有在断开连接返回终态 `missing` 后才移除配置，非终态答复或之后的 settings 失败都会留下可恢复的已配置卡片。
+
+共用一个主目录的多个 Harness 进程也会共用 OAuth generation、租约、重连状态与凭据，并在同一把文件锁下协调每次修改。任一进程中的取消或断开连接都会为全部进程撤销当前 generation。租约时长可以按部署配置，因为缓慢或中断频繁的环境需要不同的接管间隔，但过短的值会增加不必要的接管和取消。存储损坏或提供方撤销绝不会暴露被拒绝的 payload，代价是需要重新连接。
+
+其他 catalog 提供方保留既有认证分类。提供 API 密钥方法的提供方即使也提供 OAuth，仍走 API 密钥路径；依赖原生环境的提供方仍归类为原生。既有显式密钥 Codex profile 继续可用，同时不会削弱原生 OAuth 的禁止回退规则。
+
+`classifyPiAiError()` 仍会把已识别的提供方消息映射成稳定错误码，并让未识别的失败使用 `PI_AI_ERROR`。原生 Codex 的提供方和 SDK 失败只保留该分类并丢弃提供方消息，而 Harness 自身产生的 `LlmError` 会保留其错误码和消息。无关的 pi-ai 路由保留既有错误文本，因为本功能不改变它们的隐私策略。Codex 的凭据缺失、撤销与刷新失败状态会经 `OAUTH_RECONNECT_REQUIRED` 绕过此路径。
+
+## 验证
+
+凭据与 pi-ai 包测试固定了私有原子修改、限定 generation 的写入、过时请求、过时 logout 与已撤销凭据接管的竞态、原生 OAuth 预检前及预检期间的调用方取消且不会提交延迟完成的凭据、进程间私有失效通知、仅设备码交互、资源释放、独立于 OAuth 状态的 profile 驱动公开注册、无法提交的持久重连标记会保持最后一次已发布的连接状态、Harness 自身 `LlmError` 的保留、外部提供方与 SDK 异常的脱敏，以及与显式旧式密钥路径的区别。Host 与连接测试固定了跨私有状态变化的公开提供方和模型拓扑、受信任远程目录访问，以及仅限回环地址的生命周期答复；client 测试固定了本地 OAuth 状态关联与只有终态才执行的先断开再删除顺序。Loader 组合证明，已保存连接可以通过已发布的 Headless profile 使用且不会发起登录。无密钥的组装 Web 场景会在 OAuth 完成前观察其模型组，随后发起一次真实但失败的 Codex 请求，并证明其恶意哨兵值没有出现在流事件、持久化存储、浏览器历史与事件、Host 与浏览器日志、可见文案及快照中。显式启用的个人订阅冒烟测试只在进程内保留凭据，在脱敏 `checkAuth()` 与 catalog 检查之后断开连接，未明确启用时会自行跳过。

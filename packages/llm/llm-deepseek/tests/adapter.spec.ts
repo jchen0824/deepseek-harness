@@ -627,6 +627,7 @@ describe('plugin registration and config', () => {
       displayName: 'DeepSeek',
       settingsNs: 'llm-deepseek',
       settingsPath: [],
+      auth: { kind: 'api-key' },
     }])
     await fiber.dispose()
     expect(ctx.llm.listProviders()).toEqual([])

@@ -12,9 +12,15 @@ import type { Agent, ModelSelection, ModelSelectionRef, AgentOptions, AgentStatu
 import type {} from '@deepseek-ai/dsh-agent-presets/types'
 import { AttachmentError } from '@deepseek-ai/dsh-attachment'
 import type { ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
-import { contentHasImage, createUserMessage, freezeMessage, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
+import { assertNever, contentHasImage, createUserMessage, freezeMessage, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import { errorChain } from '@deepseek-ai/dsh-llm'
-import type { ContentBlock, MessageSource } from '@deepseek-ai/dsh-llm'
+import type {
+  ContentBlock,
+  LlmOAuthConnection,
+  LlmOAuthController,
+  LlmOAuthStart,
+  MessageSource,
+} from '@deepseek-ai/dsh-llm'
 import { isAppendSurfaceEvent, isJsonValue } from '@deepseek-ai/dsh-session'
 import type { JsonValue, Session, SessionEvent, SessionEventMap, SessionHeader, SessionId, UserMessage } from '@deepseek-ai/dsh-session'
 import type { SessionPersistence } from '@deepseek-ai/dsh-session-persistence'
@@ -38,7 +44,8 @@ import type {} from '@deepseek-ai/dsh-tools'
 import type {
   ApiProxy, ConfigurableProviderView, CredentialView, GoalRef, HistoryEntry, HostFrame,
   ModelCatalogFailure, ModelProviderGroup,
-  ModelReasoning, MuxFrame, PromptContentPart, QuestionResponsePayload, SessionListMetadata, SessionProjectionsBlock, SessionSearchItem,
+  ModelReasoning, MuxFrame, OAuthConnectionView, OAuthStartView, PromptContentPart,
+  QuestionResponsePayload, SessionListMetadata, SessionProjectionsBlock, SessionSearchItem,
   QueuedInboxItem, SessionSummary, SettingsNamespaceView, SubagentAddress, JobView, ToolEventView,
   WorkspaceId, WorkspaceView,
 } from './api/index.ts'
@@ -126,6 +133,12 @@ const DEFAULT_MAX_MESSAGES = 50
 const WEB_SETTINGS_NAMESPACES = [
   'agent-loop', 'shell', 'locale', 'permission', 'ui-conversation', 'ui-theme', 'web-search-deepseek',
 ] as const
+
+/** Fixed OAuth storage names unavailable to every generic browser credential operation. */
+const PRIVATE_BROWSER_CREDENTIAL_REFS = new Set([
+  'DSH_OPENAI_CODEX_OAUTH',
+  'DSH_OPENAI_CODEX_LOGIN_LEASE',
+])
 
 /** Provider work budget: at most 100 calls and 2,000 inspected hits. */
 const SESSION_SEARCH_PROVIDER_CALL_LIMIT = 100
@@ -1925,6 +1938,15 @@ export function createApiProxy(ctx: Context, defaults: ApiProxyDefaults): ApiPro
     return { code: 'internal', message: 'credentials service is absent: this deployment does not mount a credential provider (e.g. @deepseek-ai/dsh-credentials-local) in its composition', details: {} }
   }
 
+  /** Refuse private references without echoing their name or stored state. */
+  function privateCredentialUnavailable<T>(request: RpcRequest<unknown>): RpcResponse<T> {
+    return err(request, {
+      code: 'credential-rejected',
+      message: 'Credential operation is unavailable.',
+      details: {},
+    })
+  }
+
   /** Map one redacted settings descriptor to its wire view. */
   function namespaceView(descriptor: SettingsDescriptor): SettingsNamespaceView {
     return {
@@ -2021,6 +2043,73 @@ export function createApiProxy(ctx: Context, defaults: ApiProxyDefaults): ApiPro
       return err(request, { code: 'internal', message: `settings namespace "${ns}" was disposed after the ${mode}`, details: {} })
     }
     return ok(request, namespaceView(descriptor))
+  }
+
+  /** Copy only the public connection fields from the LLM controller facade. */
+  function oauthConnectionView(connection: LlmOAuthConnection): OAuthConnectionView {
+    return { provider: connection.provider, status: connection.status }
+  }
+
+  /** Resolve only an OAuth directory route whose provider-bound facade is live. */
+  function oauthController(provider: string): LlmOAuthController | undefined {
+    const configured = ctx.llm.listConfigurableProviders()
+      .some(entry => entry.provider === provider && entry.auth.kind === 'oauth')
+    return configured ? ctx.llm.getOAuthController(provider) : undefined
+  }
+
+  /** Indistinguishable refusal for unknown, non-OAuth, and unserved provider ids. */
+  function oauthUnavailable<T>(request: RpcRequest<unknown>): RpcResponse<T> {
+    return err(request, {
+      code: 'internal',
+      message: 'OAuth connection is unavailable. Refresh the provider list and try again.',
+      details: {},
+    })
+  }
+
+  /** Run one state-only OAuth action while replacing provider errors with stable copy. */
+  async function oauthConnectionAction(
+    request: RpcRequest<{ provider: string }>,
+    action: 'check' | 'cancel' | 'disconnect',
+    run: (controller: LlmOAuthController) => Promise<LlmOAuthConnection>,
+  ): Promise<RpcResponse<{ connection: OAuthConnectionView }>> {
+    const controller = oauthController(request.payload.provider)
+    if (controller === undefined) return oauthUnavailable(request)
+    try {
+      return ok(request, { connection: oauthConnectionView(await run(controller)) })
+    } catch {
+      return err(request, {
+        code: 'internal',
+        message: `Unable to ${action} the OAuth connection. Try again.`,
+        details: {},
+      })
+    }
+  }
+
+  /** Project a controller start result without its duplicate connection field. */
+  function oauthStartView(started: LlmOAuthStart): OAuthStartView {
+    const connection = oauthConnectionView(started.connection)
+    switch (started.kind) {
+      case 'device-code':
+        return {
+          connection,
+          start: {
+            kind: 'device-code',
+            deviceCode: {
+              verificationUri: started.deviceCode.verificationUri,
+              userCode: started.deviceCode.userCode,
+              ...started.deviceCode.intervalSeconds === undefined
+                ? {}
+                : { intervalSeconds: started.deviceCode.intervalSeconds },
+              ...started.deviceCode.expiresInSeconds === undefined
+                ? {}
+                : { expiresInSeconds: started.deviceCode.expiresInSeconds },
+            },
+          },
+        }
+      case 'already-connecting': return { connection, start: { kind: 'already-connecting' } }
+      case 'connected': return { connection, start: { kind: 'connected' } }
+      default: return assertNever(started, 'llm OAuth start result')
+    }
   }
 
   return {
@@ -3320,6 +3409,9 @@ export function createApiProxy(ctx: Context, defaults: ApiProxyDefaults): ApiPro
 
     credentials: {
       async describe(request) {
+        if (request.payload.refs.some(ref => PRIVATE_BROWSER_CREDENTIAL_REFS.has(ref))) {
+          return privateCredentialUnavailable(request)
+        }
         const credentials = ctx.get('credentials')
         if (credentials === undefined) return err(request, credentialsAbsent())
         const entries = await Promise.all(request.payload.refs.map(async (ref) => {
@@ -3335,6 +3427,9 @@ export function createApiProxy(ctx: Context, defaults: ApiProxyDefaults): ApiPro
       },
 
       async set(request) {
+        if (PRIVATE_BROWSER_CREDENTIAL_REFS.has(request.payload.ref)) {
+          return privateCredentialUnavailable(request)
+        }
         const credentials = ctx.get('credentials')
         if (credentials === undefined) return err(request, credentialsAbsent())
         const { ref, value } = request.payload
@@ -3351,6 +3446,9 @@ export function createApiProxy(ctx: Context, defaults: ApiProxyDefaults): ApiPro
       },
 
       async unset(request) {
+        if (PRIVATE_BROWSER_CREDENTIAL_REFS.has(request.payload.ref)) {
+          return privateCredentialUnavailable(request)
+        }
         const credentials = ctx.get('credentials')
         if (credentials === undefined) return err(request, credentialsAbsent())
         const { ref } = request.payload
@@ -3379,6 +3477,7 @@ export function createApiProxy(ctx: Context, defaults: ApiProxyDefaults): ApiPro
           settingsNs: entry.settingsNs,
           settingsPath: [...entry.settingsPath],
           active: active.has(entry.provider),
+          auth: { ...entry.auth },
           ...entry.declared === undefined ? {} : { declared: entry.declared },
         }))
         // Routes registered without a directory declaration still appear —
@@ -3392,6 +3491,7 @@ export function createApiProxy(ctx: Context, defaults: ApiProxyDefaults): ApiPro
             settingsNs: '',
             settingsPath: [],
             active: true,
+            auth: { kind: 'native' },
           })
         }
         return Promise.resolve(ok(request, { providers: views }))
@@ -3423,6 +3523,32 @@ export function createApiProxy(ctx: Context, defaults: ApiProxyDefaults): ApiPro
             details: { settingsNs, ...baseURL === undefined ? {} : { baseURL } },
           })
         }
+      },
+
+      async oauthStart(request) {
+        const controller = oauthController(request.payload.provider)
+        if (controller === undefined) return oauthUnavailable(request)
+        try {
+          return ok(request, oauthStartView(await controller.start()))
+        } catch {
+          return err(request, {
+            code: 'internal',
+            message: 'Unable to start the OAuth connection. Try again.',
+            details: {},
+          })
+        }
+      },
+
+      oauthStatus(request) {
+        return oauthConnectionAction(request, 'check', controller => controller.status())
+      },
+
+      oauthCancel(request) {
+        return oauthConnectionAction(request, 'cancel', controller => controller.cancel())
+      },
+
+      oauthDisconnect(request) {
+        return oauthConnectionAction(request, 'disconnect', controller => controller.disconnect())
       },
     },
 

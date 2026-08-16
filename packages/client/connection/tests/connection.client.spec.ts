@@ -15,11 +15,61 @@ import { FakeApiClient, deferred, ok } from './fake-api.client.ts'
 const SID = 'fk-c1' as SessionId
 const FAST = { backoffBaseMs: 10, backoffFactor: 1, backoffMaxMs: 10, streamOpenTimeoutMs: 500 }
 
+const fakeOAuthCases = [
+  {
+    method: 'oauthStart',
+    call: (api: FakeApiClient, provider: string) => api.llm.oauthStart({ provider }),
+    value: {
+      connection: { provider: 'openai-codex', status: 'connecting' },
+      start: {
+        kind: 'device-code',
+        deviceCode: {
+          verificationUri: 'https://auth.openai.com/codex/device',
+          userCode: 'ABCD-EFGH',
+          intervalSeconds: 5,
+          expiresInSeconds: 900,
+        },
+      },
+    },
+  },
+  {
+    method: 'oauthStatus',
+    call: (api: FakeApiClient, provider: string) => api.llm.oauthStatus({ provider }),
+    value: { connection: { provider: 'openai-codex', status: 'missing' } },
+  },
+  {
+    method: 'oauthCancel',
+    call: (api: FakeApiClient, provider: string) => api.llm.oauthCancel({ provider }),
+    value: { connection: { provider: 'openai-codex', status: 'missing' } },
+  },
+  {
+    method: 'oauthDisconnect',
+    call: (api: FakeApiClient, provider: string) => api.llm.oauthDisconnect({ provider }),
+    value: { connection: { provider: 'openai-codex', status: 'missing' } },
+  },
+] as const
+
 function subscribedFrame(lastSeq = 0) {
   return { type: 'session/subscribed', sessionId: SID, lastSeq } as const
 }
 
 describe('connection lifecycle', () => {
+  it.each(fakeOAuthCases)('$method accepts only the configured provider in the connection fake', async ({ call, value }) => {
+    const valid = await call(new FakeApiClient(), 'openai-codex')
+    expect(valid.result).toEqual({ ok: true, value })
+    expect(JSON.stringify(valid)).not.toMatch(/access|refresh|accountId|plan|lease|token/)
+
+    const arbitrary = await call(new FakeApiClient(), 'arbitrary-provider')
+    expect(arbitrary.result).toEqual({
+      ok: false,
+      error: {
+        code: 'internal',
+        message: 'OAuth connection is unavailable. Refresh the provider list and try again.',
+        details: {},
+      },
+    })
+  })
+
   it('announces connected after describe + both streams open, then pumps frames to sinks', async () => {
     const api = new FakeApiClient()
     const muxSeen: string[] = []

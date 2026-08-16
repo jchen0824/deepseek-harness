@@ -1,0 +1,6 @@
+# Bilingual-pair consistency record (docs/i18n/README.md): the git blob hash of each
+# side as of the last confirmed-consistent state. Both languages carry equal authority;
+# after editing either side, bring the other along and re-record with:
+#   pnpm run verify-translation-pairing --write docs/superpowers/plans/2026-08-16-openai-codex-oauth-implementation.md
+2026-08-16-openai-codex-oauth-implementation.md: 99732b59342e322e332d0330eae4319f2d3945ab
+2026-08-16-openai-codex-oauth-implementation.zh.md: 21d7558f28c8d9b187f7c7db885109617f67f46e

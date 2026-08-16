@@ -17,8 +17,13 @@ import LlmRuntime, { LlmAdapter } from '@deepseek-ai/dsh-llm'
 import type { GenerateOptions, LlmModelInfo, LlmProviderInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
 import { SettingsProvider, settingsNamespace } from '@deepseek-ai/dsh-settings'
 import type { SettingsNamespace } from '@deepseek-ai/dsh-settings'
-import { CredentialProvider } from '@deepseek-ai/dsh-credentials'
-import type { CredentialInfo, CredentialRef, ResolvedCredential } from '@deepseek-ai/dsh-credentials'
+import { CredentialProvider, credentialRef } from '@deepseek-ai/dsh-credentials'
+import type {
+  CredentialInfo,
+  CredentialMutation,
+  CredentialRef,
+  ResolvedCredential,
+} from '@deepseek-ai/dsh-credentials'
 import type { HostFrame } from '../src/api/index.ts'
 import type { RpcRequest, RpcResponse } from '../src/api/rpc.ts'
 import { RpcId } from '../src/api/rpc.ts'
@@ -90,6 +95,7 @@ class MemorySettings extends SettingsProvider {
 /** In-memory credential provider with an env-shadow double for the rejection path. */
 class MemoryCredentials extends CredentialProvider {
   private readonly values = new Map<string, string>()
+  private operations: Promise<void> = Promise.resolve()
 
   constructor(ctx: ConstructorParameters<typeof CredentialProvider>[0], options?: { shadowed?: string[] }) {
     super(ctx)
@@ -111,21 +117,33 @@ class MemoryCredentials extends CredentialProvider {
   }
 
   set(ref: CredentialRef, value: string): Promise<void> {
-    if (this.shadowed.has(ref)) {
-      return Promise.reject(new Error(`credentials: ${ref} is shadowed by the read-only environment`))
-    }
-    this.values.set(ref, value)
-    this.ctx.emit('credentials/updated', ref)
-    return Promise.resolve()
+    return this.modify(ref, async () => ({ value, result: undefined, visibility: 'public' }))
   }
 
   unset(ref: CredentialRef): Promise<void> {
-    if (this.shadowed.has(ref)) {
-      return Promise.reject(new Error(`credentials: ${ref} is shadowed by the read-only environment`))
-    }
-    this.values.delete(ref)
-    this.ctx.emit('credentials/updated', ref)
-    return Promise.resolve()
+    return this.modify(ref, async () => ({ value: undefined, result: undefined, visibility: 'public' }))
+  }
+
+  modify<T>(
+    ref: CredentialRef,
+    mutate: (current: string | undefined) => Promise<CredentialMutation<T>>,
+  ): Promise<T> {
+    const task = this.operations.then(async () => {
+      if (this.shadowed.has(ref)) {
+        throw new Error(`credentials: ${ref} is shadowed by the read-only environment`)
+      }
+      const before = this.values.get(ref)
+      const mutation = await mutate(before)
+      if (mutation.value === '') throw new Error('credentials: an empty value cannot be stored')
+      if (mutation.value !== before) {
+        if (mutation.value === undefined) this.values.delete(ref)
+        else this.values.set(ref, mutation.value)
+        if (mutation.visibility === 'public') this.ctx.emit('credentials/updated', ref)
+      }
+      return mutation.result
+    })
+    this.operations = task.then(() => undefined, () => undefined)
+    return task
   }
 }
 
@@ -187,7 +205,7 @@ async function harness(options?: {
   // onboarding allowlists are the proxy's complete settings surface.
   if (options?.configurableProviders !== false) {
     ctx.llm.registerConfigurableProviders([
-      { provider: 'deepseek-official', displayName: 'DeepSeek', settingsNs: 'llm-deepseek', settingsPath: [] },
+      { provider: 'deepseek-official', displayName: 'DeepSeek', settingsNs: 'llm-deepseek', settingsPath: [], auth: { kind: 'api-key' } },
     ])
   }
   // Host-stream opener reads the committed-workspace baseline; the stub
@@ -230,7 +248,7 @@ function forwardedSettings(ns: string): HostFrame {
     type: 'host/remote-event',
     event: 'settings/document-updated',
     // The revision is the Host's own counter, so the matcher is the assertion.
-    args: [ns, expect.any(Number)], // oxlint-disable-line typescript/no-unsafe-assignment
+    args: [ns, expect.any(Number) as number],
   }
 }
 
@@ -616,14 +634,56 @@ describe('credentials domain', () => {
     const unsetError = expectErr(await api.credentials.unset(request({ ref: 'DEEPSEEK_API_KEY' })))
     expect(unsetError.code).toBe('credential-rejected')
   })
+
+  it('keeps fixed OAuth references outside every generic browser credential operation', async () => {
+    const ctx = await harness()
+    const api = createApiProxy(ctx, DEFAULTS)
+    const privateRefs = ['DSH_OPENAI_CODEX_OAUTH', 'DSH_OPENAI_CODEX_LOGIN_LEASE']
+    for (const ref of privateRefs) {
+      await ctx.credentials.modify(credentialRef(ref), async () => ({
+        value: 'private-browser-reservation-sentinel',
+        result: undefined,
+        visibility: 'private',
+      }))
+    }
+
+    const frames = await collectHost(api, ['host/remote-event'], 1, async () => {
+      for (const ref of privateRefs) {
+        const describeError = expectErr(await api.credentials.describe(request({ refs: [ref] })))
+        const setError = expectErr(await api.credentials.set(request({
+          ref,
+          value: 'browser-overwrite-sentinel',
+        })))
+        const unsetError = expectErr(await api.credentials.unset(request({ ref })))
+        for (const error of [describeError, setError, unsetError]) {
+          expect(error).toEqual({
+            code: 'credential-rejected',
+            message: 'Credential operation is unavailable.',
+            details: {},
+          })
+          expect(JSON.stringify(error)).not.toContain(ref)
+        }
+        await expect(ctx.credentials.resolve(credentialRef(ref))).resolves.toMatchObject({
+          value: 'private-browser-reservation-sentinel',
+        })
+      }
+      expectOk(await api.credentials.set(request({ ref: 'PUBLIC_BROWSER_KEY', value: 'public-value' })))
+    })
+
+    expect(frames).toEqual([{
+      type: 'host/remote-event',
+      event: 'credentials/updated',
+      args: ['PUBLIC_BROWSER_KEY'],
+    }])
+  })
 })
 
 describe('llm domain', () => {
   it('merges the configurable directory with live routes and appends undeclared ones', async () => {
     const ctx = await harness({ configurableProviders: false })
     ctx.llm.registerConfigurableProviders([
-      { provider: 'deepseek-official', displayName: 'DeepSeek', settingsNs: 'llm-deepseek', settingsPath: [] },
-      { provider: 'openai', displayName: 'openai', settingsNs: 'llm-pi-ai', settingsPath: ['providers', 'openai'] },
+      { provider: 'deepseek-official', displayName: 'DeepSeek', settingsNs: 'llm-deepseek', settingsPath: [], auth: { kind: 'api-key' } },
+      { provider: 'openai', displayName: 'openai', settingsNs: 'llm-pi-ai', settingsPath: ['providers', 'openai'], auth: { kind: 'api-key' } },
     ])
     ctx.llm.registerAdapter(['deepseek-official'], new CatalogAdapter('DeepSeek', ['deepseek-v4-flash']))
     ctx.llm.registerAdapter(['undeclared'], new CatalogAdapter('Undeclared', ['u-1']))
@@ -633,12 +693,43 @@ describe('llm domain', () => {
     const api = createApiProxy(ctx, DEFAULTS)
     const value = expectOk(await api.llm.providers(request({})))
     expect(value.providers).toEqual([
-      { provider: 'deepseek-official', displayName: 'DeepSeek', settingsNs: 'llm-deepseek', settingsPath: [], active: true },
-      { provider: 'openai', displayName: 'openai', settingsNs: 'llm-pi-ai', settingsPath: ['providers', 'openai'], active: false },
+      { provider: 'deepseek-official', displayName: 'DeepSeek', settingsNs: 'llm-deepseek', settingsPath: [], auth: { kind: 'api-key' }, active: true },
+      { provider: 'openai', displayName: 'openai', settingsNs: 'llm-pi-ai', settingsPath: ['providers', 'openai'], auth: { kind: 'api-key' }, active: false },
       // An undeclared live route has no settings address, so nothing can be
       // interrogated on its behalf either.
-      { provider: 'undeclared', displayName: 'Undeclared', settingsNs: '', settingsPath: [], active: true },
+      { provider: 'undeclared', displayName: 'Undeclared', settingsNs: '', settingsPath: [], auth: { kind: 'native' }, active: true },
     ])
+  })
+
+  it('keeps OAuth state out of the public provider catalog while its route is active', async () => {
+    const ctx = await harness({ configurableProviders: false })
+    ctx.llm.registerConfigurableProviders([{
+      provider: 'openai-codex', displayName: 'OpenAI Codex', settingsNs: 'llm-pi-ai',
+      settingsPath: ['providers', 'openai-codex'], auth: { kind: 'oauth' },
+    }])
+    ctx.llm.registerAdapter(['openai-codex'], new CatalogAdapter('OpenAI Codex', ['gpt-5.4']))
+    ctx.llm.registerOAuthController({
+      provider: 'openai-codex',
+      status: () => Promise.resolve({ provider: 'openai-codex', status: 'connecting' as const, accountId: 'acct-private' }),
+      start: () => Promise.resolve({ kind: 'connected' as const, connection: { provider: 'openai-codex', status: 'connected' as const } }),
+      cancel: () => Promise.resolve({ provider: 'openai-codex', status: 'missing' as const }),
+      disconnect: () => Promise.resolve({ provider: 'openai-codex', status: 'missing' as const }),
+    })
+    const api = createApiProxy(ctx, DEFAULTS)
+
+    expect(expectOk(await api.llm.providers(request({})))).toEqual({ providers: [{
+      provider: 'openai-codex', displayName: 'OpenAI Codex', settingsNs: 'llm-pi-ai',
+      settingsPath: ['providers', 'openai-codex'], auth: { kind: 'oauth' }, active: true,
+    }] })
+    expect(expectOk(await api.llm.models(request({})))).toEqual({
+      groups: [{
+        id: 'openai-codex', name: 'OpenAI Codex', models: [{ id: 'gpt-5.4', name: 'gpt-5.4' }],
+      }],
+      failures: [],
+    })
+    expect(expectOk(await api.llm.oauthStatus(request({ provider: 'openai-codex' })))).toEqual({
+      connection: { provider: 'openai-codex', status: 'connecting' },
+    })
   })
 
   it('serves the host-scoped catalog with per-provider failures contained', async () => {

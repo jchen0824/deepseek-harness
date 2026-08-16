@@ -49,6 +49,15 @@ export function err<T>(error: RpcError): RpcResponse<T> {
   return { rpcId: RpcId(`fake-${nextRpc++}`), result: { ok: false, error } }
 }
 
+function fakeOAuthResponse<T>(provider: string, value: T): Promise<RpcResponse<T>> {
+  if (provider === 'openai-codex') return Promise.resolve(ok(value))
+  return Promise.resolve(err({
+    code: 'internal',
+    message: 'OAuth connection is unavailable. Refresh the provider list and try again.',
+    details: {},
+  }))
+}
+
 type StreamItem<F> = { kind: 'frame'; envelope: RpcRequest<F> } | { kind: 'end' } | { kind: 'fail'; error: unknown }
 
 interface StreamConn<F> {
@@ -275,6 +284,27 @@ export class FakeApiClient implements IApiClient {
     providers: payload => this.record('llm.providers', payload, Promise.resolve(ok({ providers: [] }))),
     models: payload => this.record('llm.models', payload, Promise.resolve(ok({ groups: [], failures: [] }))),
     discoverModels: payload => this.record('llm.discoverModels', payload, Promise.resolve(ok({ models: [] }))),
+    oauthStart: payload => this.record('llm.oauthStart', payload, fakeOAuthResponse(payload.provider, {
+      connection: { provider: 'openai-codex', status: 'connecting' as const },
+      start: {
+        kind: 'device-code' as const,
+        deviceCode: {
+          verificationUri: 'https://auth.openai.com/codex/device',
+          userCode: 'ABCD-EFGH',
+          intervalSeconds: 5,
+          expiresInSeconds: 900,
+        },
+      },
+    })),
+    oauthStatus: payload => this.record('llm.oauthStatus', payload, fakeOAuthResponse(payload.provider, {
+      connection: { provider: 'openai-codex', status: 'missing' as const },
+    })),
+    oauthCancel: payload => this.record('llm.oauthCancel', payload, fakeOAuthResponse(payload.provider, {
+      connection: { provider: 'openai-codex', status: 'missing' as const },
+    })),
+    oauthDisconnect: payload => this.record('llm.oauthDisconnect', payload, fakeOAuthResponse(payload.provider, {
+      connection: { provider: 'openai-codex', status: 'missing' as const },
+    })),
   }
 
   /** When true, streams never fire onOpen (misbehaving-carrier material for the handshake timeout guard). */

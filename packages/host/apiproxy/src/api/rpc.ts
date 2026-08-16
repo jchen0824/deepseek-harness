@@ -75,8 +75,11 @@ export interface RpcErrorDetailsMap {
    * first. The details carry both revisions so a client can re-read and retry.
    */
   'settings-conflict': { ns: string; expected: number; actual: number }
-  /** A credential write was refused (read-only shadowing layer or storage failure); the message is the seam's own text. */
-  'credential-rejected': { ref: string }
+  /**
+   * A credential operation was refused. Ordinary storage failures name the
+   * public reference; reserved private references omit it.
+   */
+  'credential-rejected': { ref?: string }
   /**
    * Interrogating a draft provider endpoint did not produce a model listing:
    * no adapter family serves the namespace, the protocol has no listing this

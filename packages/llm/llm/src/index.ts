@@ -15,6 +15,10 @@ import type {
   LlmModelContext,
   LlmModelDiscoveryRequest,
   LlmModelInfo,
+  LlmOAuthConnection,
+  LlmOAuthConnectionStatus,
+  LlmOAuthController,
+  LlmOAuthStart,
   LlmResolvedModelInfo,
   LlmProviderInfo,
   ModelModality,
@@ -277,6 +281,14 @@ export interface DirectoryRegistrationHandle {
   replace(entries: readonly LlmConfigurableProvider[]): void
 }
 
+/** Return whether a value is one of the public OAuth connection states. */
+function isOAuthConnectionStatus(value: unknown): value is LlmOAuthConnectionStatus {
+  return value === 'missing'
+    || value === 'connecting'
+    || value === 'connected'
+    || value === 'reconnect-required'
+}
+
 /**
  * The abstract `llm` service: an adapter registry plus a streaming model-call
  * API, interceptable via the `llm/stream` waterfall.
@@ -284,6 +296,7 @@ export interface DirectoryRegistrationHandle {
 export class LlmRuntime extends Service {
   private adapters = new Map<string, AdapterRegistration>()
   private directory = new Map<string, LlmConfigurableProvider>()
+  private oauthControllers = new Map<string, LlmOAuthController>()
   private discoveries = new Map<
     string,
     (request: LlmModelDiscoveryRequest) => Promise<readonly LlmDiscoveredModel[]>
@@ -445,6 +458,11 @@ export class LlmRuntime extends Service {
         if (entry.provider.length === 0 || entry.displayName.length === 0 || entry.settingsNs.length === 0) {
           throw new LlmError('configurable providers need a non-empty provider, displayName, and settingsNs', 'INVALID_DIRECTORY')
         }
+        const auth: unknown = entry.auth
+        if (typeof auth !== 'object' || auth === null || !('kind' in auth) || typeof auth.kind !== 'string'
+          || !['api-key', 'oauth', 'native'].includes(auth.kind)) {
+          throw new LlmError('configurable providers need authentication metadata', 'INVALID_DIRECTORY')
+        }
         if (entry.settingsPath.some(segment => segment.length === 0)) {
           throw new LlmError(`configurable provider "${entry.provider}" has an empty settingsPath segment`, 'INVALID_DIRECTORY')
         }
@@ -452,7 +470,7 @@ export class LlmRuntime extends Service {
           || detached.some(seen => seen.provider === entry.provider)) {
           throw new LlmError(`configurable provider "${entry.provider}" is already declared`, 'DUPLICATE_DIRECTORY')
         }
-        detached.push({ ...entry, settingsPath: [...entry.settingsPath] })
+        detached.push({ ...entry, settingsPath: [...entry.settingsPath], auth: { ...entry.auth } })
       }
       for (const entry of held) this.directory.delete(entry.provider)
       for (const entry of detached) this.directory.set(entry.provider, entry)
@@ -488,7 +506,121 @@ export class LlmRuntime extends Service {
    * @returns detached directory entries in declaration order.
    */
   listConfigurableProviders(): LlmConfigurableProvider[] {
-    return [...this.directory.values()].map(entry => ({ ...entry, settingsPath: [...entry.settingsPath] }))
+    return [...this.directory.values()].map(entry => ({ ...entry, settingsPath: [...entry.settingsPath], auth: { ...entry.auth } }))
+  }
+
+  /**
+   * Register the controller that exclusively owns one OAuth-capable provider route.
+   * Public reads receive a facade bound to this provider, never the controller
+   * itself; every lifecycle result is reconstructed with only public fields.
+   * The contribution disposes with its registering fiber.
+   * @param controller - provider-owned lifecycle operations.
+   * @returns a disposer that withdraws the provider-bound facade.
+   */
+  registerOAuthController(controller: LlmOAuthController): () => void {
+    const dispose = this.ctx.effect(function* (this: LlmRuntime) {
+      const provider = controller.provider
+      if (typeof provider !== 'string' || provider.length === 0) {
+        throw new LlmError('OAuth controllers need a non-empty provider id', 'INVALID_OAUTH_CONTROLLER')
+      }
+      if (this.oauthControllers.has(provider)) {
+        throw new LlmError(`an OAuth controller for provider "${provider}" is already registered`, 'DUPLICATE_OAUTH_CONTROLLER')
+      }
+      const publicController = this.publicOAuthController(provider, controller)
+      this.oauthControllers.set(provider, publicController)
+      yield () => {
+        if (this.oauthControllers.get(provider) === publicController) {
+          this.oauthControllers.delete(provider)
+        }
+      }
+    }.bind(this), 'llm.registerOAuthController()')
+    return () => void dispose()
+  }
+
+  /** Bind controller results to the registered provider and copy only public fields. */
+  private publicOAuthController(provider: string, controller: LlmOAuthController): LlmOAuthController {
+    const connection = (candidate: LlmOAuthConnection): LlmOAuthConnection => {
+      if (!isOAuthConnectionStatus(candidate.status)) {
+        throw new LlmError('invalid OAuth connection status', 'INVALID_OAUTH_CONNECTION')
+      }
+      return { provider, status: candidate.status }
+    }
+    const deviceCode = (candidate: LlmOAuthStart & { kind: 'device-code' }): LlmOAuthStart => ({
+      kind: 'device-code',
+      connection: connection(candidate.connection),
+      deviceCode: {
+        verificationUri: candidate.deviceCode.verificationUri,
+        userCode: candidate.deviceCode.userCode,
+        ...candidate.deviceCode.intervalSeconds === undefined ? {} : { intervalSeconds: candidate.deviceCode.intervalSeconds },
+        ...candidate.deviceCode.expiresInSeconds === undefined ? {} : { expiresInSeconds: candidate.deviceCode.expiresInSeconds },
+      },
+    })
+    return {
+      provider,
+      status: async () => connection(await controller.status()),
+      start: async () => {
+        const started = await controller.start()
+        switch (started.kind) {
+          case 'device-code': return deviceCode(started)
+          case 'already-connecting': return { kind: 'already-connecting', connection: connection(started.connection) }
+          case 'connected': return { kind: 'connected', connection: connection(started.connection) }
+          default: throw new LlmError('invalid OAuth start result', 'INVALID_OAUTH_CONNECTION')
+        }
+      },
+      cancel: async () => connection(await controller.cancel()),
+      disconnect: async () => connection(await controller.disconnect()),
+    }
+  }
+
+  /**
+   * Look up the provider-bound facade registered for a provider route. Every
+   * lifecycle call returns detached connection data containing only its owner
+   * provider and declared public fields.
+   * @param provider - provider route whose controller to read.
+   * @returns the provider-bound public controller, when one is registered.
+   */
+  getOAuthController(provider: string): LlmOAuthController | undefined {
+    return this.oauthControllers.get(provider)
+  }
+
+  /**
+   * Broadcast a redacted OAuth lifecycle update. Device codes, account data,
+   * credentials, and provider errors are intentionally not accepted here.
+   * Listener failures are contained after the caller committed its transition.
+   * @param connection - provider route and valid public lifecycle status.
+   */
+  emitOAuthConnectionUpdated(connection: LlmOAuthConnection): void {
+    if (typeof connection.provider !== 'string' || connection.provider.length === 0) {
+      throw new LlmError('OAuth connection updates need a non-empty provider id', 'INVALID_OAUTH_CONNECTION')
+    }
+    if (!isOAuthConnectionStatus(connection.status)) {
+      throw new LlmError('invalid OAuth connection status', 'INVALID_OAUTH_CONNECTION')
+    }
+    const publicConnection = { provider: connection.provider, status: connection.status }
+    let invariantFailure: unknown
+    for (const listener of this.ctx.events.dispatch('emit', ['llm/oauth-connection-updated']) as Array<(connection: LlmOAuthConnection) => unknown>) {
+      try {
+        const returned = listener({ ...publicConnection })
+        if (returned != null && typeof (returned as PromiseLike<unknown>).then === 'function') {
+          void Promise.resolve(returned as PromiseLike<unknown>).then(undefined, (error: unknown) => {
+            this.warnOAuthConnectionListenerFailure(error)
+          })
+        }
+      } catch (error) {
+        if ((error as { code?: unknown } | null)?.code === 'INVARIANT') {
+          invariantFailure ??= error
+          continue
+        }
+        this.warnOAuthConnectionListenerFailure(error)
+      }
+    }
+    if (invariantFailure !== undefined) throw invariantFailure as Error
+  }
+
+  /** Contain OAuth update listener failures after the provider commits its state. */
+  private warnOAuthConnectionListenerFailure(error: unknown): void {
+    this.ctx.logger.warn('llm: an llm/oauth-connection-updated listener failed')
+    this.ctx.logger.warn(error)
   }
 
   /**

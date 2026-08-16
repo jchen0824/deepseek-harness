@@ -9,9 +9,9 @@
  */
 
 import { Context, Service } from '@deepseek-ai/cordis'
-import type { CredentialRef } from './types.ts'
+import type { CredentialMutation, CredentialRef } from './types.ts'
 
-export type { CredentialRef } from './types.ts'
+export type { CredentialMutation, CredentialMutationVisibility, CredentialRef } from './types.ts'
 
 const REF_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/
 
@@ -52,7 +52,7 @@ declare module '@deepseek-ai/cordis' {
 }
 
 /**
- * Abstract credential service. Providers implement the four operations over
+ * Abstract credential service. Providers implement the operations over
  * their source layers; one seam-wide rule binds them all: an empty stored
  * value is absent everywhere — `resolve` skips it, `describe` reports it
  * unconfigured — so a blank never masquerades as a configured secret.
@@ -98,29 +98,56 @@ export abstract class CredentialProvider extends Service {
    */
   abstract unset(ref: CredentialRef): Promise<void>
 
+  /**
+   * Atomically read and change one provider-managed stored value. The callback
+   * receives only that stored value, never an inherited environment value.
+   * Callers must keep private references and mutations in host code; this
+   * operation is not a browser-facing credential RPC.
+   * @typeParam T - caller-defined result returned after the mutation commits.
+   * @param ref - the host-only reference to change.
+   * @param mutate - derives the next stored value and caller result from the current stored value.
+   * @returns the mutation result after its value commits.
+   */
+  abstract modify<T>(
+    ref: CredentialRef,
+    mutate: (current: string | undefined) => Promise<CredentialMutation<T>>,
+  ): Promise<T>
+
   /* jscpd:ignore-start -- deliberate symmetry with the settings seam's commit
      fan-out: the contained-dispatch shape is the reviewed listener-lifecycle
      contract, and extracting it would couple the two seams' event semantics. */
-  /**
-   * Fan `credentials/updated` out with contained listener failures: every
-   * listener runs, and a sync throw or async rejection is logged without
-   * changing the committed operation's outcome — except `INVARIANT`-coded
-   * failures, which rethrow after every listener ran (the rethrow reaches the
-   * caller only from synchronous listeners, so invariant checks on this event
-   * must not be async functions). Providers call this only after the write or
-   * reload actually committed, so a broken observer can never make a durable
-   * change look failed.
-   * @param ref - the reference whose stored value changed.
-   */
+  /** Notify public credential consumers after one committed value change. */
   protected notifyUpdated(ref: CredentialRef): void {
+    this.notify('credentials/updated', [ref])
+  }
+
+  /** Notify host-private consumers after one committed private value change. */
+  protected notifyPrivateUpdated(): void {
+    this.notify('credentials/private-updated', [])
+  }
+
+  /**
+   * Fan one credential commit event out with contained listener failures:
+   * every listener runs, and a sync throw or async rejection is logged without
+   * changing the committed operation's outcome — except `INVARIANT`-coded
+   * failures, which rethrow after every listener ran. Providers call this only
+   * after the write or reload actually committed, so a broken observer can
+   * never make a durable change look failed.
+   * @param event - public reference-bearing or private payload-free event.
+   * @param listenerArgs - arguments delivered after the Cordis event key.
+   */
+  private notify(
+    event: 'credentials/updated' | 'credentials/private-updated',
+    listenerArgs: readonly CredentialRef[],
+  ): void {
     let invariantFailure: unknown
-    const args = ['credentials/updated', ref]
+    const args = [event, ...listenerArgs]
     for (const listener of this.ctx.events.dispatch('emit', args) as Array<(...listenerArgs: unknown[]) => unknown>) {
       try {
-        const returned = listener(ref)
+        const returned = listener(...listenerArgs)
         if (returned != null && typeof (returned as PromiseLike<unknown>).then === 'function') {
           void Promise.resolve(returned as PromiseLike<unknown>).then(undefined, (error: unknown) => {
-            this.warnListenerFailure(ref, error)
+            this.warnListenerFailure(event, error)
           })
         }
       } catch (error) {
@@ -128,7 +155,7 @@ export abstract class CredentialProvider extends Service {
           invariantFailure ??= error
           continue
         }
-        this.warnListenerFailure(ref, error)
+        this.warnListenerFailure(event, error)
       }
     }
     if (invariantFailure !== undefined) throw invariantFailure as Error
@@ -136,8 +163,8 @@ export abstract class CredentialProvider extends Service {
   /* jscpd:ignore-end */
 
   /** Contained-listener diagnostic shared by the sync and async failure paths. */
-  private warnListenerFailure(ref: CredentialRef, error: unknown): void {
-    this.ctx.logger.warn('credentials: a credentials/updated listener for "%s" failed', ref)
+  private warnListenerFailure(event: string, error: unknown): void {
+    this.ctx.logger.warn('credentials: a %s listener failed', event)
     this.ctx.logger.warn(error)
   }
 }

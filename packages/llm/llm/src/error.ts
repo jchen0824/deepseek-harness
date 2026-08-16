@@ -47,6 +47,9 @@ export const EMPTY_RESPONSE_CODE = 'EMPTY_RESPONSE'
  */
 export const INVALID_CREDENTIAL_CODE = 'INVALID_CREDENTIAL'
 
+/** Canonical provider-neutral code for a request that needs OAuth reconnection. */
+export const OAUTH_RECONNECT_REQUIRED_CODE = 'OAUTH_RECONNECT_REQUIRED'
+
 /** Structured codes and plain phrases that explicitly name a context bound being exceeded. */
 const STRUCTURED_CONTEXT_OVERFLOW = new RegExp(
   String.raw`(?:^|[^a-z0-9])context[\s_-](?:length|window)[\s_-]`

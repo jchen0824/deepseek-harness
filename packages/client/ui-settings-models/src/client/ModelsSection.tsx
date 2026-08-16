@@ -1,8 +1,9 @@
 /**
  * Models settings section: the provider rows joined from the configurable
  * directory, settings namespaces, and credential states, with one editor
- * card at a time. Rows expose only confirmed API-key state through accessible
- * solid configured or missing dots. A whole-section provider without a
+ * card at a time. API-key rows expose only confirmed key state through
+ * accessible solid dots; OAuth rows use a dedicated redacted connection card.
+ * A whole-section provider without a
  * configured key renders as its open setup card instead of a row, but only in
  * the first-run posture — no provider on the page can serve requests yet — and
  * only until the user closes that card; the add flow is a card carrying the
@@ -18,7 +19,8 @@ import type { IApiClient } from '@deepseek-ai/dsh-api-remotes/client'
 import { Button, IconPlusOutline16, Modal } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { SnapshotSelectorHook } from '@deepseek-ai/dsh-client-web-react'
 import { CustomProviderCard } from './CustomProviderCard.tsx'
-import { deriveKeyRef, messageOf, protocolChoices, providerUsable } from './store.ts'
+import { OAuthProviderCard } from './OAuthProviderCard.tsx'
+import { deriveKeyRef, messageOf, protocolChoices, providerUsable, usesOAuthLifecycle } from './store.ts'
 import type { ModelsSettingsState, ModelsSettingsStore, ProviderRow } from './store.ts'
 import { ProviderEditor, type ProviderEditorProps } from './ProviderEditor.tsx'
 import type { en } from './locales.ts'
@@ -58,7 +60,21 @@ interface EditorTarget extends ProviderIdentity {
   credentialRef?: string
   /** The adapter reports this route as one it does not ship (see {@link ProviderEditorProps.declared}). */
   declared?: boolean
+  /** Whether removal must disconnect the provider before deleting its profile. */
+  oauth?: boolean
 }
+
+const OAUTH_ACTION_FAILED = 'oauth-action-failed'
+const OAUTH_PROFILE_REMAINS = 'oauth-profile-remains'
+
+type ProviderRemovalTarget = {
+  settingsNs: string
+  settingsPath: readonly string[]
+  credentialRef?: string
+} & (
+  | { oauth: true; provider: string }
+  | { oauth?: false; provider?: string }
+)
 
 /** Values that vary around the shared provider-editor rendering. */
 interface ProviderEditorRenderProps extends Pick<
@@ -82,34 +98,48 @@ function renderProviderEditor({ target, ...props }: ProviderEditorRenderProps): 
 }
 
 /**
- * Remove one user-added provider and its page-managed credential. Credential
- * removal comes first so a second-step failure leaves the provider row visible
- * and the whole operation safely retryable; both unsets are idempotent.
+ * Remove one user-added provider and its page-managed authentication. OAuth
+ * disconnect or managed-key removal comes before profile deletion, so a later
+ * failure leaves the provider row visible and the operation safely retryable.
  * The settings removal names the profile rather than rebuilding its whole
  * namespace from a partial view.
- * @param api - settings and credential wire faces.
+ * @param api - settings, credential, and OAuth wire faces.
  * @param controller - the page store to refresh.
  * @param target - the provider's settings address and optional managed credential.
  * @returns the failure message, or undefined once the write and reload landed.
  */
 export async function removeProviderProfile(
-  api: Pick<IApiClient, 'settings' | 'credentials'>,
+  api: Pick<IApiClient, 'settings' | 'credentials' | 'llm'>,
   controller: ModelsSettingsStore,
-  target: { settingsNs: string; settingsPath: readonly string[]; credentialRef?: string },
+  target: ProviderRemovalTarget,
 ): Promise<string | undefined> {
+  let disconnected = false
   try {
+    if (target.oauth === true) {
+      const response = await api.llm.oauthDisconnect({ provider: target.provider })
+      if (!response.result.ok) return OAUTH_ACTION_FAILED
+      if (response.result.value.connection.status !== 'missing') {
+        await controller.load()
+        return OAUTH_ACTION_FAILED
+      }
+      disconnected = true
+      await controller.load()
+    }
     if (target.credentialRef !== undefined) {
       const credential = await api.credentials.unset({ ref: target.credentialRef })
-      if (!credential.result.ok) return credential.result.error.message
+      if (!credential.result.ok) {
+        return target.oauth === true ? OAUTH_PROFILE_REMAINS : credential.result.error.message
+      }
     }
     const response = await api.settings.mutate({
       ns: target.settingsNs,
       ops: [{ op: 'unset', path: [...target.settingsPath] }],
     })
-    if (!response.result.ok) return response.result.error.message
+    if (!response.result.ok) return target.oauth === true ? OAUTH_PROFILE_REMAINS : response.result.error.message
   } catch (error) {
     // The transport rejected rather than answering; the caller must be able
     // to retry the idempotent operation instead of the row silently staying.
+    if (target.oauth === true) return disconnected ? OAUTH_PROFILE_REMAINS : OAUTH_ACTION_FAILED
     return messageOf(error)
   }
   await controller.load()
@@ -127,6 +157,7 @@ export async function removeProviderProfile(
  */
 export function needsSetup(row: ProviderRow, anyUsable: boolean): boolean {
   if (anyUsable) return false
+  if (row.entry.auth.kind !== 'api-key') return false
   if (row.entry.settingsPath.length > 0) return false
   return row.credential?.configured !== true
 }
@@ -148,6 +179,7 @@ function targetOf(row: ProviderRow): EditorTarget {
     // route-level fields only a declared route owns off the card, exactly as
     // it leaves the custom tag off the row.
     ...row.entry.declared === true ? { declared: true } : {},
+    ...usesOAuthLifecycle(row) ? { oauth: true } : {},
   }
 }
 
@@ -226,7 +258,11 @@ function Loaded({ injected }: { injected: ModelsSectionInjected }): ReactNode {
     void removeProviderProfile(api, controller, deleteTarget)
       .then((failure) => {
         if (failure !== undefined) {
-          setDeleteFailure(failure)
+          setDeleteFailure(failure === OAUTH_PROFILE_REMAINS
+            ? t('oauthRemoveFailed')
+            : failure === OAUTH_ACTION_FAILED
+              ? t('oauthActionFailed')
+              : failure)
           return
         }
         setDeleteTarget(undefined)
@@ -262,8 +298,10 @@ function Loaded({ injected }: { injected: ModelsSectionInjected }): ReactNode {
   // One fact decides both first-run postures on this page and the onboarding
   // step: whether the user already has a provider to talk to.
   const anyUsable = state.rows.some(providerUsable)
-  const configured = state.rows.filter(row => row.configured)
-  const addable = state.rows.filter(row => !row.configured && row.entry.settingsNs !== '')
+  const oauthRows = state.rows.filter(row => usesOAuthLifecycle(row) && row.entry.settingsNs !== '')
+  const configured = state.rows.filter(row => row.configured && !usesOAuthLifecycle(row))
+  const addable = state.rows.filter(row =>
+    !row.configured && row.entry.auth.kind === 'api-key' && row.entry.settingsNs !== '')
   const addTarget = adding ? editing : undefined
   const addNamespace = addTarget === undefined ? undefined : state.namespaces.get(addTarget.settingsNs)
   // Hand-declared routes live in the pi-ai namespace, which is also the only
@@ -284,6 +322,26 @@ function Loaded({ injected }: { injected: ModelsSectionInjected }): ReactNode {
           </p>
         )}
       <ul className={styles['rows']}>
+        {oauthRows.map(row => (
+          <OAuthProviderCard
+            key={row.entry.provider}
+            row={row}
+            controller={controller}
+            api={api}
+            t={t}
+            readOnly={!state.writable}
+            {...row.removable
+              ? {
+                removeLabel: providerCopy(t('removeProvider'), targetOf(row)),
+                onRemove: () => {
+                  setSavedTarget(undefined)
+                  setDeleteFailure(undefined)
+                  setDeleteTarget(targetOf(row))
+                },
+              }
+              : {}}
+          />
+        ))}
         {configured.map((row) => {
           const target = targetOf(row)
           const namespace = state.namespaces.get(target.settingsNs)
@@ -305,7 +363,9 @@ function Loaded({ injected }: { injected: ModelsSectionInjected }): ReactNode {
               </li>
             )
           }
-          const open = !adding && editing?.provider === row.entry.provider
+          const editable = row.entry.auth.kind === 'api-key'
+            || (row.entry.auth.kind === 'oauth' && row.apiKeyEnv !== undefined)
+          const open = editable && !adding && editing?.provider === row.entry.provider
           const credentialConfigured = row.credential?.configured === true
           const credentialMissing = !credentialConfigured
             && row.apiKeyEnv !== undefined
@@ -342,22 +402,26 @@ function Loaded({ injected }: { injected: ModelsSectionInjected }): ReactNode {
                       : null}
                 </span>
                 <span className={styles['rowActions']}>
-                  <button
-                    type="button"
-                    className={styles['secondaryButton']}
-                    aria-label={providerCopy(t('editProvider'), target)}
-                    onClick={() => {
-                      setSavedTarget(undefined)
-                      // One card at a time: leaving `declaring` set would show
-                      // the create card beside this editor, and closing either
-                      // one discards the other's draft.
-                      setDeclaring(false)
-                      setAdding(false)
-                      setEditing(open ? undefined : target)
-                    }}
-                  >
-                    {t('edit')}
-                  </button>
+                  {editable
+                    ? (
+                      <button
+                        type="button"
+                        className={styles['secondaryButton']}
+                        aria-label={providerCopy(t('editProvider'), target)}
+                        onClick={() => {
+                          setSavedTarget(undefined)
+                          // One card at a time: leaving `declaring` set would show
+                          // the create card beside this editor, and closing either
+                          // one discards the other's draft.
+                          setDeclaring(false)
+                          setAdding(false)
+                          setEditing(open ? undefined : target)
+                        }}
+                      >
+                        {t('edit')}
+                      </button>
+                    )
+                    : null}
                   {row.removable
                     ? (
                       <button
@@ -494,9 +558,11 @@ function Loaded({ injected }: { injected: ModelsSectionInjected }): ReactNode {
         description={deleteTarget === undefined
           ? ''
           : providerCopy(
-            deleteTarget.credentialRef === undefined
-              ? t('deleteDescription')
-              : t('deleteDescriptionWithCredential'),
+            deleteTarget.oauth === true
+              ? t('deleteDescriptionOAuth')
+              : deleteTarget.credentialRef === undefined
+                ? t('deleteDescription')
+                : t('deleteDescriptionWithCredential'),
             deleteTarget,
           )}
         className={styles['deleteDialog'] as string}

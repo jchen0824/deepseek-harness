@@ -908,6 +908,8 @@ export interface Config {
    * and registers them the moment a settings section supplies profiles.
    */
   providers?: Record<string, PiAiProviderProfile>
+  /** Host-owned OAuth coordination configuration. */
+  oauth?: PiAiOAuthConfig
 }
 
 /** Configuration for one pi-ai provider route; the `providers` dict key IS the route. */
@@ -987,6 +989,12 @@ export interface PiAiProviderProfile {
   streamIdleTimeoutMs?: number
   /** Provider-owned model-request retry policy; omission uses normal defaults. */
   retryPolicy?: RetryPolicyConfig
+}
+
+/** Host-owned OpenAI Codex OAuth lifecycle configuration. */
+export interface PiAiOAuthConfig {
+  /** Lifetime and renewal basis for the private cross-process login lease. */
+  loginLeaseTtlMs?: number
 }
 
 /** One configured model entry: an id plus the catalog fields it overrides. */
@@ -1081,7 +1089,7 @@ type WithheldThinkingFormat = 'chat-template' | 'qwen-chat-template'
 
 依赖：`Api`（`@earendil-works/pi-ai`）· `CacheRetention`（`@earendil-works/pi-ai`）· `Model`（`@earendil-works/pi-ai`）· `ModelThinkingLevel`（`@earendil-works/pi-ai`）· `OpenAICompletionsCompat`（`@earendil-works/pi-ai`）· [`RetryPolicyConfig`](../packages/llm/llm/src/index.ts) · `ThinkingBudgets`（`@earendil-works/pi-ai`）· `Transport`（`@earendil-works/pi-ai`）
 
-来源：[`packages/llm/llm-pi-ai/src/config.ts:172`](../packages/llm/llm-pi-ai/src/config.ts)
+来源：[`packages/llm/llm-pi-ai/src/config.ts:187`](../packages/llm/llm-pi-ai/src/config.ts)
 
 <a id="deepseek-aidsh-llm-replay"></a>
 

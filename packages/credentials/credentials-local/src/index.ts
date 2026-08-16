@@ -45,7 +45,7 @@ import { withFileLock, writeFileAtomic } from '@deepseek-ai/dsh-atomic-write'
 import { canonicalizeWatchPath, resolveDshHome } from '@deepseek-ai/dsh-home-paths'
 import { launchEnvironmentOf } from '@deepseek-ai/dsh-launch-environment'
 import { CredentialProvider, credentialRef } from '@deepseek-ai/dsh-credentials'
-import type { CredentialInfo, CredentialRef, ResolvedCredential } from '@deepseek-ai/dsh-credentials'
+import type { CredentialInfo, CredentialMutation, CredentialMutationVisibility, CredentialRef, ResolvedCredential } from '@deepseek-ai/dsh-credentials'
 import type { LaunchEnvironmentEntry } from '@deepseek-ai/dsh-launch-environment'
 
 /** Basename of the credentials document inside the harness home. */
@@ -87,6 +87,9 @@ export function resolveSpec(config: Config): ResolvedSpec {
 /** Permission bits outside the owner; a credentials document must have none of them. */
 const GROUP_OTHER_BITS = 0o077
 
+/** Suffix for the owner-only metadata file that records privately changed references. */
+const PRIVATE_REFERENCES_SUFFIX = '.private-references.json'
+
 /**
  * Reject a credentials document other OS users can read, before its contents
  * are read at all. The provider creates and replaces the file at `0600`, but a
@@ -124,6 +127,43 @@ async function assertOwnerOnly(filename: string): Promise<void> {
 /** Whether a filesystem error means absence; every non-ENOENT failure must surface. */
 function isENOENT(error: unknown): boolean {
   return (error as NodeJS.ErrnoException | null)?.code === 'ENOENT'
+}
+
+/**
+ * Read the private-reference metadata. It contains identifiers only, never
+ * values, and must be owner-only for the same reason as the credentials file.
+ * @param filename - absolute metadata file path.
+ * @returns references whose reconciliation updates must stay private.
+ */
+async function readPrivateReferences(filename: string): Promise<Set<CredentialRef>> {
+  await assertOwnerOnly(filename)
+  let text: string
+  try {
+    text = await readFile(filename, 'utf8')
+  } catch (error) {
+    if (isENOENT(error)) return new Set<CredentialRef>()
+    throw error
+  }
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(text)
+  } catch {
+    throw new Error(`credentials-local: invalid private reference metadata at ${filename}`)
+  }
+  if (!Array.isArray(parsed) || !parsed.every((ref): ref is string => typeof ref === 'string')) {
+    throw new TypeError(`credentials-local: private reference metadata at ${filename} must be a string array`)
+  }
+  return new Set(parsed.map(ref => credentialRef(ref)))
+}
+
+/**
+ * Atomically persist private-reference metadata with owner-only permissions.
+ * @param filename - absolute metadata file path.
+ * @param refs - current private references for the matching credentials file.
+ */
+async function writePrivateReferences(filename: string, refs: Set<CredentialRef>): Promise<void> {
+  await assertOwnerOnly(filename)
+  await writeFileAtomic(filename, `${JSON.stringify([...refs])}\n`, { mode: 0o600, dirMode: 0o700 })
 }
 
 /**
@@ -216,6 +256,8 @@ export class LocalCredentialProvider extends CredentialProvider {
   })
 
   private readonly spec: ResolvedSpec
+  /** Owner-only metadata for private reference visibility, paired with {@link spec.filename}. */
+  private readonly privateReferencesFilename: string
   /**
    * Raw text of the last read or persisted document; `undefined` while the
    * file is absent. Watcher events whose content equals this cache are no-ops,
@@ -244,6 +286,7 @@ export class LocalCredentialProvider extends CredentialProvider {
     // Programmatic construction may bypass Schemastery normalization; resolve
     // the same defaults in one explicit step either way.
     this.spec = resolveSpec(config)
+    this.privateReferencesFilename = `${this.spec.filename}${PRIVATE_REFERENCES_SUFFIX}`
   }
 
   /** The inherited-environment value for a reference, or `undefined` when empty or unset. */
@@ -334,11 +377,11 @@ export class LocalCredentialProvider extends CredentialProvider {
     if (value.length === 0) {
       throw new Error(`credentials-local: an empty value cannot be stored for "${ref}"; use unset`)
     }
-    await this.write(ref, value)
+    await this.mutate(ref, () => Promise.resolve({ value, result: undefined, visibility: 'public' }), 'set')
   }
 
   override async unset(ref: CredentialRef): Promise<void> {
-    await this.write(ref, undefined)
+    await this.mutate(ref, () => Promise.resolve({ value: undefined, result: undefined, visibility: 'public' }), 'unset')
   }
 
   /* jscpd:ignore-start -- the operation-chain and reload lifecycle is the same
@@ -365,9 +408,12 @@ export class LocalCredentialProvider extends CredentialProvider {
   }
   /* jscpd:ignore-end */
 
-  /** Queue one line edit; entry checks reject early, the queue re-judges them at run time. */
-  private async write(ref: CredentialRef, value: string | undefined): Promise<void> {
-    const verb = value === undefined ? 'unset' : 'set'
+  /** Atomically read, change, and commit one stored credential under the shared writer lock. */
+  private async mutate<T>(
+    ref: CredentialRef,
+    mutate: (current: string | undefined) => Promise<CredentialMutation<T>>,
+    verb: 'set' | 'unset' | 'modify',
+  ): Promise<T> {
     if (this.isClosed()) {
       throw new Error(`credentials-local is disposed: cannot ${verb} "${ref}"`)
     }
@@ -381,25 +427,68 @@ export class LocalCredentialProvider extends CredentialProvider {
       // The writer lock's exclusive create needs the parent to exist; 0700
       // because the harness home holds user-private data.
       await mkdir(dirname(this.spec.filename), { recursive: true, mode: 0o700 })
-      await withFileLock(this.spec.filename, async () => {
+      return withFileLock(this.spec.filename, async () => {
         // Read-modify-write: fold in any on-disk state this process has not
         // observed yet — an external edit still inside the watcher debounce
         // window, a change the watcher missed, or another process's write —
         // so the line edit below can never resurrect a stale document.
-        await this.reconcileFromDisk()
-        const existing = this.values.get(ref)
-        if (value === undefined && existing === undefined) return
-        const nextText = renderDocument(this.text, ref, value)
-        // 0600: a document holding secrets is never world-readable.
-        await writeFileAtomic(this.spec.filename, nextText, { mode: 0o600, dirMode: 0o700 })
-        this.text = nextText
-        if (value === undefined) this.values.delete(ref)
-        else this.values.set(ref, value)
-        // After the commit: a broken observer must never make the durable
-        // write look failed (an INVARIANT failure still rethrows).
-        this.notifyUpdated(ref)
+        await this.reconcileLockedFromDisk()
+        this.assertUnshadowed(ref, verb)
+        const before = this.values.get(ref)
+        // The file lock deliberately stays held across this async callback:
+        // its read-derived replacement must serialize with every process that
+        // writes this document.
+        const mutation = await mutate(before)
+        if (mutation.value === '') {
+          throw new Error(`credentials-local: an empty value cannot be stored for "${ref}"; use unset`)
+        }
+        const changed = await this.commitMutation(ref, mutation.value, mutation.visibility)
+        if (!changed) return mutation.result
+        if (mutation.visibility === 'public') this.notifyUpdated(ref)
+        else this.notifyPrivateUpdated()
+        return mutation.result
       })
     })
+  }
+
+  /** Expose one host-only atomic mutation through the credential service. */
+  override modify<T>(
+    ref: CredentialRef,
+    mutate: (current: string | undefined) => Promise<CredentialMutation<T>>,
+  ): Promise<T> {
+    return this.mutate(ref, mutate, 'modify')
+  }
+
+  /** Persist a changed stored value and refresh the local snapshot. */
+  private async commitMutation(
+    ref: CredentialRef,
+    value: string | undefined,
+    visibility: CredentialMutationVisibility,
+  ): Promise<boolean> {
+    const previousPrivateRefs = await readPrivateReferences(this.privateReferencesFilename)
+    const nextPrivateRefs = new Set(previousPrivateRefs)
+    if (visibility === 'private') nextPrivateRefs.add(ref)
+    else nextPrivateRefs.delete(ref)
+    const privateRefsChanged = nextPrivateRefs.size !== previousPrivateRefs.size
+    if (this.values.get(ref) === value) {
+      if (privateRefsChanged) await writePrivateReferences(this.privateReferencesFilename, nextPrivateRefs)
+      return privateRefsChanged
+    }
+    const nextText = renderDocument(this.text, ref, value)
+    // Mark the visibility before changing the document: a peer that sees the
+    // new text can then classify it even when it runs in another process.
+    if (privateRefsChanged) await writePrivateReferences(this.privateReferencesFilename, nextPrivateRefs)
+    try {
+      // 0600: a document holding secrets is never world-readable.
+      await writeFileAtomic(this.spec.filename, nextText, { mode: 0o600, dirMode: 0o700 })
+    } catch (error) {
+      if (privateRefsChanged) await writePrivateReferences(this.privateReferencesFilename, previousPrivateRefs)
+      throw error
+    }
+    this.text = nextText
+    if (value === undefined) this.values.delete(ref)
+    else this.values.set(ref, value)
+    return true
   }
 
   /**
@@ -407,7 +496,7 @@ export class LocalCredentialProvider extends CredentialProvider {
    * no-effect. Only that layer can shadow a write: everything else this
    * provider resolves ranks below the document being written.
    */
-  private assertUnshadowed(ref: CredentialRef, verb: 'set' | 'unset'): void {
+  private assertUnshadowed(ref: CredentialRef, verb: 'set' | 'unset' | 'modify'): void {
     if (this.inherited(ref) !== undefined) {
       throw new Error(
         `credentials-local: "${ref}" is supplied read-only by the launching environment, so ${verb} would be`
@@ -455,14 +544,22 @@ export class LocalCredentialProvider extends CredentialProvider {
     }
   }
 
-  /**
-   * Compare the on-disk text against the cache and publish any difference
-   * into the seam. Absence publishes the empty store; an unreadable or
-   * invalid document throws, so each caller picks its policy — a reload warns
-   * and keeps the last good snapshot, a write fails loud rather than
-   * overwriting a document it could not understand.
-   */
+  /** Acquire the main writer lock before reconciling credential and visibility snapshots. */
   private async reconcileFromDisk(): Promise<void> {
+    // The lock's exclusive create needs the parent even for a watcher reload
+    // that observes an absent document.
+    await mkdir(dirname(this.spec.filename), { recursive: true, mode: 0o700 })
+    await withFileLock(this.spec.filename, async () => this.reconcileLockedFromDisk())
+  }
+
+  /**
+   * Compare the locked credential and visibility snapshots against the cache
+   * and publish any difference into the seam. Absence publishes the empty
+   * store; an unreadable or invalid document throws, so each caller picks its
+   * policy — a reload warns and keeps the last good snapshot, a write fails
+   * loud rather than overwriting a document it could not understand.
+   */
+  private async reconcileLockedFromDisk(): Promise<void> {
     // Re-checked on every reload and before every write: an external editor or
     // a restored backup can loosen the mode after boot.
     await assertOwnerOnly(this.spec.filename)
@@ -475,10 +572,16 @@ export class LocalCredentialProvider extends CredentialProvider {
     }
     if (text === this.text || this.isClosed()) return
     const next = text === undefined ? new Map<string, string>() : parseCredentialsDocument(text, this.spec.filename)
+    const privateRefs = await readPrivateReferences(this.privateReferencesFilename)
     const changed = this.changedRefs(this.values, next)
     this.text = text
     this.values = next
-    for (const ref of changed) this.notifyUpdated(ref)
+    let privateChanged = false
+    for (const ref of changed) {
+      if (privateRefs.has(ref)) privateChanged = true
+      else this.notifyUpdated(ref)
+    }
+    if (privateChanged) this.notifyPrivateUpdated()
   }
   /* jscpd:ignore-end */
 

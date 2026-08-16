@@ -15,6 +15,8 @@ import type {
   LlmResolvedModelInfo, StreamChunk,
   UserMessage,
 } from '@deepseek-ai/dsh-llm'
+import { PiAiAdapter } from '@deepseek-ai/dsh-llm-pi-ai'
+import { resolveProfiles } from '../../../llm/llm-pi-ai/src/config.ts'
 import SessionStore from '@deepseek-ai/dsh-session'
 import type { SessionId } from '@deepseek-ai/dsh-session'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
@@ -449,6 +451,80 @@ describe('Web session model selection', () => {
     await ctx.fiber.dispose()
   })
 
+  it('offers Codex only while its OAuth-backed route is registered and keeps selection scopes intact', async () => {
+    const { ctx, sessionId } = await harness()
+    const logged = ctx.sessions.create()
+    logged.append('request/header', {
+      header: { config: { provider: 'deepseek-official', model: 'deepseek-reasoner' } },
+      reason: 'initial',
+    })
+    ctx.agents.register({
+      id: logged.id,
+      session: logged,
+      status: 'running',
+      ctx,
+      inbox: { nextTurn: [], nextStep: [] },
+    } as unknown as Agent)
+    let stored = { provider: 'deepseek-official', model: 'deepseek-chat' }
+    const saved: unknown[] = []
+    const api = createApiProxy(ctx, {
+      defaultModelSelection: () => stored,
+      saveDefaultModelSelection: (selection) => {
+        stored = selection
+        saved.push(selection)
+        return Promise.resolve()
+      },
+      cwd: '/tmp',
+    })
+
+    expect(expectValue(await api.sessions.models(request({ sessionId }))).groups)
+      .not.toEqual(expect.arrayContaining([expect.objectContaining({ id: 'openai-codex' })]))
+    expect((await api.sessions.selectModel(request({
+      sessionId, provider: 'openai-codex', model: 'gpt-5.4', reasoningEffort: 'high',
+    }))).result).toMatchObject({ ok: false, error: { code: 'model-unavailable' } })
+
+    const profiles = resolveProfiles({ 'openai-codex': {} })
+    const connectedRoute = ctx.llm.registerAdapter(['openai-codex'], new PiAiAdapter({
+      profiles: () => profiles,
+      resolveApiKey: () => Promise.resolve(undefined),
+    }))
+    const catalog = expectValue(await api.sessions.models(request({ sessionId })))
+    expect(catalog.groups.some(group => group.id === 'openai-codex'
+      && group.models.some(model => model.id === 'gpt-5.4'
+        && model.reasoning?.efforts.some(effort => effort.id === 'high') === true))).toBe(true)
+
+    expectValue(await api.sessions.selectModel(request({
+      sessionId,
+      provider: 'openai-codex',
+      model: 'gpt-5.4',
+      reasoningEffort: 'high',
+    })))
+    expect(saved).toEqual([{ provider: 'openai-codex', model: 'gpt-5.4', reasoningEffort: 'high' }])
+    expect(expectValue(await api.sessions.models(request({ sessionId }))).current)
+      .toEqual({ provider: 'openai-codex', model: 'gpt-5.4', reasoningEffort: 'high' })
+    expect(expectValue(await api.sessions.models(request({ sessionId: logged.id }))).current)
+      .toEqual({ provider: 'deepseek-official', model: 'deepseek-reasoner' })
+
+    const blank = ctx.sessions.create()
+    ctx.agents.register({
+      id: blank.id,
+      session: blank,
+      status: 'running',
+      ctx,
+      inbox: { nextTurn: [], nextStep: [] },
+    } as unknown as Agent)
+    expect(expectValue(await api.sessions.models(request({ sessionId: blank.id }))).current)
+      .toEqual({ provider: 'openai-codex', model: 'gpt-5.4', reasoningEffort: 'high' })
+
+    connectedRoute()
+    expect(expectValue(await api.sessions.models(request({ sessionId }))).groups)
+      .not.toEqual(expect.arrayContaining([expect.objectContaining({ id: 'openai-codex' })]))
+    expect((await api.sessions.selectModel(request({
+      sessionId, provider: 'openai-codex', model: 'gpt-5.4', reasoningEffort: 'high',
+    }))).result).toMatchObject({ ok: false, error: { code: 'model-unavailable' } })
+    await ctx.fiber.dispose()
+  })
+
   it('refuses a prompt no adapter can route, and reports it on the directory', async () => {
     const { ctx, sessionId } = await harness()
     const api = createApiProxy(ctx, {
@@ -495,6 +571,155 @@ describe('Web session model selection', () => {
     expect(catalog.current).toEqual({ provider: 'deleted-gateway', model: 'deleted-model' })
     expect(catalog.groups.flatMap(group => group.models.map(model => `${group.id}/${model.id}`)))
       .not.toContain('deleted-gateway/deleted-model')
+    await ctx.fiber.dispose()
+  })
+
+  it('exposes only configured provider-bound OAuth lifecycle state and sanitizes failures', async () => {
+    const { ctx } = await harness()
+    ctx.llm.registerConfigurableProviders([
+      {
+        provider: 'openai-codex', displayName: 'OpenAI Codex', settingsNs: 'llm-pi-ai',
+        settingsPath: ['providers', 'openai-codex'], auth: { kind: 'oauth' },
+      },
+      {
+        provider: 'openai', displayName: 'OpenAI', settingsNs: 'llm-pi-ai',
+        settingsPath: ['providers', 'openai'], auth: { kind: 'api-key' },
+      },
+    ])
+    let failStart = false
+    let failAction: 'check' | 'cancel' | 'disconnect' | undefined
+    ctx.llm.registerOAuthController({
+      provider: 'openai-codex',
+      status: () => {
+        if (failAction === 'check') throw new Error('provider status account=acct-private')
+        return Promise.resolve({ provider: 'openai-codex', status: 'connected' as const, accountId: 'acct-private' })
+      },
+      start: () => {
+        if (failStart) throw new Error('provider denied refresh=private-refresh access=private-access')
+        return Promise.resolve({
+          kind: 'device-code' as const,
+          connection: { provider: 'openai-codex', status: 'connecting' as const, accountId: 'acct-private' },
+          deviceCode: {
+            verificationUri: 'https://auth.openai.com/codex/device',
+            userCode: 'ABCD-EFGH',
+            intervalSeconds: 5,
+            expiresInSeconds: 900,
+            access: 'private-access',
+          },
+          leaseRef: 'OPENAI_CODEX_OAUTH',
+        })
+      },
+      cancel: () => {
+        if (failAction === 'cancel') throw new Error('provider cancel refresh=private-refresh')
+        return Promise.resolve({ provider: 'openai-codex', status: 'missing' as const, refresh: 'private-refresh' })
+      },
+      disconnect: () => {
+        if (failAction === 'disconnect') throw new Error('provider disconnect lease=OPENAI_CODEX_OAUTH')
+        return Promise.resolve({ provider: 'openai-codex', status: 'missing' as const, accountId: 'acct-private' })
+      },
+    })
+    const api = createApiProxy(ctx, {
+      defaultModelSelection: () => ({ provider: 'deepseek-official', model: 'deepseek-chat' }),
+      cwd: '/tmp',
+    })
+
+    expect(expectValue(await api.llm.oauthStart(request({ provider: 'openai-codex' })))).toEqual({
+      connection: { provider: 'openai-codex', status: 'connecting' },
+      start: {
+        kind: 'device-code',
+        deviceCode: {
+          verificationUri: 'https://auth.openai.com/codex/device',
+          userCode: 'ABCD-EFGH',
+          intervalSeconds: 5,
+          expiresInSeconds: 900,
+        },
+      },
+    })
+    expect(expectValue(await api.llm.oauthStatus(request({ provider: 'openai-codex' }))))
+      .toEqual({ connection: { provider: 'openai-codex', status: 'connected' } })
+    expect(expectValue(await api.llm.oauthCancel(request({ provider: 'openai-codex' }))))
+      .toEqual({ connection: { provider: 'openai-codex', status: 'missing' } })
+    expect(expectValue(await api.llm.oauthDisconnect(request({ provider: 'openai-codex' }))))
+      .toEqual({ connection: { provider: 'openai-codex', status: 'missing' } })
+
+    const unknown = await api.llm.oauthStart(request({ provider: 'arbitrary-provider' }))
+    const nonOAuth = await api.llm.oauthStart(request({ provider: 'openai' }))
+    expect(unknown.result).toEqual(nonOAuth.result)
+    expect(unknown.result).toEqual({
+      ok: false,
+      error: {
+        code: 'internal',
+        message: 'OAuth connection is unavailable. Refresh the provider list and try again.',
+        details: {},
+      },
+    })
+
+    failStart = true
+    const failed = await api.llm.oauthStart(request({ provider: 'openai-codex' }))
+    expect(failed.result).toEqual({
+      ok: false,
+      error: {
+        code: 'internal',
+        message: 'Unable to start the OAuth connection. Try again.',
+        details: {},
+      },
+    })
+    expect(JSON.stringify(failed)).not.toMatch(/provider denied|refresh|access|account|lease|OPENAI_CODEX_OAUTH/)
+
+    for (const [action, invoke, message] of [
+      ['check', () => api.llm.oauthStatus(request({ provider: 'openai-codex' })), 'Unable to check the OAuth connection. Try again.'],
+      ['cancel', () => api.llm.oauthCancel(request({ provider: 'openai-codex' })), 'Unable to cancel the OAuth connection. Try again.'],
+      ['disconnect', () => api.llm.oauthDisconnect(request({ provider: 'openai-codex' })), 'Unable to disconnect the OAuth connection. Try again.'],
+    ] as const) {
+      failAction = action
+      const actionFailed = await invoke()
+      expect(actionFailed.result).toEqual({
+        ok: false,
+        error: { code: 'internal', message, details: {} },
+      })
+      expect(JSON.stringify(actionFailed)).not.toMatch(/provider|refresh|access|account|lease|OPENAI_CODEX_OAUTH/)
+    }
+    await ctx.fiber.dispose()
+  })
+
+  it('refuses OAuth lifecycle RPCs for a key-authenticated Codex profile before controller calls', async () => {
+    const { ctx } = await harness()
+    ctx.llm.registerConfigurableProviders([{
+      provider: 'openai-codex', displayName: 'OpenAI Codex', settingsNs: 'llm-pi-ai',
+      settingsPath: ['providers', 'openai-codex'], auth: { kind: 'api-key' },
+    }])
+    const status = vi.fn(() => Promise.resolve({ provider: 'openai-codex', status: 'connected' as const }))
+    const start = vi.fn(() => Promise.resolve({
+      kind: 'connected' as const,
+      connection: { provider: 'openai-codex', status: 'connected' as const },
+    }))
+    const cancel = vi.fn(() => Promise.resolve({ provider: 'openai-codex', status: 'missing' as const }))
+    const disconnect = vi.fn(() => Promise.resolve({ provider: 'openai-codex', status: 'missing' as const }))
+    ctx.llm.registerOAuthController({ provider: 'openai-codex', status, start, cancel, disconnect })
+    const api = createApiProxy(ctx, {
+      defaultModelSelection: () => ({ provider: 'deepseek-official', model: 'deepseek-chat' }),
+      cwd: '/tmp',
+    })
+
+    for (const invoke of [
+      () => api.llm.oauthStart(request({ provider: 'openai-codex' })),
+      () => api.llm.oauthStatus(request({ provider: 'openai-codex' })),
+      () => api.llm.oauthCancel(request({ provider: 'openai-codex' })),
+      () => api.llm.oauthDisconnect(request({ provider: 'openai-codex' })),
+    ]) {
+      expect((await invoke()).result).toEqual({
+        ok: false,
+        error: {
+          code: 'internal',
+          message: 'OAuth connection is unavailable. Refresh the provider list and try again.',
+          details: {},
+        },
+      })
+    }
+    expect(status).not.toHaveBeenCalled()
+    expect(start).not.toHaveBeenCalled()
+    expect(cancel).not.toHaveBeenCalled()
+    expect(disconnect).not.toHaveBeenCalled()
     await ctx.fiber.dispose()
   })
 })

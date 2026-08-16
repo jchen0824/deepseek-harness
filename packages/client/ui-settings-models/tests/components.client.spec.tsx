@@ -150,12 +150,12 @@ function scriptedFace(overrides: {
     llm: {
       providers: vi.fn(() => Promise.resolve(ok({
         providers: [
-          { provider: 'deepseek-official', displayName: 'DeepSeek', settingsNs: 'llm-deepseek', settingsPath: [], active: true },
-          { provider: 'openai', displayName: 'openai', settingsNs: 'llm-pi-ai', settingsPath: ['providers', 'openai'], active: true },
-          { provider: 'anthropic', displayName: 'anthropic', settingsNs: 'llm-pi-ai', settingsPath: ['providers', 'anthropic'], active: false },
-          { provider: 'zombie', displayName: 'zombie', settingsNs: 'llm-pi-ai', settingsPath: ['providers', 'zombie'], active: false },
-          { provider: 'broken', displayName: 'broken', settingsNs: 'llm-pi-ai', settingsPath: ['nope', 'x'], active: false },
-          { provider: 'plain', displayName: 'plain', settingsNs: 'llm-plain', settingsPath: ['profiles', 'plain'], active: false },
+          { provider: 'deepseek-official', displayName: 'DeepSeek', settingsNs: 'llm-deepseek', settingsPath: [], active: true, auth: { kind: 'api-key' } },
+          { provider: 'openai', displayName: 'openai', settingsNs: 'llm-pi-ai', settingsPath: ['providers', 'openai'], active: true, auth: { kind: 'api-key' } },
+          { provider: 'anthropic', displayName: 'anthropic', settingsNs: 'llm-pi-ai', settingsPath: ['providers', 'anthropic'], active: false, auth: { kind: 'api-key' } },
+          { provider: 'zombie', displayName: 'zombie', settingsNs: 'llm-pi-ai', settingsPath: ['providers', 'zombie'], active: false, auth: { kind: 'api-key' } },
+          { provider: 'broken', displayName: 'broken', settingsNs: 'llm-pi-ai', settingsPath: ['nope', 'x'], active: false, auth: { kind: 'api-key' } },
+          { provider: 'plain', displayName: 'plain', settingsNs: 'llm-plain', settingsPath: ['profiles', 'plain'], active: false, auth: { kind: 'api-key' } },
         ],
       }))),
       models: vi.fn(() => Promise.resolve(ok({ groups: [], failures: [] }))),
@@ -224,6 +224,391 @@ async function mountDeepSeekCard(overrides: Parameters<typeof scriptedFace>[0] =
   fireEvent.click(screen.getByRole('button', { name: deepSeekCopy(en.editProvider) }))
   return mounted
 }
+
+type OAuthStatus = 'missing' | 'connecting' | 'connected' | 'reconnect-required'
+
+function oauthNamespace(configured: boolean, apiKeyEnv?: string): SettingsNamespaceView {
+  const providers = configured
+    ? { 'openai-codex': apiKeyEnv === undefined ? {} : { apiKeyEnv } }
+    : {}
+  return {
+    ns: 'llm-pi-ai',
+    schema: JSON.parse(JSON.stringify(PiAiConfig.toJSON())) as unknown,
+    value: { providers },
+    base: { providers: {} },
+    user: { providers },
+    applies: 'live',
+    secrets: [],
+    revision: 4,
+  }
+}
+
+function scriptedOAuthFace(options: {
+  status?: OAuthStatus
+  configured?: boolean
+  apiKeyEnv?: string
+  removeFailure?: string
+  startFailure?: string
+  deferProfileMutation?: boolean
+  deferStart?: boolean
+  disconnectStatus?: OAuthStatus
+} = {}) {
+  let status = options.status ?? 'missing'
+  let configured = options.configured ?? (options.apiKeyEnv !== undefined || status !== 'missing')
+  const providers = vi.fn(() => Promise.resolve(ok({
+    providers: [{
+      provider: 'openai-codex',
+      displayName: 'OpenAI Codex',
+      settingsNs: 'llm-pi-ai',
+      settingsPath: ['providers', 'openai-codex'],
+      active: configured,
+      auth: { kind: 'oauth' as const },
+    }],
+  })))
+  let resolveDeferredProfileMutation: (() => void) | undefined
+  const mutate = vi.fn((request: { ops: { op: 'set' | 'unset' }[] }) => {
+    const operation = request.ops[0]
+    if (operation?.op === 'unset' && options.removeFailure !== undefined) {
+      return Promise.resolve(fail(options.removeFailure))
+    }
+    configured = operation?.op === 'set'
+    const response = ok(oauthNamespace(configured, options.apiKeyEnv))
+    if (operation?.op === 'set' && options.deferProfileMutation === true) {
+      return new Promise<typeof response>((resolve) => {
+        resolveDeferredProfileMutation = () => { resolve(response) }
+      })
+    }
+    return Promise.resolve(response)
+  })
+  let resolveDeferredStart: (() => void) | undefined
+  const deviceCodeStart = () => ok({
+    connection: { provider: 'openai-codex', status: 'connecting' as const },
+    start: {
+      kind: 'device-code' as const,
+      deviceCode: {
+        verificationUri: 'https://example.test/device',
+        userCode: 'ABCD-EFGH',
+        intervalSeconds: 5,
+        expiresInSeconds: 900,
+      },
+    },
+  })
+  const oauthStart = vi.fn(() => {
+    if (options.startFailure !== undefined) return Promise.resolve(fail(options.startFailure))
+    if (options.deferStart === true) {
+      return new Promise<ReturnType<typeof deviceCodeStart>>((resolve) => {
+        resolveDeferredStart = () => { resolve(deviceCodeStart()) }
+      })
+    }
+    status = 'connecting'
+    return Promise.resolve(deviceCodeStart())
+  })
+  const oauthCancel = vi.fn(() => {
+    status = 'missing'
+    return Promise.resolve(ok({ connection: { provider: 'openai-codex', status } }))
+  })
+  const oauthDisconnect = vi.fn(() => {
+    status = options.disconnectStatus ?? 'missing'
+    return Promise.resolve(ok({ connection: { provider: 'openai-codex', status } }))
+  })
+  const face = {
+    llm: {
+      providers,
+      models: vi.fn(() => Promise.resolve(ok({ groups: [], failures: [] }))),
+      oauthStart,
+      oauthStatus: vi.fn(() => Promise.resolve(ok({ connection: { provider: 'openai-codex', status } }))),
+      oauthCancel,
+      oauthDisconnect,
+    },
+    settings: {
+      describe: vi.fn(() => Promise.resolve(ok({
+        writable: true,
+        hasDocument: true,
+        namespaces: [oauthNamespace(configured, options.apiKeyEnv)],
+      }))),
+      update: vi.fn(),
+      replace: vi.fn(),
+      mutate,
+    },
+    credentials: {
+      describe: vi.fn((payload: { refs: string[] }) => Promise.resolve(ok({
+        credentials: Object.fromEntries(payload.refs.map(ref => [ref, {
+          configured: ref === options.apiKeyEnv,
+          writable: true,
+        }])),
+      }))),
+      set: vi.fn(() => Promise.resolve(ok({}))),
+      unset: vi.fn(() => Promise.resolve(ok({}))),
+    },
+  }
+  return {
+    face,
+    mutate,
+    oauthStart,
+    oauthCancel,
+    oauthDisconnect,
+    setStatus(next: OAuthStatus): void { status = next },
+    resolveProfileMutation(): void {
+      if (resolveDeferredProfileMutation === undefined) throw new Error('no deferred profile mutation is pending')
+      resolveDeferredProfileMutation()
+    },
+    resolveStart(): void {
+      if (resolveDeferredStart === undefined) throw new Error('no deferred OAuth start is pending')
+      resolveDeferredStart()
+    },
+    configured: (): boolean => configured,
+  }
+}
+
+async function mountOAuth(options: Parameters<typeof scriptedOAuthFace>[0] = {}) {
+  const scripted = scriptedOAuthFace(options)
+  const controller = new ModelsSettingsStore(scripted.face as unknown as WireFace)
+  await controller.load()
+  const injected: ModelsSectionInjected = {
+    controller,
+    useSnapshot: bindSnapshotSelector(controller.store),
+    api: scripted.face as never,
+    t,
+  }
+  const view = render(<ModelsSection {...injected} />)
+  return { ...scripted, controller, injected, view }
+}
+
+describe('OAuth provider card', () => {
+  it.each([
+    ['missing', false, ['Connect ChatGPT']],
+    ['connecting', true, ['Connecting', 'Cancel']],
+    ['connected', true, ['Connected', 'Disconnect']],
+    ['reconnect-required', true, ['Reconnect', 'Disconnect']],
+  ] as const)('renders the %s redacted state without an API-key editor', async (status, configured, labels) => {
+    await mountOAuth({ status, configured })
+
+    expect(screen.getByText('OpenAI Codex')).toBeTruthy()
+    for (const label of labels) expect(screen.getByText(label)).toBeTruthy()
+    expect(screen.queryByLabelText(/API key/i)).toBeNull()
+  })
+
+  it('keeps an explicit-key Codex profile on the regular key row and removal path', async () => {
+    const mounted = await mountOAuth({ apiKeyEnv: 'OPENAI_CODEX_API_KEY' })
+    const target = { provider: 'openai-codex', displayName: 'OpenAI Codex' }
+
+    expect(screen.getByRole('img', { name: en.credentialConfigured })).toBeTruthy()
+    expect(screen.getByRole('button', { name: providerCopy(en.editProvider, target) })).toBeTruthy()
+    expect(screen.queryByRole('button', { name: 'Connect ChatGPT' })).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Disconnect' })).toBeNull()
+    expect(mounted.face.llm.oauthStatus).not.toHaveBeenCalled()
+
+    fireEvent.click(screen.getByRole('button', { name: providerCopy(en.removeProvider, target) }))
+    const dialog = screen.getByRole('dialog', { name: providerCopy(en.deleteTitle, target) })
+    expect(dialog.textContent).toContain(providerCopy(en.deleteDescriptionWithCredential, target))
+    fireEvent.click(within(dialog).getByRole('button', { name: providerCopy(en.deleteConfirm, target) }))
+
+    await waitFor(() => { expect(mounted.face.credentials.unset).toHaveBeenCalledWith({ ref: 'OPENAI_CODEX_API_KEY' }) })
+    await waitFor(() => { expect(mounted.mutate).toHaveBeenCalledOnce() })
+    expect(mounted.oauthDisconnect).not.toHaveBeenCalled()
+  })
+
+  it('creates the empty profile before start and keeps device instructions page-local', async () => {
+    const clipboard = { writeText: vi.fn(() => Promise.resolve()) }
+    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: clipboard })
+    const mounted = await mountOAuth({ status: 'missing', configured: false })
+
+    fireEvent.click(screen.getByRole('button', { name: 'Connect ChatGPT' }))
+
+    expect(await screen.findByText('ABCD-EFGH')).toBeTruthy()
+    expect(mounted.mutate).toHaveBeenCalledWith({
+      ns: 'llm-pi-ai',
+      ops: [{ op: 'set', path: ['providers', 'openai-codex'], value: {} }],
+    })
+    expect(mounted.oauthStart).toHaveBeenCalledWith({ provider: 'openai-codex' })
+    expect(mounted.mutate.mock.invocationCallOrder[0])
+      .toBeLessThan(mounted.oauthStart.mock.invocationCallOrder[0] as number)
+    const link = screen.getByRole<HTMLAnchorElement>('link', { name: 'Open verification page' })
+    expect(link.href).toBe('https://example.test/device')
+    expect(link.target).toBe('_blank')
+    expect(link.rel).toBe('noreferrer')
+    fireEvent.click(screen.getByRole('button', { name: 'Copy code' }))
+    expect(clipboard.writeText).toHaveBeenCalledWith('ABCD-EFGH')
+    expect(JSON.stringify(mounted.controller.store.getSnapshot())).not.toContain('ABCD-EFGH')
+    expect(JSON.stringify(mounted.controller.store.getSnapshot())).not.toContain('https://example.test/device')
+    expect(screen.queryByLabelText(/API key/i)).toBeNull()
+
+    mounted.view.unmount()
+    render(<ModelsSection {...mounted.injected} />)
+    expect(screen.queryByText('ABCD-EFGH')).toBeNull()
+    expect(screen.getByText('Connecting')).toBeTruthy()
+  })
+
+  it('continues the first OAuth start after the profile refresh replaces its missing row', async () => {
+    const mounted = await mountOAuth({
+      status: 'missing',
+      configured: false,
+      deferProfileMutation: true,
+    })
+
+    fireEvent.click(screen.getByRole('button', { name: 'Connect ChatGPT' }))
+    await waitFor(() => { expect(mounted.mutate).toHaveBeenCalledOnce() })
+
+    // The settings document update can refresh the row before its mutation
+    // response reaches the browser. It is the same user-initiated start.
+    await act(async () => { await mounted.controller.load() })
+    mounted.resolveProfileMutation()
+
+    expect(await screen.findByText('ABCD-EFGH')).toBeTruthy()
+    expect(mounted.oauthStart).toHaveBeenCalledWith({ provider: 'openai-codex' })
+  })
+
+  it('does not start OAuth when the refreshed profile names a legacy API key', async () => {
+    const mounted = await mountOAuth({
+      status: 'missing',
+      configured: false,
+      apiKeyEnv: 'OPENAI_CODEX_API_KEY',
+      deferProfileMutation: true,
+    })
+
+    fireEvent.click(screen.getByRole('button', { name: 'Connect ChatGPT' }))
+    await waitFor(() => { expect(mounted.mutate).toHaveBeenCalledOnce() })
+
+    await act(async () => { await mounted.controller.load() })
+    mounted.resolveProfileMutation()
+    await act(async () => {
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+
+    expect(screen.getByRole('button', {
+      name: providerCopy(en.editProvider, { provider: 'openai-codex', displayName: 'OpenAI Codex' }),
+    })).toBeTruthy()
+    expect(mounted.oauthStart).not.toHaveBeenCalled()
+  })
+
+  it('clears the device code after cancellation and a terminal redacted reload', async () => {
+    const cancelled = await mountOAuth({ status: 'missing', configured: false })
+    fireEvent.click(screen.getByRole('button', { name: 'Connect ChatGPT' }))
+    expect(await screen.findByText('ABCD-EFGH')).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
+    await waitFor(() => { expect(screen.queryByText('ABCD-EFGH')).toBeNull() })
+    expect(cancelled.oauthCancel).toHaveBeenCalledWith({ provider: 'openai-codex' })
+    expect(screen.getByRole('button', { name: 'Connect ChatGPT' })).toBeTruthy()
+
+    cleanup()
+    const completed = await mountOAuth({ status: 'missing', configured: false })
+    fireEvent.click(screen.getByRole('button', { name: 'Connect ChatGPT' }))
+    expect(await screen.findByText('ABCD-EFGH')).toBeTruthy()
+    completed.setStatus('connected')
+    await act(async () => { await completed.controller.load() })
+    expect(screen.queryByText('ABCD-EFGH')).toBeNull()
+    expect(screen.getByText('Connected')).toBeTruthy()
+  })
+
+  it('polls loopback status while connecting so a device-code expiry cannot leave the card stale', async () => {
+    const mounted = await mountOAuth({ status: 'missing', configured: false })
+    fireEvent.click(screen.getByRole('button', { name: 'Connect ChatGPT' }))
+    expect(await screen.findByText('ABCD-EFGH')).toBeTruthy()
+    const statusCalls = mounted.face.llm.oauthStatus.mock.calls.length
+
+    // This stands in for an expiry or cancellation owned by another Harness
+    // process. No forwarded OAuth event exists for the browser to consume.
+    mounted.setStatus('missing')
+
+    await waitFor(() => {
+      expect(screen.queryByText('ABCD-EFGH')).toBeNull()
+      expect(screen.queryByText('Connecting')).toBeNull()
+      expect(screen.getByRole('button', { name: 'Connect ChatGPT' })).toBeTruthy()
+      expect(mounted.face.llm.oauthStatus.mock.calls.length).toBeGreaterThan(statusCalls)
+    }, { timeout: 3_000 })
+  })
+
+  it('lets a terminal redacted snapshot invalidate a late device-code response', async () => {
+    const mounted = await mountOAuth({ status: 'missing', configured: false, deferStart: true })
+    fireEvent.click(screen.getByRole('button', { name: 'Connect ChatGPT' }))
+    await waitFor(() => { expect(mounted.oauthStart).toHaveBeenCalledOnce() })
+
+    mounted.setStatus('connected')
+    await act(async () => { await mounted.controller.load() })
+    expect(screen.getByText('Connected')).toBeTruthy()
+    expect(screen.queryByText('Connecting')).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Cancel' })).toBeNull()
+
+    // If the stale start response is accepted, its device code renders while
+    // the handler's post-start reload waits here.
+    mounted.face.llm.providers.mockImplementationOnce(() => new Promise(() => {}))
+    mounted.resolveStart()
+    await act(async () => { await Promise.resolve() })
+
+    expect(screen.queryByText('ABCD-EFGH')).toBeNull()
+    expect(screen.queryByText('Connecting')).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Cancel' })).toBeNull()
+    expect(screen.getByText('Connected')).toBeTruthy()
+  })
+
+  it('disconnects without removing the retained provider profile', async () => {
+    const mounted = await mountOAuth({ status: 'connected', configured: true })
+
+    fireEvent.click(screen.getByRole('button', { name: 'Disconnect' }))
+
+    await waitFor(() => { expect(screen.getByRole('button', { name: 'Connect ChatGPT' })).toBeTruthy() })
+    expect(mounted.oauthDisconnect).toHaveBeenCalledWith({ provider: 'openai-codex' })
+    expect(mounted.mutate).not.toHaveBeenCalled()
+    expect(mounted.configured()).toBe(true)
+  })
+
+  it('reconnects through the retained profile without rewriting settings', async () => {
+    const mounted = await mountOAuth({ status: 'reconnect-required', configured: true })
+
+    fireEvent.click(screen.getByRole('button', { name: 'Reconnect' }))
+
+    expect(await screen.findByText('ABCD-EFGH')).toBeTruthy()
+    expect(mounted.oauthStart).toHaveBeenCalledWith({ provider: 'openai-codex' })
+    expect(mounted.mutate).not.toHaveBeenCalled()
+  })
+
+  it('disconnects before removing a provider profile', async () => {
+    const mounted = await mountOAuth({ status: 'connected', configured: true })
+    const target = { provider: 'openai-codex', displayName: 'OpenAI Codex' }
+    fireEvent.click(screen.getByRole('button', { name: providerCopy(en.removeProvider, target) }))
+    const dialog = screen.getByRole('dialog', { name: providerCopy(en.deleteTitle, target) })
+    fireEvent.click(within(dialog).getByRole('button', { name: providerCopy(en.deleteConfirm, target) }))
+
+    await waitFor(() => { expect(mounted.oauthDisconnect).toHaveBeenCalledOnce() })
+    await waitFor(() => { expect(mounted.mutate).toHaveBeenCalledOnce() })
+    expect(mounted.oauthDisconnect.mock.invocationCallOrder[0])
+      .toBeLessThan(mounted.mutate.mock.invocationCallOrder[0] as number)
+    expect(mounted.mutate).toHaveBeenCalledWith({
+      ns: 'llm-pi-ai',
+      ops: [{ op: 'unset', path: ['providers', 'openai-codex'] }],
+    })
+  })
+
+  it('shows configured-but-disconnected after profile removal fails without leaking the host error', async () => {
+    const leaked = 'provider account jane@example.test plan Team token secret-token'
+    const mounted = await mountOAuth({ status: 'connected', configured: true, removeFailure: leaked })
+    const target = { provider: 'openai-codex', displayName: 'OpenAI Codex' }
+    fireEvent.click(screen.getByRole('button', { name: providerCopy(en.removeProvider, target) }))
+    const dialog = screen.getByRole('dialog', { name: providerCopy(en.deleteTitle, target) })
+    fireEvent.click(within(dialog).getByRole('button', { name: providerCopy(en.deleteConfirm, target) }))
+
+    expect(await within(dialog).findByText('The provider remains configured but is disconnected. Try deleting it again.')).toBeTruthy()
+    expect(dialog.textContent).not.toContain(leaked)
+    expect(mounted.oauthDisconnect).toHaveBeenCalledOnce()
+    expect(mounted.mutate).toHaveBeenCalledOnce()
+    expect(mounted.controller.store.getSnapshot().rows[0]).toMatchObject({
+      configured: true,
+      connection: { status: 'missing' },
+    })
+    expect(screen.getByRole('button', { name: 'Connect ChatGPT' })).toBeTruthy()
+  })
+
+  it('uses stable connection copy instead of exposing a rejected provider response', async () => {
+    const leaked = 'provider error: jane@example.test Team secret-token'
+    await mountOAuth({ status: 'missing', configured: false, startFailure: leaked })
+
+    fireEvent.click(screen.getByRole('button', { name: 'Connect ChatGPT' }))
+
+    expect(await screen.findByText('The ChatGPT connection could not be updated. Please try again.')).toBeTruthy()
+    expect(document.body.textContent).not.toContain(leaked)
+  })
+})
 
 describe('ModelsSection', () => {
   it('renders nothing before the slot injects its dependencies', () => {
@@ -302,7 +687,9 @@ describe('ModelsSection', () => {
   })
 
   it('decides setup need from the joined credential state and the first-run posture', () => {
-    const entry = { provider: 'p', displayName: 'p', settingsNs: 'llm-deepseek', settingsPath: [], active: true }
+    const entry = {
+      provider: 'p', displayName: 'p', settingsNs: 'llm-deepseek', settingsPath: [], active: true, auth: { kind: 'api-key' as const },
+    }
     const row = (credential: ProviderRow['credential']): ProviderRow => ({
       entry,
       configured: true,
@@ -1317,6 +1704,30 @@ describe('ModelsSection', () => {
       },
     )
     expect(failure).toBe('credential is read-only')
+    expect(mutate).not.toHaveBeenCalled()
+  })
+
+  it('keeps an OAuth profile while remote disconnection is still nonterminal', async () => {
+    const { face, mutate } = scriptedOAuthFace({
+      status: 'connecting',
+      configured: true,
+      disconnectStatus: 'connecting',
+    })
+    const controller = new ModelsSettingsStore(face as unknown as WireFace)
+    await controller.load()
+
+    const failure = await removeProviderProfile(
+      face as unknown as Parameters<typeof removeProviderProfile>[0],
+      controller,
+      {
+        provider: 'openai-codex',
+        settingsNs: 'llm-pi-ai',
+        settingsPath: ['providers', 'openai-codex'],
+        oauth: true,
+      },
+    )
+
+    expect(failure).toBe('oauth-action-failed')
     expect(mutate).not.toHaveBeenCalled()
   })
 

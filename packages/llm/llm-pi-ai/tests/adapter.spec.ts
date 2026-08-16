@@ -7,11 +7,20 @@ import type {
   SaveImageAttachment,
   StoredImageAttachment,
 } from '@deepseek-ai/dsh-attachment'
-import LlmRuntime, { createUserMessage, CONTEXT_WINDOW_EXCEEDED_CODE, LlmError, ReasoningEffortId, userAgent } from '@deepseek-ai/dsh-llm'
+import LlmRuntime, {
+  createUserMessage,
+  CONTEXT_WINDOW_EXCEEDED_CODE,
+  LlmError,
+  OAUTH_RECONNECT_REQUIRED_CODE,
+  ReasoningEffortId,
+  userAgent,
+} from '@deepseek-ai/dsh-llm'
 import * as LlmPiAi from '@deepseek-ai/dsh-llm-pi-ai'
 import { PiAiAdapter } from '@deepseek-ai/dsh-llm-pi-ai'
 import { MAX_TIMER_DELAY_MS } from '@deepseek-ai/dsh-timeout'
+import { lazyStream } from '@earendil-works/pi-ai'
 import { getBuiltinModels } from '@earendil-works/pi-ai/providers/all'
+import type { Credential, CredentialInfo, CredentialStore, Models, OAuthCredential, Provider } from '@earendil-works/pi-ai'
 import { resolveProfiles } from '../src/config.ts'
 import { assemble } from './assemble.ts'
 import { closeMockServers, mockServer, textEvents } from './mock-server.ts'
@@ -50,6 +59,81 @@ function adapterOf(
   })
 }
 
+/** Mutable pi-ai credential store for adapter auth-path tests. */
+class MemoryOAuthStore implements CredentialStore {
+  credential: Credential | undefined
+  reads = 0
+  failReadAt: number | undefined
+  private operation: Promise<void> = Promise.resolve()
+
+  constructor(credential: Credential | undefined) {
+    this.credential = credential
+  }
+
+  read(providerId: string): Promise<Credential | undefined> {
+    this.reads += 1
+    if (this.reads === this.failReadAt) {
+      return Promise.reject(new Error('provider credential-store detail after preflight'))
+    }
+    return Promise.resolve(providerId === 'openai-codex' ? this.credential : undefined)
+  }
+
+  list(): Promise<readonly CredentialInfo[]> {
+    return Promise.resolve(this.credential === undefined
+      ? []
+      : [{ providerId: 'openai-codex', type: this.credential.type }])
+  }
+
+  modify(
+    providerId: string,
+    fn: (current: Credential | undefined) => Promise<Credential | undefined>,
+  ): Promise<Credential | undefined> {
+    const task = this.operation.then(async () => {
+      const current = providerId === 'openai-codex' ? this.credential : undefined
+      const next = await fn(current)
+      if (providerId === 'openai-codex' && next !== undefined) this.credential = next
+      return next ?? current
+    })
+    this.operation = task.then(() => undefined, () => undefined)
+    return task
+  }
+
+  async delete(providerId: string): Promise<void> {
+    await this.operation
+    if (providerId === 'openai-codex') this.credential = undefined
+  }
+
+  /** Wait until the latest serialized credential operation has settled. */
+  settled(): Promise<void> {
+    return this.operation
+  }
+}
+
+function oauthCredential(expires: number): OAuthCredential {
+  return {
+    type: 'oauth',
+    access: 'private-access-value',
+    refresh: 'private-refresh-value',
+    expires,
+  }
+}
+
+function deferred(): { promise: Promise<void>; resolve: () => void } {
+  let resolve!: () => void
+  const promise = new Promise<void>((done) => { resolve = done })
+  return { promise, resolve }
+}
+
+/** Consume one native Codex request so setup failures reject the caller. */
+async function drainCodex(adapter: PiAiAdapter, model: string, signal?: AbortSignal): Promise<void> {
+  for await (const _chunk of adapter.stream({
+    provider: 'openai-codex',
+    model,
+    messages: [],
+    ...signal === undefined ? {} : { signal },
+  })) { /* drain */ }
+}
+
 beforeEach(() => {
   // Configuration carries only the reference; these mounts resolve it from
   // the environment, which is the whole credential plane without a seam.
@@ -57,6 +141,452 @@ beforeEach(() => {
 })
 
 describe('PiAiAdapter provider routing', () => {
+  it('does not expose raw pi-ai Models through the adapter API', () => {
+    const adapter = new PiAiAdapter({
+      profiles: () => resolveProfiles({}),
+      resolveApiKey: () => Promise.resolve(undefined),
+    })
+
+    expect((adapter as unknown as { modelsSnapshot?: unknown }).modelsSnapshot).toBeUndefined()
+  })
+
+  it('replaces immutable model snapshots while retaining one credential store', async () => {
+    const store = new MemoryOAuthStore(oauthCredential(Date.now() + 60_000))
+    const firstResolved = resolveProfiles({ 'openai-codex': {} }).get('openai-codex')
+    const secondResolved = resolveProfiles({
+      'openai-codex': { displayName: 'Codex subscription' },
+    }).get('openai-codex')
+    if (firstResolved === undefined || secondResolved === undefined) throw new Error('expected Codex profiles')
+    let firstStreams = 0
+    let secondStreams = 0
+    const firstProfile = {
+      ...firstResolved,
+      piProvider: {
+        ...firstResolved.piProvider,
+        streamSimple: () => {
+          firstStreams += 1
+          throw new Error('first provider stream stop')
+        },
+      },
+    }
+    const secondProfile = {
+      ...secondResolved,
+      piProvider: {
+        ...secondResolved.piProvider,
+        streamSimple: () => {
+          secondStreams += 1
+          throw new Error('second provider stream stop')
+        },
+      },
+    }
+    let profiles = new Map([['openai-codex', firstProfile]])
+    const adapter = new PiAiAdapter({
+      profiles: () => profiles,
+      resolveApiKey: () => Promise.resolve(undefined),
+      credentialStore: store,
+    })
+
+    await drainCodex(adapter, firstResolved.piProvider.getModels()[0]!.id)
+    const readsAfterFirst = store.reads
+    profiles = new Map([['openai-codex', secondProfile]])
+    await drainCodex(adapter, secondResolved.piProvider.getModels()[0]!.id)
+
+    expect(firstStreams).toBe(1)
+    expect(secondStreams).toBe(1)
+    expect(store.reads).toBeGreaterThan(readsAfterFirst)
+  })
+
+  it('never asks for or passes an API-key override on the native Codex OAuth profile', async () => {
+    const resolved = resolveProfiles({ 'openai-codex': {} }).get('openai-codex')
+    if (resolved === undefined) throw new Error('expected Codex profile')
+    const provider: Provider = {
+      ...resolved.piProvider,
+      streamSimple: () => { throw new Error('hostile-native-terminal-sentinel') },
+    }
+    const profile = { ...resolved, piProvider: provider }
+    let keyResolutions = 0
+    let reconnects = 0
+    const adapter = new PiAiAdapter({
+      profiles: () => new Map([['openai-codex', profile]]),
+      resolveApiKey: () => {
+        keyResolutions += 1
+        return Promise.resolve('legacy-override')
+      },
+      credentialStore: new MemoryOAuthStore(oauthCredential(Date.now() + 60_000)),
+      oauthController: {
+        captureRequestGeneration: () => Promise.resolve(1),
+        markReconnectRequired: () => { reconnects += 1; return Promise.resolve() },
+      },
+    })
+
+    const chunkTypes: string[] = []
+    let finishCode: string | undefined
+    let finishMessage: string | undefined
+    for await (const chunk of adapter.stream({
+      provider: 'openai-codex',
+      model: resolved.piProvider.getModels()[0]!.id,
+      messages: [],
+    })) {
+      chunkTypes.push(chunk.type)
+      if (chunk.type === 'finish' && chunk.reason.kind === 'error') {
+        finishCode = chunk.reason.failure.code
+        finishMessage = chunk.reason.failure.message
+      }
+    }
+
+    expect(keyResolutions).toBe(0)
+    expect(reconnects).toBe(0)
+    expect(chunkTypes).toEqual(['usage', 'finish'])
+    expect(finishCode).toBe('PI_AI_ERROR')
+    expect(finishMessage).toBe('OpenAI Codex request failed')
+    expect(JSON.stringify({ chunkTypes, finishCode, finishMessage }))
+      .not.toContain('hostile-native-terminal-sentinel')
+  })
+
+  it('sanitizes a synchronous native Codex stream exception without yielding provider text', async () => {
+    const resolved = resolveProfiles({ 'openai-codex': {} }).get('openai-codex')
+    if (resolved === undefined) throw new Error('expected Codex profile')
+    const adapter = new PiAiAdapter({
+      profiles: () => new Map([['openai-codex', resolved]]),
+      resolveApiKey: () => Promise.resolve(undefined),
+      credentialStore: new MemoryOAuthStore(oauthCredential(Date.now() + 60_000)),
+    })
+    const requestModels = {
+      getAuth: () => Promise.resolve({ auth: {}, source: 'OAuth' as const }),
+      streamSimple: () => { throw new Error('hostile-native-throw-sentinel') },
+    } as unknown as Models
+    vi.spyOn(
+      adapter as unknown as { nativeOAuthRequest: () => { models: Models } },
+      'nativeOAuthRequest',
+    ).mockReturnValue({ models: requestModels })
+    const chunks: unknown[] = []
+    const consume = async (): Promise<void> => {
+      for await (const chunk of adapter.stream({
+        provider: 'openai-codex',
+        model: resolved.piProvider.getModels()[0]!.id,
+        messages: [],
+      })) chunks.push(chunk)
+    }
+
+    await expect(consume()).rejects.toMatchObject({
+      code: 'PI_AI_ERROR',
+      message: 'OpenAI Codex request failed',
+    })
+    expect(chunks).toEqual([])
+    expect(JSON.stringify(chunks)).not.toContain('hostile-native-throw-sentinel')
+  })
+
+  it('preserves a Harness unsupported-content failure before native Codex provider I/O', async () => {
+    const resolved = resolveProfiles({ 'openai-codex': {} }).get('openai-codex')
+    if (resolved === undefined) throw new Error('expected Codex profile')
+    const model = resolved.piProvider.getModels().find(candidate => !candidate.input.includes('image'))
+    if (model === undefined) throw new Error('expected text-only Codex model')
+    const adapter = new PiAiAdapter({
+      profiles: () => new Map([['openai-codex', resolved]]),
+      resolveApiKey: () => Promise.resolve(undefined),
+      credentialStore: new MemoryOAuthStore(oauthCredential(Date.now() + 60_000)),
+    })
+    let streamCalls = 0
+    const requestModels = {
+      getAuth: () => Promise.resolve({ auth: {}, source: 'OAuth' as const }),
+      streamSimple: () => {
+        streamCalls += 1
+        throw new Error('native provider must not run for unsupported content')
+      },
+    } as unknown as Models
+    vi.spyOn(
+      adapter as unknown as { nativeOAuthRequest: () => { models: Models } },
+      'nativeOAuthRequest',
+    ).mockReturnValue({ models: requestModels })
+
+    await expect((async () => {
+      for await (const _chunk of adapter.stream({
+        provider: 'openai-codex',
+        model: model.id,
+        messages: [createUserMessage({
+          content: [{ type: 'image', attachment: IMAGE_REF }],
+          source: { kind: 'plugin', plugin: 'test' },
+        })],
+      })) { /* drain */ }
+    })()).rejects.toMatchObject({
+      code: 'UNSUPPORTED_CONTENT',
+      message: `pi-ai model "${model.id}" does not support image input`,
+    })
+    expect(streamCalls).toBe(0)
+  })
+
+  it('normalizes a failed OAuth refresh before provider text reaches the stream', async () => {
+    const resolved = resolveProfiles({ 'openai-codex': {} }).get('openai-codex')
+    if (resolved === undefined) throw new Error('expected Codex profile')
+    let providerStreams = 0
+    const provider: Provider = {
+      ...resolved.piProvider,
+      auth: {
+        oauth: {
+          name: 'Codex test OAuth',
+          login: async () => oauthCredential(Date.now() + 60_000),
+          refresh: async () => { throw new Error('provider refresh response detail') },
+          toAuth: async credential => ({ apiKey: credential.access }),
+        },
+      },
+      streamSimple: (...args) => {
+        providerStreams += 1
+        return resolved.piProvider.streamSimple(...args)
+      },
+    }
+    const profile = { ...resolved, piProvider: provider }
+    const reconnectGenerations: number[] = []
+    const adapter = new PiAiAdapter({
+      profiles: () => new Map([['openai-codex', profile]]),
+      resolveApiKey: () => Promise.resolve(undefined),
+      credentialStore: new MemoryOAuthStore(oauthCredential(0)),
+      oauthController: {
+        captureRequestGeneration: () => Promise.resolve(17),
+        markReconnectRequired: (generation) => { reconnectGenerations.push(generation); return Promise.resolve() },
+      },
+    })
+    await expect(drainCodex(adapter, resolved.piProvider.getModels()[0]!.id))
+      .rejects.toEqual(expect.objectContaining({
+        code: OAUTH_RECONNECT_REQUIRED_CODE,
+        message: 'OpenAI Codex connection needs to be reconnected',
+      }))
+    expect(reconnectGenerations).toEqual([17])
+    expect(providerStreams).toBe(0)
+  })
+
+  it('does not start a native Codex OAuth preflight after caller cancellation', async () => {
+    const resolved = resolveProfiles({ 'openai-codex': {} }).get('openai-codex')
+    if (resolved === undefined) throw new Error('expected Codex profile')
+    const expired = oauthCredential(0)
+    const store = new MemoryOAuthStore(expired)
+    let refreshes = 0
+    let captures = 0
+    let streams = 0
+    const provider: Provider = {
+      ...resolved.piProvider,
+      auth: {
+        oauth: {
+          name: 'Codex test OAuth',
+          login: async () => oauthCredential(Date.now() + 60_000),
+          refresh: async () => {
+            refreshes += 1
+            return oauthCredential(Date.now() + 60_000)
+          },
+          toAuth: async credential => ({ apiKey: credential.access }),
+        },
+      },
+      streamSimple: () => {
+        streams += 1
+        throw new Error('native provider must not run after caller cancellation')
+      },
+    }
+    const adapter = new PiAiAdapter({
+      profiles: () => new Map([['openai-codex', { ...resolved, piProvider: provider }]]),
+      resolveApiKey: () => Promise.resolve(undefined),
+      credentialStore: store,
+      oauthController: {
+        captureRequestGeneration: () => { captures += 1; return Promise.resolve(1) },
+        markReconnectRequired: () => Promise.resolve(),
+      },
+    })
+    const controller = new AbortController()
+    controller.abort('caller cancelled before Codex OAuth preflight')
+
+    await expect(drainCodex(adapter, resolved.piProvider.getModels()[0]!.id, controller.signal)).rejects.toMatchObject({
+      code: 'ABORTED',
+      message: 'OpenAI Codex request aborted by caller',
+    })
+    expect(captures).toBe(0)
+    expect(store.reads).toBe(0)
+    expect(refreshes).toBe(0)
+    expect(streams).toBe(0)
+    expect(store.credential).toEqual(expired)
+  })
+
+  it('cancels a native Codex OAuth refresh without committing its credential', async () => {
+    const resolved = resolveProfiles({ 'openai-codex': {} }).get('openai-codex')
+    if (resolved === undefined) throw new Error('expected Codex profile')
+    const expired = oauthCredential(0)
+    const refreshed = oauthCredential(Date.now() + 60_000)
+    const store = new MemoryOAuthStore(expired)
+    const refreshEntered = deferred()
+    const releaseRefresh = deferred()
+    let reconnects = 0
+    let refreshes = 0
+    let streams = 0
+    const provider: Provider = {
+      ...resolved.piProvider,
+      auth: {
+        oauth: {
+          name: 'Codex test OAuth',
+          login: async () => oauthCredential(Date.now() + 60_000),
+          refresh: async () => {
+            refreshes += 1
+            refreshEntered.resolve()
+            await releaseRefresh.promise
+            return refreshed
+          },
+          toAuth: async credential => ({ apiKey: credential.access }),
+        },
+      },
+      streamSimple: () => {
+        streams += 1
+        throw new Error('native provider must not run after caller cancellation')
+      },
+    }
+    const adapter = new PiAiAdapter({
+      profiles: () => new Map([['openai-codex', { ...resolved, piProvider: provider }]]),
+      resolveApiKey: () => Promise.resolve(undefined),
+      credentialStore: store,
+      oauthController: {
+        captureRequestGeneration: () => Promise.resolve(1),
+        markReconnectRequired: () => { reconnects += 1; return Promise.resolve() },
+      },
+    })
+    const controller = new AbortController()
+
+    const request = drainCodex(adapter, resolved.piProvider.getModels()[0]!.id, controller.signal)
+    await refreshEntered.promise
+    controller.abort('caller cancelled during Codex OAuth refresh')
+    await expect(request).rejects.toMatchObject({
+      code: 'ABORTED',
+      message: 'OpenAI Codex request aborted by caller',
+    })
+    expect(reconnects).toBe(0)
+    expect(streams).toBe(0)
+    expect(store.credential).toEqual(expired)
+
+    releaseRefresh.resolve()
+    await store.settled()
+    expect(store.credential).toEqual(expired)
+
+    await drainCodex(adapter, resolved.piProvider.getModels()[0]!.id)
+    expect(refreshes).toBe(2)
+    expect(reconnects).toBe(0)
+    expect(streams).toBe(1)
+    expect(store.credential).toEqual(refreshed)
+  })
+
+  it('normalizes a credential-store failure before pi-ai diagnostics reach the stream', async () => {
+    const resolved = resolveProfiles({ 'openai-codex': {} }).get('openai-codex')
+    if (resolved === undefined) throw new Error('expected Codex profile')
+    const store = new MemoryOAuthStore(oauthCredential(Date.now() + 60_000))
+    vi.spyOn(store, 'read').mockRejectedValue(new Error('provider credential-store detail'))
+    let reconnects = 0
+    const adapter = new PiAiAdapter({
+      profiles: () => new Map([['openai-codex', resolved]]),
+      resolveApiKey: () => Promise.resolve(undefined),
+      credentialStore: store,
+      oauthController: {
+        captureRequestGeneration: () => Promise.resolve(1),
+        markReconnectRequired: () => { reconnects += 1; return Promise.resolve() },
+      },
+    })
+    await expect(drainCodex(adapter, resolved.piProvider.getModels()[0]!.id)).rejects.toMatchObject({
+      code: OAUTH_RECONNECT_REQUIRED_CODE,
+      message: 'OpenAI Codex connection needs to be reconnected',
+    })
+    expect(reconnects).toBe(1)
+  })
+
+  it('normalizes an OAuth auth failure raised only by pi-ai lazy stream setup', async () => {
+    const resolved = resolveProfiles({ 'openai-codex': {} }).get('openai-codex')
+    if (resolved === undefined) throw new Error('expected Codex profile')
+    const store = new MemoryOAuthStore(oauthCredential(Date.now() + 60_000))
+    store.failReadAt = 2
+    let reconnects = 0
+    const adapter = new PiAiAdapter({
+      profiles: () => new Map([['openai-codex', resolved]]),
+      resolveApiKey: () => Promise.resolve(undefined),
+      credentialStore: store,
+      oauthController: {
+        captureRequestGeneration: () => Promise.resolve(1),
+        markReconnectRequired: () => { reconnects += 1; return Promise.resolve() },
+      },
+    })
+    const chunkTypes: string[] = []
+    const consume = async (): Promise<void> => {
+      for await (const chunk of adapter.stream({
+        provider: 'openai-codex',
+        model: resolved.piProvider.getModels()[0]!.id,
+        messages: [],
+      })) chunkTypes.push(chunk.type)
+    }
+
+    await expect(consume()).rejects.toMatchObject({
+      code: OAUTH_RECONNECT_REQUIRED_CODE,
+      message: 'OpenAI Codex connection needs to be reconnected',
+    })
+    expect(reconnects).toBe(1)
+    expect(chunkTypes).toEqual([])
+  })
+
+  it('does not let one concurrent OAuth failure contaminate an ordinary provider failure', async () => {
+    const resolved = resolveProfiles({ 'openai-codex': {} }).get('openai-codex')
+    if (resolved === undefined) throw new Error('expected Codex profile')
+    const store = new MemoryOAuthStore(oauthCredential(Date.now() + 60_000))
+    const authFailureEntered = deferred()
+    const releaseAuthFailure = deferred()
+    const ordinaryStreamEntered = deferred()
+    const releaseOrdinaryStream = deferred()
+    const read = store.read.bind(store)
+    vi.spyOn(store, 'read').mockImplementation(async (providerId) => {
+      if (store.reads !== 1) return read(providerId)
+      store.reads += 1
+      authFailureEntered.resolve()
+      await releaseAuthFailure.promise
+      throw new Error('private credential-store failure')
+    })
+    const provider: Provider = {
+      ...resolved.piProvider,
+      streamSimple: model => lazyStream(model, async () => {
+        ordinaryStreamEntered.resolve()
+        await releaseOrdinaryStream.promise
+        throw new Error('ordinary provider failure')
+      }),
+    }
+    const profiles = new Map([['openai-codex', { ...resolved, piProvider: provider }]])
+    let reconnects = 0
+    const adapter = new PiAiAdapter({
+      profiles: () => profiles,
+      resolveApiKey: () => Promise.resolve(undefined),
+      credentialStore: store,
+      oauthController: {
+        captureRequestGeneration: () => Promise.resolve(1),
+        markReconnectRequired: () => { reconnects += 1; return Promise.resolve() },
+      },
+    })
+    const firstChunkTypes: string[] = []
+    const secondChunkTypes: string[] = []
+    const secondFinishCodes: string[] = []
+    const consume = async (chunkTypes: string[], finishCodes?: string[]): Promise<void> => {
+      for await (const chunk of adapter.stream({
+        provider: 'openai-codex',
+        model: resolved.piProvider.getModels()[0]!.id,
+        messages: [],
+      })) {
+        chunkTypes.push(chunk.type)
+        if (chunk.type === 'finish' && chunk.reason.kind === 'error') {
+          finishCodes?.push(chunk.reason.failure.code)
+        }
+      }
+    }
+
+    const first = consume(firstChunkTypes)
+    await authFailureEntered.promise
+    const second = consume(secondChunkTypes, secondFinishCodes)
+    await ordinaryStreamEntered.promise
+    releaseAuthFailure.resolve()
+    await expect(first).rejects.toMatchObject({ code: OAUTH_RECONNECT_REQUIRED_CODE })
+    releaseOrdinaryStream.resolve()
+    await expect(second).resolves.toBeUndefined()
+
+    expect(reconnects).toBe(1)
+    expect(firstChunkTypes).toEqual([])
+    expect(secondChunkTypes).toEqual(['usage', 'finish'])
+    expect(secondFinishCodes).toEqual(['PI_AI_ERROR'])
+  })
+
   it('resolves a catalog model dynamically and uses a private endpoint', async () => {
     const server = await mockServer([{ events: textEvents }])
     const ctx = await harness(server.url)

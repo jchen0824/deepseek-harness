@@ -21,7 +21,9 @@
 // built dist; ordinary keyless modes disable llm-deepseek and fill the open
 // llm seam post-boot with installLlmReplay on the settled root ctx
 // (the plugin-row path discards the ReplayHandle; the direct install keeps
-// assertConsumed for the teardown fixture-consumption check).
+// assertConsumed for the teardown fixture-consumption check). The Codex OAuth
+// lane mounts a deterministic native-provider failure after login so the
+// assembled browser can prove failure redaction end to end.
 import { existsSync } from 'node:fs'
 import { mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -44,8 +46,16 @@ import { dshHomePath } from '@deepseek-ai/dsh-home-paths'
 import { settingsNamespace } from '@deepseek-ai/dsh-settings'
 import { LlmAdapter } from '@deepseek-ai/dsh-llm'
 import type {
-  LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, StreamChunk,
+  AdapterRegistrationHandle, LlmModelInfo, LlmOAuthConnection,
+  LlmOAuthConnectionStatus, LlmOAuthController, LlmProviderInfo,
+  LlmResolvedModelInfo, StreamChunk,
 } from '@deepseek-ai/dsh-llm'
+import {
+  Config as PiAiConfig,
+  OpenAICodexCredentialStore,
+  PiAiAdapter,
+} from '@deepseek-ai/dsh-llm-pi-ai'
+import { resolveProfiles } from '../../../packages/llm/llm-pi-ai/src/config.ts'
 import type { ReplayHandle } from '@deepseek-ai/dsh-llm-replay'
 import { installLlmReplay, parseSessionLog } from '@deepseek-ai/dsh-llm-replay'
 import SessionStore, {
@@ -115,6 +125,179 @@ const REPLAY_PROVIDERS = [{
   models: [{ id: 'deepseek-v4-flash', name: 'DeepSeek-V4-Flash', contextWindow: 128_000 }],
 }]
 
+const OPENAI_CODEX_PROVIDER = 'openai-codex'
+const OPENAI_CODEX_VERIFICATION_URL = 'https://auth.openai.com/codex/device'
+const OPENAI_CODEX_VERIFICATION_CODE = 'ABCD-EFGH'
+const OPENAI_CODEX_REDACTION_SENTINELS = [
+  'sensitive-token-sentinel',
+  'sensitive-authorization-sentinel',
+  'sensitive-account-sentinel',
+  'sensitive-plan-sentinel',
+  'sensitive-reference-sentinel',
+  'sensitive-error-sentinel',
+] as const
+
+/** Test-only proof that private controller fields were exercised before browser-wire projection. */
+export interface OAuthRedactionEvidence {
+  /** Fixed non-secret markers attached to every private fixture connection. */
+  sentinels: readonly string[]
+  /** Number of private connection payloads returned or emitted by the fixture. */
+  payloadsIssued: number
+  /** Last private payload passed into a real LLM redaction seam. */
+  lastPrivatePayload: Readonly<Record<string, unknown>>
+  /** Requests that reached the deterministic native Codex provider. */
+  modelRequests: number
+}
+
+/** Test-owned control over the deterministic Codex OAuth lifecycle. */
+interface OpenAICodexOAuthFixture {
+  /** Complete the pending login, then optionally observe its local lifecycle refresh. */
+  complete(observeConnection?: () => Promise<void>): Promise<void>
+  /** Inspect whether non-secret private sentinels reached the real redaction seams. */
+  redactionEvidence(): OAuthRedactionEvidence
+}
+
+/**
+ * Install a deterministic OAuth controller around the real pi-ai catalog
+ * adapter. Creating a profile registers its route, while OAuth completion
+ * changes only the private lifecycle status; the browser therefore exercises
+ * production's stable public topology without a copied model list.
+ * @param ctx - settled Web composition context.
+ * @returns control used only by the owning browser scenario.
+ */
+async function installOpenAICodexOAuthFixture(ctx: Context): Promise<OpenAICodexOAuthFixture> {
+  const resolvedProfiles = resolveProfiles({ [OPENAI_CODEX_PROVIDER]: {} })
+  const profile = resolvedProfiles.get(OPENAI_CODEX_PROVIDER)
+  if (profile === undefined) throw new Error('web e2e scaffold: pi-ai did not resolve the Codex catalog route')
+  let modelRequests = 0
+  const profiles = new Map(resolvedProfiles)
+  profiles.set(OPENAI_CODEX_PROVIDER, {
+    ...profile,
+    piProvider: {
+      ...profile.piProvider,
+      streamSimple: () => {
+        modelRequests += 1
+        throw new Error(OPENAI_CODEX_REDACTION_SENTINELS[5])
+      },
+    },
+  })
+  const credentials = new OpenAICodexCredentialStore(() => ctx.credentials)
+  await credentials.modify(OPENAI_CODEX_PROVIDER, async () => ({
+    type: 'oauth',
+    access: OPENAI_CODEX_REDACTION_SENTINELS[0],
+    refresh: OPENAI_CODEX_REDACTION_SENTINELS[1],
+    expires: Number.MAX_SAFE_INTEGER,
+  }))
+  const adapter = new PiAiAdapter({
+    profiles: () => profiles,
+    resolveApiKey: () => Promise.resolve(undefined),
+    credentialStore: credentials,
+  })
+  let status: LlmOAuthConnectionStatus = 'missing'
+  let route: AdapterRegistrationHandle | undefined
+  let routeRegistered = false
+  let payloadsIssued = 0
+  let lastPrivatePayload: Readonly<Record<string, unknown>> | undefined
+  const connection = (): LlmOAuthConnection => {
+    const payload = {
+      provider: OPENAI_CODEX_PROVIDER,
+      status,
+      token: OPENAI_CODEX_REDACTION_SENTINELS[0],
+      authorization: OPENAI_CODEX_REDACTION_SENTINELS[1],
+      account: OPENAI_CODEX_REDACTION_SENTINELS[2],
+      plan: OPENAI_CODEX_REDACTION_SENTINELS[3],
+      privateReference: OPENAI_CODEX_REDACTION_SENTINELS[4],
+      rawProviderError: OPENAI_CODEX_REDACTION_SENTINELS[5],
+    }
+    payloadsIssued += 1
+    lastPrivatePayload = payload
+    return payload
+  }
+  const publish = (): void => { ctx.llm.emitOAuthConnectionUpdated(connection()) }
+  const ensureRoute = (): void => {
+    if (routeRegistered) return
+    if (route === undefined) route = ctx.llm.registerAdapter([OPENAI_CODEX_PROVIDER], adapter)
+    else route.replace([OPENAI_CODEX_PROVIDER])
+    routeRegistered = true
+  }
+  const withdrawRoute = (): void => {
+    if (!routeRegistered || route === undefined) return
+    route.replace([])
+    routeRegistered = false
+  }
+
+  const oauthSettingsNs = settingsNamespace('llm-pi-ai')
+  const profileSettings = ctx.settings.register(oauthSettingsNs, PiAiConfig, { base: {} })
+  const synchronizeRoute = (): void => {
+    if (profileSettings.get().providers?.[OPENAI_CODEX_PROVIDER] === undefined) withdrawRoute()
+    else ensureRoute()
+  }
+  ctx.on('settings/updated', (ns) => {
+    if (ns === oauthSettingsNs) synchronizeRoute()
+  })
+  synchronizeRoute()
+  ctx.llm.registerConfigurableProviders([{
+    provider: OPENAI_CODEX_PROVIDER,
+    displayName: profile.displayName,
+    settingsNs: oauthSettingsNs,
+    settingsPath: ['providers', OPENAI_CODEX_PROVIDER],
+    auth: { kind: 'oauth' },
+    declared: false,
+  }])
+  const controller: LlmOAuthController = {
+    provider: OPENAI_CODEX_PROVIDER,
+    status: () => Promise.resolve(connection()),
+    start: () => {
+      if (status === 'connected') return Promise.resolve({ kind: 'connected', connection: connection() })
+      if (status === 'connecting') return Promise.resolve({ kind: 'already-connecting', connection: connection() })
+      status = 'connecting'
+      return Promise.resolve({
+        kind: 'device-code',
+        connection: connection(),
+        deviceCode: {
+          verificationUri: OPENAI_CODEX_VERIFICATION_URL,
+          userCode: OPENAI_CODEX_VERIFICATION_CODE,
+        },
+      })
+    },
+    cancel: () => {
+      if (status === 'connecting') {
+        status = 'missing'
+        publish()
+      }
+      return Promise.resolve(connection())
+    },
+    disconnect: () => {
+      status = 'missing'
+      publish()
+      return Promise.resolve(connection())
+    },
+  }
+  ctx.llm.registerOAuthController(controller)
+
+  return {
+    async complete(observeConnection): Promise<void> {
+      if (status !== 'connecting') {
+        throw new Error('web e2e scaffold: Codex OAuth completion needs a pending device-code login')
+      }
+      status = 'connected'
+      publish()
+      await observeConnection?.()
+    },
+    redactionEvidence(): OAuthRedactionEvidence {
+      if (lastPrivatePayload === undefined) {
+        throw new Error('web e2e scaffold: Codex OAuth fixture issued no private payload')
+      }
+      return {
+        sentinels: [...OPENAI_CODEX_REDACTION_SENTINELS],
+        payloadsIssued,
+        lastPrivatePayload: { ...lastPrivatePayload },
+        modelRequests,
+      }
+    },
+  }
+}
+
 /**
  * The routes a shipped composition always has, with no ability to stream.
  * A fixture-less keyless scenario issues no model calls, but its tree must
@@ -179,6 +362,10 @@ export interface WebScaffold {
   harnessHome: string
   /** Await a settled turn end: in-process turn/end, then the agent's idle flip (which follows the persistence flush). */
   whenTurnSettled(timeoutMs?: number): Promise<SessionId>
+  /** Complete the deterministic Codex device-code login when that fixture was requested. */
+  completeOAuthLogin(provider: 'openai-codex', observeConnectionEvent?: () => Promise<void>): Promise<void>
+  /** Read non-secret private-payload evidence for the deterministic Codex fixture. */
+  oauthRedactionEvidence(provider: 'openai-codex'): OAuthRedactionEvidence
   /** Tear everything down; asserts the replay fixture was fully consumed first (replay/refresh). */
   close(): Promise<void>
 }
@@ -233,6 +420,8 @@ export interface LaunchOptions {
    * keyless first-run configuration lane; the default disables the adapter.
    */
   deepSeekMissingCredential?: boolean
+  /** Mount a keyless Codex OAuth controller whose login advances only through the returned scaffold control. */
+  openAiCodexOAuth?: boolean
   /** Leave the current welcome notice pending; ordinary scenarios pre-acknowledge it before browser boot. */
   welcomeNoticePending?: boolean
   /**
@@ -485,6 +674,7 @@ export async function launchWebScaffold(options: LaunchOptions = {}): Promise<We
           baseURL: options.deepSeekSearch.baseURL,
         },
       }],
+    ...options.openAiCodexOAuth === true ? [{ id: 'llm-pi-ai', disabled: true }] : [],
     ...mode === 'record' || options.deepSeekMissingCredential === true
       ? []
       : [{ id: 'llm-deepseek', disabled: true }],
@@ -496,6 +686,7 @@ export async function launchWebScaffold(options: LaunchOptions = {}): Promise<We
   const ctx = new Context()
   let port = 0
   let replayHandle: ReplayHandle | undefined
+  let openAiCodexOAuthFixture: OpenAICodexOAuthFixture | undefined
   try {
     process.chdir(workspaceCwd)
     // The production module-resolution setup: an empty profile root inside the temp
@@ -532,6 +723,9 @@ export async function launchWebScaffold(options: LaunchOptions = {}): Promise<We
     })
     await ctx.loader.await()
     assertEntriesLoaded(ctx, 'web e2e scaffold')
+    if (options.openAiCodexOAuth === true) {
+      openAiCodexOAuthFixture = await installOpenAICodexOAuthFixture(ctx)
+    }
     if (options.welcomeNoticePending !== true) {
       await ctx.settings.mutate(settingsNamespace(WELCOME_NOTICE_SETTINGS_NAMESPACE), [{
         op: 'set', path: [WELCOME_NOTICE_ACK_FIELD], value: WELCOME_NOTICE_VERSION,
@@ -603,6 +797,18 @@ export async function launchWebScaffold(options: LaunchOptions = {}): Promise<We
             .then(() => { resolveSettled(session.id) }, reject)
         })
       })
+    },
+    completeOAuthLogin(provider, observeConnectionEvent): Promise<void> {
+      if (provider !== OPENAI_CODEX_PROVIDER || openAiCodexOAuthFixture === undefined) {
+        return Promise.reject(new Error(`web e2e scaffold: no OAuth fixture is mounted for ${provider}`))
+      }
+      return openAiCodexOAuthFixture.complete(observeConnectionEvent)
+    },
+    oauthRedactionEvidence(provider): OAuthRedactionEvidence {
+      if (provider !== OPENAI_CODEX_PROVIDER || openAiCodexOAuthFixture === undefined) {
+        throw new Error(`web e2e scaffold: no OAuth fixture is mounted for ${provider}`)
+      }
+      return openAiCodexOAuthFixture.redactionEvidence()
     },
     async close(): Promise<void> {
       const failures: unknown[] = []

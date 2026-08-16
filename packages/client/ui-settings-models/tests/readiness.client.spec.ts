@@ -14,6 +14,7 @@ function row(overrides: Partial<ProviderRow> = {}): ProviderRow {
       settingsNs: 'llm-deepseek',
       settingsPath: [],
       active: true,
+      auth: { kind: 'api-key' },
     },
     configured: true,
     removable: false,
@@ -32,6 +33,7 @@ function otherRow(overrides: Partial<ProviderRow> = {}): ProviderRow {
       settingsNs: 'llm-pi-ai',
       settingsPath: ['providers', 'hfai'],
       active: true,
+      auth: { kind: 'api-key' },
     },
     configured: true,
     removable: true,
@@ -61,8 +63,44 @@ describe('providerUsable', () => {
     expect(providerUsable(otherRow({ credential: undefined }))).toBe(false)
   })
 
-  it('treats a reference-free registered route as provider-native authentication', () => {
-    expect(providerUsable(otherRow({ apiKeyEnv: undefined, credential: undefined }))).toBe(true)
+  it('keeps active reference-free API-key routes usable for ambient authentication', () => {
+    expect(providerUsable(otherRow({
+      entry: { ...otherRow().entry, auth: { kind: 'api-key' } },
+      apiKeyEnv: undefined,
+      credential: undefined,
+    }))).toBe(true)
+    expect(providerUsable(otherRow({
+      entry: { ...otherRow().entry, auth: { kind: 'native' } },
+      apiKeyEnv: undefined,
+      credential: undefined,
+    }))).toBe(true)
+  })
+
+  it('requires a connected OAuth state or an explicitly configured legacy key', () => {
+    const oauth = (status: 'missing' | 'connecting' | 'connected' | 'reconnect-required') => otherRow({
+      entry: {
+        ...otherRow().entry,
+        provider: 'openai-codex',
+        auth: { kind: 'oauth' },
+      },
+      connection: { provider: 'openai-codex', status },
+      apiKeyEnv: undefined,
+      credential: undefined,
+    })
+    expect(providerUsable(oauth('missing'))).toBe(false)
+    expect(providerUsable(oauth('connecting'))).toBe(false)
+    expect(providerUsable(oauth('reconnect-required'))).toBe(false)
+    expect(providerUsable(oauth('connected'))).toBe(true)
+    expect(providerUsable({
+      ...oauth('missing'),
+      apiKeyEnv: 'OPENAI_CODEX_API_KEY',
+      credential: { configured: true, writable: true },
+    })).toBe(true)
+    expect(providerUsable({
+      ...oauth('connected'),
+      apiKeyEnv: 'OPENAI_CODEX_API_KEY',
+      credential: missingCredential,
+    })).toBe(false)
   })
 })
 
@@ -87,6 +125,10 @@ describe('onboardingReadiness', () => {
 
   it('ends onboarding once any other registered provider can serve requests', () => {
     expect(onboardingReadiness(state({ rows: [row(), otherRow()] }))).toEqual({ kind: 'provider-ready' })
+    expect(onboardingReadiness(state({ rows: [row(), otherRow({
+      apiKeyEnv: undefined,
+      credential: undefined,
+    })] }))).toEqual({ kind: 'provider-ready' })
     // A provider the user cannot reach yet leaves the prompt in place.
     expect(onboardingReadiness(state({
       rows: [row(), otherRow({ credential: missingCredential })],

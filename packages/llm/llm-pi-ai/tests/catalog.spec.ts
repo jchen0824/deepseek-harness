@@ -142,6 +142,7 @@ describe('hand-declared providers', () => {
       displayName: 'Acme Gateway',
       settingsNs: 'llm-pi-ai',
       settingsPath: ['providers', 'acme-gateway'],
+      auth: { kind: 'api-key' },
       // Nothing in the installed catalog answers for this route, which is what
       // configuration surfaces mark as a route this deployment declared.
       declared: true,
@@ -889,7 +890,7 @@ describe('configurable-provider directory', () => {
     const ctx = await bootWithSettings(dir, {})
     // Another adapter family owns this route id, exactly as llm-deepseek does.
     ctx.llm.registerConfigurableProviders([
-      { provider: 'deepseek-official', displayName: 'DeepSeek', settingsNs: 'llm-deepseek', settingsPath: [] },
+      { provider: 'deepseek-official', displayName: 'DeepSeek', settingsNs: 'llm-deepseek', settingsPath: [], auth: { kind: 'api-key' } },
     ])
     const before = ctx.llm.listConfigurableProviders().length
     expect(before).toBeGreaterThan(30)
@@ -934,30 +935,27 @@ describe('configurable-provider directory', () => {
     expect(ctx.llm.listConfigurableProviders()).toHaveLength(catalogOnly)
   })
 
-  it('withholds a catalog route this adapter cannot authenticate', async () => {
+  it('advertises catalog authentication without registering an unprofiled Codex route', async () => {
     const ctx = await harness({})
-    const offered = ctx.llm.listConfigurableProviders().map(entry => entry.provider)
+    const offered = new Map(ctx.llm.listConfigurableProviders().map(entry => [entry.provider, entry.auth]))
 
-    // `openai-codex` is the one installed provider that authenticates through
-    // OAuth alone. pi-ai resolves OAuth only from a *stored* credential, this
-    // adapter constructs its collection with no credential store, and nothing
-    // here runs a login flow — so every request on such a route fails with
-    // `Provider is not configured` before it goes out. Offering it would put a
-    // provider on the settings page that no amount of configuration can make
-    // work.
-    expect(offered).not.toContain('openai-codex')
-    // A provider that offers OAuth *beside* an api-key method keeps its entry:
-    // the key is a path this adapter can serve.
-    expect(offered).toContain('anthropic')
-    expect(offered).toContain('openai')
+    expect(offered.get('openai-codex')).toEqual({ kind: 'oauth' })
+    expect(offered.get('anthropic')).toEqual({ kind: 'api-key' })
+    expect(offered.get('openai')).toEqual({ kind: 'api-key' })
+    expect(offered.get('amazon-bedrock')).toEqual({ kind: 'native' })
+    expect(offered.get('google-vertex')).toEqual({ kind: 'native' })
+    expect(offered.get('azure-openai-responses')).toEqual({ kind: 'native' })
+    expect(ctx.llm.listProviders().map(entry => entry.id)).not.toContain('openai-codex')
   })
 
-  it('still lists a withheld route a stored profile names, as a catalog route', async () => {
-    // Withholding the offer must not strand a profile someone already stored:
-    // the route keeps its entry so a configuration surface can edit or delete
-    // it, and `declared` still answers catalog membership rather than the
-    // offer, so the page does not mislabel it as a route this deployment
-    // invented.
+  it('registers a configured OAuth Codex route before it connects', async () => {
+    const ctx = await harness({ providers: { 'openai-codex': {} } })
+
+    expect(ctx.llm.listProviders().map(entry => entry.id)).toContain('openai-codex')
+    await expect(ctx.llm.listModels('openai-codex')).resolves.not.toHaveLength(0)
+  })
+
+  it('keeps a legacy explicit-key Codex profile active on the API-key path', async () => {
     const ctx = await harness({ providers: { 'openai-codex': { apiKeyEnv: KEY_ENV } } })
 
     expect(ctx.llm.listConfigurableProviders()).toContainEqual({
@@ -965,7 +963,9 @@ describe('configurable-provider directory', () => {
       displayName: 'openai-codex',
       settingsNs: 'llm-pi-ai',
       settingsPath: ['providers', 'openai-codex'],
+      auth: { kind: 'api-key' },
       declared: false,
     })
+    expect(ctx.llm.listProviders().map(entry => entry.id)).toContain('openai-codex')
   })
 })

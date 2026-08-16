@@ -86,6 +86,25 @@
   color: var(--dsw-alias-label-primary);
 }
 
+.oauthStatus,
+.oauthStatusConnected {
+  flex: none;
+  padding: 1px 6px;
+  border-radius: 4px;
+  font-size: 11px;
+  line-height: 16px;
+}
+
+.oauthStatus {
+  background: var(--dsw-alias-bg-module-platform);
+  color: var(--dsw-alias-label-secondary);
+}
+
+.oauthStatusConnected {
+  background: var(--dsw-alias-state-success-tertiary);
+  color: var(--dsw-alias-state-success-primary);
+}
+
 /* Reads as an annotation on the name, not as a second name: caption size and
    the secondary label tone, so it never competes with the row's own title. It
    sits inside `rowIdentity` with the credential dot, which is what keeps it
@@ -193,12 +212,58 @@
 
 /* Provider-row controls take the dense capsule (Button `.sm`). */
 .rowActions .secondaryButton,
+.rowActions .primaryButton,
 .rowActions .dangerButton {
   height: 28px;
   padding: 0 10px;
   border-radius: 14px;
   font-size: 12px;
   line-height: 18px;
+}
+
+.oauthDevice {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px;
+  border-radius: 8px;
+  background: var(--dsw-alias-bg-module-platform);
+}
+
+.oauthCodeLabel {
+  color: var(--dsw-alias-label-secondary);
+  font-size: 12px;
+  line-height: 18px;
+}
+
+.oauthCode {
+  color: var(--dsw-alias-label-primary);
+  font-family: var(--ds-font-family-code);
+  font-size: 18px;
+  line-height: 26px;
+  letter-spacing: 0.08em;
+}
+
+.oauthDeviceActions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.oauthLink {
+  color: var(--dsw-alias-brand-primary);
+  font-size: 12px;
+  line-height: 18px;
+  text-decoration: none;
+}
+
+.oauthLink:hover {
+  text-decoration: underline;
+}
+
+.oauthLink:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--dsw-alias-border-l3);
 }
 
 .primaryButton:disabled,

@@ -95,8 +95,8 @@ export function apply(ctx: ClientContext): void {
     t,
   })
 
-  // Pushed invalidations converge every open surface without polling: any
-  // settings/credentials/topology change refetches once the page loaded.
+  // Pushed invalidations converge every open surface: OAuth state is queried
+  // only through its loopback-only RPC while provider topology stays public.
   ctx.effect(() => {
     const refreshModels = (): void => { refreshIfLoaded(controller) }
     const refreshAll = (): void => {
