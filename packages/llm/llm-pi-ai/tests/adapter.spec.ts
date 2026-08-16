@@ -102,6 +102,11 @@ class MemoryOAuthStore implements CredentialStore {
     await this.operation
     if (providerId === 'openai-codex') this.credential = undefined
   }
+
+  /** Wait until the latest serialized credential operation has settled. */
+  settled(): Promise<void> {
+    return this.operation
+  }
 }
 
 function oauthCredential(expires: number): OAuthCredential {
@@ -120,11 +125,12 @@ function deferred(): { promise: Promise<void>; resolve: () => void } {
 }
 
 /** Consume one native Codex request so setup failures reject the caller. */
-async function drainCodex(adapter: PiAiAdapter, model: string): Promise<void> {
+async function drainCodex(adapter: PiAiAdapter, model: string, signal?: AbortSignal): Promise<void> {
   for await (const _chunk of adapter.stream({
     provider: 'openai-codex',
     model,
     messages: [],
+    ...signal === undefined ? {} : { signal },
   })) { /* drain */ }
 }
 
@@ -346,6 +352,119 @@ describe('PiAiAdapter provider routing', () => {
       }))
     expect(reconnectGenerations).toEqual([17])
     expect(providerStreams).toBe(0)
+  })
+
+  it('does not start a native Codex OAuth preflight after caller cancellation', async () => {
+    const resolved = resolveProfiles({ 'openai-codex': {} }).get('openai-codex')
+    if (resolved === undefined) throw new Error('expected Codex profile')
+    const expired = oauthCredential(0)
+    const store = new MemoryOAuthStore(expired)
+    let refreshes = 0
+    let captures = 0
+    let streams = 0
+    const provider: Provider = {
+      ...resolved.piProvider,
+      auth: {
+        oauth: {
+          name: 'Codex test OAuth',
+          login: async () => oauthCredential(Date.now() + 60_000),
+          refresh: async () => {
+            refreshes += 1
+            return oauthCredential(Date.now() + 60_000)
+          },
+          toAuth: async credential => ({ apiKey: credential.access }),
+        },
+      },
+      streamSimple: () => {
+        streams += 1
+        throw new Error('native provider must not run after caller cancellation')
+      },
+    }
+    const adapter = new PiAiAdapter({
+      profiles: () => new Map([['openai-codex', { ...resolved, piProvider: provider }]]),
+      resolveApiKey: () => Promise.resolve(undefined),
+      credentialStore: store,
+      oauthController: {
+        captureRequestGeneration: () => { captures += 1; return Promise.resolve(1) },
+        markReconnectRequired: () => Promise.resolve(),
+      },
+    })
+    const controller = new AbortController()
+    controller.abort('caller cancelled before Codex OAuth preflight')
+
+    await expect(drainCodex(adapter, resolved.piProvider.getModels()[0]!.id, controller.signal)).rejects.toMatchObject({
+      code: 'ABORTED',
+      message: 'OpenAI Codex request aborted by caller',
+    })
+    expect(captures).toBe(0)
+    expect(store.reads).toBe(0)
+    expect(refreshes).toBe(0)
+    expect(streams).toBe(0)
+    expect(store.credential).toEqual(expired)
+  })
+
+  it('cancels a native Codex OAuth refresh without committing its credential', async () => {
+    const resolved = resolveProfiles({ 'openai-codex': {} }).get('openai-codex')
+    if (resolved === undefined) throw new Error('expected Codex profile')
+    const expired = oauthCredential(0)
+    const refreshed = oauthCredential(Date.now() + 60_000)
+    const store = new MemoryOAuthStore(expired)
+    const refreshEntered = deferred()
+    const releaseRefresh = deferred()
+    let reconnects = 0
+    let refreshes = 0
+    let streams = 0
+    const provider: Provider = {
+      ...resolved.piProvider,
+      auth: {
+        oauth: {
+          name: 'Codex test OAuth',
+          login: async () => oauthCredential(Date.now() + 60_000),
+          refresh: async () => {
+            refreshes += 1
+            refreshEntered.resolve()
+            await releaseRefresh.promise
+            return refreshed
+          },
+          toAuth: async credential => ({ apiKey: credential.access }),
+        },
+      },
+      streamSimple: () => {
+        streams += 1
+        throw new Error('native provider must not run after caller cancellation')
+      },
+    }
+    const adapter = new PiAiAdapter({
+      profiles: () => new Map([['openai-codex', { ...resolved, piProvider: provider }]]),
+      resolveApiKey: () => Promise.resolve(undefined),
+      credentialStore: store,
+      oauthController: {
+        captureRequestGeneration: () => Promise.resolve(1),
+        markReconnectRequired: () => { reconnects += 1; return Promise.resolve() },
+      },
+    })
+    const controller = new AbortController()
+
+    const request = drainCodex(adapter, resolved.piProvider.getModels()[0]!.id, controller.signal)
+    await refreshEntered.promise
+    controller.abort('caller cancelled during Codex OAuth refresh')
+    await expect(request).rejects.toMatchObject({
+      code: 'ABORTED',
+      message: 'OpenAI Codex request aborted by caller',
+    })
+    expect(reconnects).toBe(0)
+    expect(streams).toBe(0)
+    expect(store.credential).toEqual(expired)
+
+    releaseRefresh.resolve()
+    await store.settled()
+    expect(store.credential).toEqual(expired)
+
+    await drainCodex(adapter, resolved.piProvider.getModels()[0]!.id)
+    expect(refreshes).toBe(2)
+    expect(reconnects).toBe(0)
+    expect(streams).toBe(1)
+    expect(store.credential).toEqual(refreshed)
   })
 
   it('normalizes a credential-store failure before pi-ai diagnostics reach the stream', async () => {

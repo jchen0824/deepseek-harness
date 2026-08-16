@@ -136,7 +136,7 @@ profile 的 `models` 列表是*替换*该路由已安装 catalog，而不是扩�
       loginLeaseTtlMs: 30000
 ```
 
-断开连接会推进 generation、清除已存 OAuth 凭据，并通过该已撤销 generation 的存储调用 pi-ai logout，因此过时 logout 无法移除后来的连接。每个原生 OAuth 请求都会在认证前捕获 generation；刷新失败只会在该 generation 仍是当前 generation 且其私有协调记录修改已提交时标记 `reconnect-required`。标记无法提交时，请求仍以 `OAUTH_RECONNECT_REQUIRED` 失败，并保持最后一次已发布的连接状态不变。凭据被撤销、已被持久标记的刷新失败、记录不可读或凭据提供方缺失时，生命周期会进入脱敏的 `reconnect-required` 状态，请求则以 `OAUTH_RECONNECT_REQUIRED` 失败；原生 OAuth profile 绝不会回退到 API 密钥、进程环境或其他提供方。Harness 自身产生的 `LlmError` 会保留其稳定错误码和消息。原生 Codex 提供方与 SDK 错误只在内部分类，对流分片与抛出的失败仅呈现为 `OpenAI Codex request failed`，因此提供方持有的消息无法进入会话、历史响应、日志或快照。已经显式点名 `apiKeyEnv` 的既有 profile 仍是一条独立的旧式密钥认证路由，不会变成 OAuth 的回退路径，并拒绝 OAuth 生命周期 RPC。
+断开连接会推进 generation、清除已存 OAuth 凭据，并通过该已撤销 generation 的存储调用 pi-ai logout，因此过时 logout 无法移除后来的连接。每个原生 OAuth 请求都会在认证前捕获 generation；调用方取消同时覆盖 generation 捕获和 pi-ai 的 `getAuth()` 预检，因此已取消的请求二者都不会启动。pi-ai 无法从外部取消已经在途的网络刷新，但该请求会停止等待，且中止感知的凭据存储包装层会在持久提交点阻止其提交，因此延迟完成的刷新无法持久化轮换后的凭据。刷新失败只会在该 generation 仍是当前 generation 且其私有协调记录修改已提交时标记 `reconnect-required`。标记无法提交时，请求仍以 `OAUTH_RECONNECT_REQUIRED` 失败，并保持最后一次已发布的连接状态不变。凭据被撤销、已被持久标记的刷新失败、记录不可读或凭据提供方缺失时，生命周期会进入脱敏的 `reconnect-required` 状态，请求则以 `OAUTH_RECONNECT_REQUIRED` 失败；原生 OAuth profile 绝不会回退到 API 密钥、进程环境或其他提供方。Harness 自身产生的 `LlmError` 会保留其稳定错误码和消息。原生 Codex 提供方与 SDK 错误只在内部分类，对流分片与抛出的失败仅呈现为 `OpenAI Codex request failed`，因此提供方持有的消息无法进入会话、历史响应、日志或快照。已经显式点名 `apiKeyEnv` 的既有 profile 仍是一条独立的旧式密钥认证路由，不会变成 OAuth 的回退路径，并拒绝 OAuth 生命周期 RPC。
 
 Web 与 Headless profile 使用同一个 Harness 主目录时会共享连接。Headless 绝不会发起交互式登录：它只消费已连接的 profile 与同一份凭据存储；未连接的原生 OAuth 请求会返回 `OAUTH_RECONNECT_REQUIRED`。由实现持有的 OAuth 记录与租约引用绝不是用户要复制进 `settings.yaml` 或 `cordis.yml` 的字段。
 

@@ -142,6 +142,54 @@ class OAuthFailureTrackingStore implements CredentialStore {
   }
 }
 
+/** Fence native OAuth's read/refresh path after the owning request stops. */
+function abortableCredentialStore(delegate: CredentialStore, signal: AbortSignal): CredentialStore {
+  const throwIfAborted = (): void => { signal.throwIfAborted() }
+  return {
+    async read(providerId): Promise<Credential | undefined> {
+      throwIfAborted()
+      const credential = await delegate.read(providerId)
+      throwIfAborted()
+      return credential
+    },
+    list: delegate.list.bind(delegate),
+    async modify(providerId, fn): Promise<Credential | undefined> {
+      throwIfAborted()
+      const credential = await delegate.modify(providerId, async (current) => {
+        throwIfAborted()
+        const proposed = await fn(current)
+        // A refresh result must not cross the durable-store commit point after
+        // its request has stopped.
+        throwIfAborted()
+        return proposed
+      })
+      throwIfAborted()
+      return credential
+    },
+    delete: delegate.delete.bind(delegate),
+  }
+}
+
+/** Resolve an operation or stop waiting as soon as the request signal aborts. */
+async function awaitWithAbort<T>(
+  operation: () => PromiseLike<T> | T,
+  signal: AbortSignal,
+): Promise<T> {
+  signal.throwIfAborted()
+  const aborted = Promise.withResolvers<never>()
+  const onAbort = (): void => { aborted.reject(signal.reason) }
+  signal.addEventListener('abort', onAbort, { once: true })
+  const pending = Promise.resolve().then(() => {
+    signal.throwIfAborted()
+    return operation()
+  })
+  try {
+    return await Promise.race([pending, aborted.promise])
+  } finally {
+    signal.removeEventListener('abort', onAbort)
+  }
+}
+
 /** Return the provider-neutral failure for any unusable native Codex OAuth state. */
 function oauthReconnectFailure(): LlmError {
   return new LlmError(
@@ -397,12 +445,15 @@ export class PiAiAdapter extends LlmAdapter {
     return this.snapshot
   }
 
-  /** Create one native OAuth collection without consulting profiles again. */
-  private nativeOAuthRequest(snapshot: PiAiSnapshot): NativeOAuthRequest {
+  /** Create one cancellable native OAuth collection without consulting profiles again. */
+  private nativeOAuthRequest(snapshot: PiAiSnapshot, signal: AbortSignal): NativeOAuthRequest {
     const oauthFailures = this.config.credentialStore === undefined
       ? undefined
       : new OAuthFailureTrackingStore(this.config.credentialStore)
-    const models = modelsFrom(snapshot.profiles, oauthFailures)
+    const credentialStore = oauthFailures === undefined
+      ? undefined
+      : abortableCredentialStore(oauthFailures, signal)
+    const models = modelsFrom(snapshot.profiles, credentialStore)
     return { models, ...oauthFailures === undefined ? {} : { oauthFailures } }
   }
 
@@ -491,31 +542,9 @@ export class PiAiAdapter extends LlmAdapter {
       options.reasoningEffort ?? profile.reasoning,
     )
     const nativeCodexOAuth = profile.provider === OPENAI_CODEX_PROVIDER && profile.apiKeyEnv === undefined
-    const oauthRequest = nativeCodexOAuth ? this.nativeOAuthRequest(snapshot) : undefined
-    const requestModels = oauthRequest?.models ?? snapshot.models
     const apiKey = nativeCodexOAuth
       ? undefined
       : await this.config.resolveApiKey(options.provider, profile)
-
-    let oauthGeneration: number | undefined
-    if (nativeCodexOAuth) {
-      try {
-        oauthGeneration = await this.config.oauthController?.captureRequestGeneration()
-        // Preflight pi-ai's locked refresh while the typed ModelsError is still
-        // available. `streamSimple()` is lazy and otherwise flattens it into a
-        // provider-text event, which must not enter the Harness stream.
-        const auth = await requestModels.getAuth(model)
-        if (auth === undefined) {
-          await reconnectOAuth(this.config.oauthController, oauthGeneration)
-        }
-      } catch (error) {
-        if (error instanceof ModelsError || error instanceof LlmError) {
-          await reconnectOAuth(this.config.oauthController, oauthGeneration)
-        }
-        throw error
-      }
-    }
-    const oauthFailureVersion = oauthRequest?.oauthFailures?.version()
 
     const consumer = new AbortController()
     const upstream = options.signal === undefined
@@ -523,8 +552,35 @@ export class PiAiAdapter extends LlmAdapter {
       : AbortSignal.any([options.signal, consumer.signal])
     const streamIdleTimeoutMs = profile.streamIdleTimeoutMs
     using watchdog = idleWatchdog(upstream, streamIdleTimeoutMs, 'LLM_STREAM_IDLE_TIMEOUT')
+    const oauthRequest = nativeCodexOAuth ? this.nativeOAuthRequest(snapshot, watchdog.signal) : undefined
+    const requestModels = oauthRequest?.models ?? snapshot.models
+    let oauthGeneration: number | undefined
+    let oauthFailureVersion: number | undefined
 
     try {
+      if (nativeCodexOAuth) {
+        try {
+          oauthGeneration = await awaitWithAbort(
+            () => this.config.oauthController?.captureRequestGeneration(),
+            watchdog.signal,
+          )
+          // Preflight pi-ai's locked refresh while the typed ModelsError is still
+          // available. `streamSimple()` is lazy and otherwise flattens it into a
+          // provider-text event, which must not enter the Harness stream.
+          const auth = await awaitWithAbort(() => requestModels.getAuth(model), watchdog.signal)
+          watchdog.signal.throwIfAborted()
+          if (auth === undefined) {
+            await reconnectOAuth(this.config.oauthController, oauthGeneration)
+          }
+        } catch (error) {
+          if (watchdog.signal.aborted) throw error
+          if (error instanceof ModelsError || error instanceof LlmError) {
+            await reconnectOAuth(this.config.oauthController, oauthGeneration)
+          }
+          throw error
+        }
+      }
+      oauthFailureVersion = oauthRequest?.oauthFailures?.version()
       const containsImage = options.messages.some(message => contentHasImage(message.content))
       if (containsImage && !model.input.includes('image')) {
         throw new LlmError(`pi-ai model "${model.id}" does not support image input`, 'UNSUPPORTED_CONTENT')
@@ -584,12 +640,6 @@ export class PiAiAdapter extends LlmAdapter {
         }
       }
     } catch (error: unknown) {
-      if (error instanceof LlmError && error.code === OAUTH_RECONNECT_REQUIRED_CODE) throw error
-      if (nativeCodexOAuth
-        && (oauthFailureVersion !== oauthRequest?.oauthFailures?.version()
-          || error instanceof ModelsError)) {
-        await reconnectOAuth(this.config.oauthController, oauthGeneration)
-      }
       if (timeoutOf(watchdog.signal, 'LLM_STREAM_IDLE_TIMEOUT') !== undefined) {
         throw new LlmError(
           nativeCodexOAuth
@@ -605,6 +655,12 @@ export class PiAiAdapter extends LlmAdapter {
           'ABORTED',
           nativeCodexOAuth ? undefined : { cause: error },
         )
+      }
+      if (error instanceof LlmError && error.code === OAUTH_RECONNECT_REQUIRED_CODE) throw error
+      if (nativeCodexOAuth
+        && (oauthFailureVersion !== oauthRequest?.oauthFailures?.version()
+          || error instanceof ModelsError)) {
+        await reconnectOAuth(this.config.oauthController, oauthGeneration)
       }
       if (nativeCodexOAuth) throw nativeCodexFailure(error)
       throw error
