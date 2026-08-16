@@ -261,7 +261,7 @@ function scriptedOAuthFace(options: {
       displayName: 'OpenAI Codex',
       settingsNs: 'llm-pi-ai',
       settingsPath: ['providers', 'openai-codex'],
-      active: (configured && options.apiKeyEnv !== undefined) || status === 'connected',
+      active: configured,
       auth: { kind: 'oauth' as const },
     }],
   })))

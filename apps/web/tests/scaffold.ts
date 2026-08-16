@@ -151,7 +151,7 @@ export interface OAuthRedactionEvidence {
 
 /** Test-owned control over the deterministic Codex OAuth lifecycle. */
 interface OpenAICodexOAuthFixture {
-  /** Complete the pending login, then optionally observe the topology-driven UI refresh. */
+  /** Complete the pending login, then optionally observe its local lifecycle refresh. */
   complete(observeConnection?: () => Promise<void>): Promise<void>
   /** Inspect whether non-secret private sentinels reached the real redaction seams. */
   redactionEvidence(): OAuthRedactionEvidence
@@ -159,9 +159,9 @@ interface OpenAICodexOAuthFixture {
 
 /**
  * Install a deterministic OAuth controller around the real pi-ai catalog
- * adapter. The route remains absent until the explicit completion barrier;
- * the browser therefore crosses the same registered-route selection gate as
- * production without a model list copied into this scaffold.
+ * adapter. Creating a profile registers its route, while OAuth completion
+ * changes only the private lifecycle status; the browser therefore exercises
+ * production's stable public topology without a copied model list.
  * @param ctx - settled Web composition context.
  * @returns control used only by the owning browser scenario.
  */
@@ -195,6 +195,7 @@ async function installOpenAICodexOAuthFixture(ctx: Context): Promise<OpenAICodex
   })
   let status: LlmOAuthConnectionStatus = 'missing'
   let route: AdapterRegistrationHandle | undefined
+  let routeRegistered = false
   let payloadsIssued = 0
   let lastPrivatePayload: Readonly<Record<string, unknown>> | undefined
   const connection = (): LlmOAuthConnection => {
@@ -213,12 +214,32 @@ async function installOpenAICodexOAuthFixture(ctx: Context): Promise<OpenAICodex
     return payload
   }
   const publish = (): void => { ctx.llm.emitOAuthConnectionUpdated(connection()) }
+  const ensureRoute = (): void => {
+    if (routeRegistered) return
+    if (route === undefined) route = ctx.llm.registerAdapter([OPENAI_CODEX_PROVIDER], adapter)
+    else route.replace([OPENAI_CODEX_PROVIDER])
+    routeRegistered = true
+  }
+  const withdrawRoute = (): void => {
+    if (!routeRegistered || route === undefined) return
+    route.replace([])
+    routeRegistered = false
+  }
 
-  ctx.settings.register(settingsNamespace('llm-pi-ai'), PiAiConfig, { base: {} })
+  const oauthSettingsNs = settingsNamespace('llm-pi-ai')
+  const profileSettings = ctx.settings.register(oauthSettingsNs, PiAiConfig, { base: {} })
+  const synchronizeRoute = (): void => {
+    if (profileSettings.get().providers?.[OPENAI_CODEX_PROVIDER] === undefined) withdrawRoute()
+    else ensureRoute()
+  }
+  ctx.on('settings/updated', (ns) => {
+    if (ns === oauthSettingsNs) synchronizeRoute()
+  })
+  synchronizeRoute()
   ctx.llm.registerConfigurableProviders([{
     provider: OPENAI_CODEX_PROVIDER,
     displayName: profile.displayName,
-    settingsNs: settingsNamespace('llm-pi-ai'),
+    settingsNs: oauthSettingsNs,
     settingsPath: ['providers', OPENAI_CODEX_PROVIDER],
     auth: { kind: 'oauth' },
     declared: false,
@@ -247,7 +268,6 @@ async function installOpenAICodexOAuthFixture(ctx: Context): Promise<OpenAICodex
       return Promise.resolve(connection())
     },
     disconnect: () => {
-      route?.replace([])
       status = 'missing'
       publish()
       return Promise.resolve(connection())
@@ -262,11 +282,6 @@ async function installOpenAICodexOAuthFixture(ctx: Context): Promise<OpenAICodex
       }
       status = 'connected'
       publish()
-      if (route === undefined) {
-        route = ctx.llm.registerAdapter([OPENAI_CODEX_PROVIDER], adapter)
-      } else {
-        route.replace([OPENAI_CODEX_PROVIDER])
-      }
       await observeConnection?.()
     },
     redactionEvidence(): OAuthRedactionEvidence {
@@ -710,9 +725,6 @@ export async function launchWebScaffold(options: LaunchOptions = {}): Promise<We
     assertEntriesLoaded(ctx, 'web e2e scaffold')
     if (options.openAiCodexOAuth === true) {
       openAiCodexOAuthFixture = await installOpenAICodexOAuthFixture(ctx)
-      await ctx.settings.update(settingsNamespace('llm-pi-ai'), {
-        providers: { [OPENAI_CODEX_PROVIDER]: {} },
-      })
     }
     if (options.welcomeNoticePending !== true) {
       await ctx.settings.mutate(settingsNamespace(WELCOME_NOTICE_SETTINGS_NAMESPACE), [{

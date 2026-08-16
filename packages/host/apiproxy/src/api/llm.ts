@@ -56,7 +56,7 @@ export interface ConfigurableProviderView {
   settingsNs: string
   /** Path from that section's root to the provider's profile object (empty = whole section). */
   settingsPath: string[]
-  /** Whether the route is currently registered (its models are requestable). */
+  /** Whether the route is currently registered in the model catalog. */
   active: boolean
   /** Authentication method the provider exposes to configuration surfaces. */
   auth: LlmProviderAuth

@@ -213,14 +213,21 @@ describe('request-level dynamic profiles', () => {
     await expect(ctx.llm.listModels('openai-codex')).resolves.not.toHaveLength(0)
   })
 
-  it('activates the OAuth-only route after a peer commits a private credential', async () => {
+  it('keeps an OAuth-only route registered across a peer credential transition', async () => {
     const dir = await home()
     const first = await boot(dir, { providers: { 'openai-codex': {} } })
     const second = await boot(dir, { providers: { 'openai-codex': {} } }, true)
     const updates: unknown[] = []
+    const topologyUpdates: unknown[] = []
     second.on('llm/oauth-connection-updated', (connection) => { updates.push(connection) })
+    second.on('llm/adapters-updated', () => { topologyUpdates.push(undefined) })
 
-    expect(second.llm.listProviders().map(provider => provider.id)).not.toContain('openai-codex')
+    expect(second.llm.listProviders().map(provider => provider.id)).toContain('openai-codex')
+    const modelsBeforeConnection = await second.llm.listModels('openai-codex')
+    expect(modelsBeforeConnection).not.toHaveLength(0)
+    const controller = second.llm.getOAuthController('openai-codex')
+    if (controller === undefined) throw new Error('expected Codex OAuth controller')
+    await expect(controller.status()).resolves.toEqual({ provider: 'openai-codex', status: 'missing' })
     const store = new LlmPiAi.OpenAICodexCredentialStore(() => first.credentials)
     await store.modify('openai-codex', async () => ({
       type: 'oauth',
@@ -233,10 +240,13 @@ describe('request-level dynamic profiles', () => {
       expect(second.llm.listProviders().map(provider => provider.id)).toContain('openai-codex')
       expect(updates).toContainEqual({ provider: 'openai-codex', status: 'connected' })
     })
+    await expect(controller.status()).resolves.toEqual({ provider: 'openai-codex', status: 'connected' })
+    await expect(second.llm.listModels('openai-codex')).resolves.toEqual(modelsBeforeConnection)
+    expect(topologyUpdates).toEqual([])
     expect(JSON.stringify(updates)).not.toMatch(/private-(?:access|refresh)-value/)
   })
 
-  it('activates the dormant OAuth route when a peer lease expires after credential persistence', async () => {
+  it('keeps an OAuth route registered while a peer lease expires after credential persistence', async () => {
     const dir = await home()
     const writer = await boot(dir, { providers: { 'openai-codex': {} } })
     const store = new LlmPiAi.OpenAICodexCredentialStore(() => writer.credentials)
@@ -270,11 +280,12 @@ describe('request-level dynamic profiles', () => {
     await vi.waitFor(() => {
       expect(updates).toContainEqual({ provider: 'openai-codex', status: 'connecting' })
     })
-    expect(peer.llm.listProviders().map(provider => provider.id)).not.toContain('openai-codex')
+    expect(peer.llm.listProviders().map(provider => provider.id)).toContain('openai-codex')
 
     await vi.waitFor(() => {
-      expect(peer.llm.listProviders().map(provider => provider.id)).toContain('openai-codex')
+      expect(updates).toContainEqual({ provider: 'openai-codex', status: 'connected' })
     }, { timeout: 2_000 })
+    expect(peer.llm.listProviders().map(provider => provider.id)).toContain('openai-codex')
   })
 
   it('refuses a settings write this adapter could not serve, leaving its routes alone', async () => {

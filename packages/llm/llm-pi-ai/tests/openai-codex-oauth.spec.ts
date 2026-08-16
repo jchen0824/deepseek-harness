@@ -50,11 +50,24 @@ class SharedCredentials extends CredentialProvider {
     reached: Deferred<undefined>
     release: Deferred<undefined>
   } | undefined
+  private delayedMutationResult: {
+    ref: CredentialRef
+    reached: Deferred<undefined>
+    release: Deferred<undefined>
+  } | undefined
 
   pauseOperation(operation: number): { reached: Promise<undefined>; release: () => void } {
     const reached = deferred<undefined>()
     const release = deferred<undefined>()
     this.pause = { operation, reached, release }
+    return { reached: reached.promise, release: () => { release.resolve(undefined) } }
+  }
+
+  /** Delay one caller's result after its private mutation commits and releases the document lock. */
+  delayMutationResult(ref: CredentialRef): { reached: Promise<undefined>; release: () => void } {
+    const reached = deferred<undefined>()
+    const release = deferred<undefined>()
+    this.delayedMutationResult = { ref, reached, release }
     return { reached: reached.promise, release: () => { release.resolve(undefined) } }
   }
 
@@ -100,7 +113,14 @@ class SharedCredentials extends CredentialProvider {
       return mutation.result
     })
     this.operations = task.then(() => undefined, () => undefined)
-    return task
+    const delayed = this.delayedMutationResult
+    if (delayed?.ref !== ref) return task
+    this.delayedMutationResult = undefined
+    return task.then(async (result) => {
+      delayed.reached.resolve(undefined)
+      await delayed.release.promise
+      return result
+    })
   }
 }
 
@@ -415,6 +435,30 @@ describe('OpenAICodexOAuthController', () => {
       persisted.release()
     }
     await waitForStatus(owner, 'missing')
+  })
+
+  it('does not rebase a revoked credential into a replacement login that fails', async () => {
+    const credentials = new SharedCredentials(new Context())
+    await persistGenerationOneCredentialWithLease(credentials, 100)
+    const now = { value: 0 }
+    const revoker = controllerOf(credentials, new DeviceCodeModels(), [], now)
+    const replacementModels = new DeviceCodeModels()
+    const replacement = controllerOf(credentials, replacementModels, [], now)
+    const revocationCommitted = credentials.delayMutationResult(OPENAI_CODEX_LOGIN_LEASE_REF)
+    const cancelling = revoker.cancel()
+    await revocationCommitted.reached
+
+    try {
+      await expect(replacement.start()).resolves.toMatchObject({ kind: 'device-code' })
+      replacementModels.completion.reject(new Error('provider rejected login'))
+
+      await waitForStatus(replacement, 'missing')
+    } finally {
+      revocationCommitted.release()
+    }
+
+    await expect(cancelling).resolves.toEqual({ provider: PROVIDER, status: 'missing' })
+    await expect(new OpenAICodexCredentialStore(() => credentials).read(PROVIDER)).resolves.toBeUndefined()
   })
 
   it('lets another controller disconnect while provider completion is waiting to persist', async () => {

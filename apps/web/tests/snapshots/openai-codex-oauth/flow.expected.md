@@ -25,7 +25,6 @@
     - listitem:
       - text: openai-codex
       - button "Connect ChatGPT"
-      - button "Delete openai-codex": Delete
   - button "Add provider" [disabled]:
     - img
     - text: Add provider
@@ -73,7 +72,7 @@
     - img
     - text: Add a custom provider
 
-# Connected through the provider topology update
+# Connected through the loopback lifecycle refresh
 
 - dialog "Settings":
   - navigation:

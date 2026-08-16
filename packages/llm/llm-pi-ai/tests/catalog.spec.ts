@@ -935,7 +935,7 @@ describe('configurable-provider directory', () => {
     expect(ctx.llm.listConfigurableProviders()).toHaveLength(catalogOnly)
   })
 
-  it('advertises catalog authentication without activating dormant Codex', async () => {
+  it('advertises catalog authentication without registering an unprofiled Codex route', async () => {
     const ctx = await harness({})
     const offered = new Map(ctx.llm.listConfigurableProviders().map(entry => [entry.provider, entry.auth]))
 
@@ -946,6 +946,13 @@ describe('configurable-provider directory', () => {
     expect(offered.get('google-vertex')).toEqual({ kind: 'native' })
     expect(offered.get('azure-openai-responses')).toEqual({ kind: 'native' })
     expect(ctx.llm.listProviders().map(entry => entry.id)).not.toContain('openai-codex')
+  })
+
+  it('registers a configured OAuth Codex route before it connects', async () => {
+    const ctx = await harness({ providers: { 'openai-codex': {} } })
+
+    expect(ctx.llm.listProviders().map(entry => entry.id)).toContain('openai-codex')
+    await expect(ctx.llm.listModels('openai-codex')).resolves.not.toHaveLength(0)
   })
 
   it('keeps a legacy explicit-key Codex profile active on the API-key path', async () => {

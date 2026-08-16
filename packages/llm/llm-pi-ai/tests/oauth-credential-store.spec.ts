@@ -208,6 +208,18 @@ describe('OpenAICodexCredentialStore', () => {
     await expect(store.readForGeneration(2)).resolves.toBeUndefined()
   })
 
+  it('clears a prior credential when a later login generation begins', async () => {
+    const credentials = new AtomicCredentials(new Context())
+    const store = new OpenAICodexCredentialStore(() => credentials)
+    const firstLoginStore = await store.beginLogin(0, 1)
+    await firstLoginStore.modify(PROVIDER, async () => oauth())
+
+    const replacementLoginStore = await store.beginLogin(1, 2)
+
+    await expect(replacementLoginStore.read(PROVIDER)).resolves.toBeUndefined()
+    await expect(store.readForGeneration(2)).resolves.toBeUndefined()
+  })
+
   it('deletes the stored connection through pi-ai logout', async () => {
     const credentials = new AtomicCredentials(new Context())
     const store = new OpenAICodexCredentialStore(() => credentials)

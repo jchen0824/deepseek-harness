@@ -74,7 +74,10 @@ function fakeResponse(): { response: ServerResponse; state: { status?: number; b
   return { response, state }
 }
 
-async function mounted(config?: { trustedHosts?: string[] }): Promise<{
+async function mounted(
+  config?: { trustedHosts?: string[] },
+  apiProxy: ApiProxy = {} as ApiProxy,
+): Promise<{
   routes: WebRoute[]
   upgrades: WebUpgradeRoute[]
   dispose: () => Promise<void>
@@ -83,7 +86,7 @@ async function mounted(config?: { trustedHosts?: string[] }): Promise<{
   const routes: WebRoute[] = []
   const upgrades: WebUpgradeRoute[] = []
   ctx.provide('webServer', fakeHttpServer(routes, upgrades) as WebServer)
-  ctx.provide('apiProxy', {} as unknown as ApiProxy)
+  ctx.provide('apiProxy', apiProxy)
   const fiber = ctx.plugin({ inject: [...inject], apply }, config)
   await fiber.await()
   return { routes, upgrades, dispose: () => fiber.dispose() }
@@ -211,6 +214,107 @@ describe('connection node half', () => {
       host: 'harness.example:3080', origin: 'http://harness.example:3080', 'sec-fetch-site': 'same-origin',
     }), declared.response)
     expect(declared.state.status).toBe(404)
+    await dispose()
+  })
+
+  it('serves configured OAuth model topology to an anonymous trusted host without lifecycle access', async () => {
+    const apiProxy = {
+      llm: {
+        providers(request: { rpcId: string }) {
+          return Promise.resolve({
+            rpcId: request.rpcId,
+            result: {
+              ok: true as const,
+              value: {
+                providers: [{
+                  provider: 'openai-codex',
+                  displayName: 'OpenAI Codex',
+                  settingsNs: 'llm-pi-ai',
+                  settingsPath: ['providers', 'openai-codex'],
+                  auth: { kind: 'oauth' as const },
+                  active: true,
+                }],
+              },
+            },
+          })
+        },
+        models(request: { rpcId: string }) {
+          return Promise.resolve({
+            rpcId: request.rpcId,
+            result: {
+              ok: true as const,
+              value: {
+                groups: [{
+                  id: 'openai-codex', name: 'OpenAI Codex', models: [{ id: 'gpt-5.4', name: 'GPT-5.4' }],
+                }],
+                failures: [],
+              },
+            },
+          })
+        },
+      },
+    } as unknown as ApiProxy
+    const { routes, dispose } = await mounted({ trustedHosts: ['harness.example'] }, apiProxy)
+    const route = routes[0]!
+    const request: ClientRequest = {
+      type: 'client-request', rpcId: RpcId('oauth-public-topology'), method: 'llm.providers', payload: {},
+    }
+
+    for (const headers of [
+      { host: '127.0.0.1:3080' },
+      { host: 'harness.example' },
+    ]) {
+      const response = fakeResponse()
+      await route.handler(fakePost(headers, '/api/llm.providers', request), response.response)
+      expect(JSON.parse(String(response.state.body))).toEqual({
+        type: 'server-response',
+        rpcId: 'oauth-public-topology',
+        result: {
+          ok: true,
+          value: {
+            providers: [{
+              provider: 'openai-codex',
+              displayName: 'OpenAI Codex',
+              settingsNs: 'llm-pi-ai',
+              settingsPath: ['providers', 'openai-codex'],
+              auth: { kind: 'oauth' },
+              active: true,
+            }],
+          },
+        },
+      })
+    }
+
+    const modelRequest: ClientRequest = {
+      type: 'client-request', rpcId: RpcId('oauth-public-model-topology'), method: 'llm.models', payload: {},
+    }
+    for (const headers of [
+      { host: '127.0.0.1:3080' },
+      { host: 'harness.example' },
+    ]) {
+      const response = fakeResponse()
+      await route.handler(fakePost(headers, '/api/llm.models', modelRequest), response.response)
+      expect(JSON.parse(String(response.state.body))).toEqual({
+        type: 'server-response',
+        rpcId: 'oauth-public-model-topology',
+        result: {
+          ok: true,
+          value: {
+            groups: [{
+              id: 'openai-codex', name: 'OpenAI Codex', models: [{ id: 'gpt-5.4', name: 'GPT-5.4' }],
+            }],
+            failures: [],
+          },
+        },
+      })
+    }
+
+    const lifecycle = fakeResponse()
+    await route.handler(fakePost({ host: 'harness.example' }, '/api/llm.oauthStatus', {
+      type: 'client-request', rpcId: RpcId('oauth-public-status'), method: 'llm.oauthStatus',
+      payload: { provider: 'openai-codex' },
+    }), lifecycle.response)
+    expect(lifecycle.state).toMatchObject({ status: 403, body: 'forbidden' })
     await dispose()
   })
 

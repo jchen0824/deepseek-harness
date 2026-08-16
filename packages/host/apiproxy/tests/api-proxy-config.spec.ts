@@ -701,12 +701,13 @@ describe('llm domain', () => {
     ])
   })
 
-  it('keeps OAuth state out of the public provider catalog', async () => {
+  it('keeps OAuth state out of the public provider catalog while its route is active', async () => {
     const ctx = await harness({ configurableProviders: false })
     ctx.llm.registerConfigurableProviders([{
       provider: 'openai-codex', displayName: 'OpenAI Codex', settingsNs: 'llm-pi-ai',
       settingsPath: ['providers', 'openai-codex'], auth: { kind: 'oauth' },
     }])
+    ctx.llm.registerAdapter(['openai-codex'], new CatalogAdapter('OpenAI Codex', ['gpt-5.4']))
     ctx.llm.registerOAuthController({
       provider: 'openai-codex',
       status: () => Promise.resolve({ provider: 'openai-codex', status: 'connecting' as const, accountId: 'acct-private' }),
@@ -718,8 +719,14 @@ describe('llm domain', () => {
 
     expect(expectOk(await api.llm.providers(request({})))).toEqual({ providers: [{
       provider: 'openai-codex', displayName: 'OpenAI Codex', settingsNs: 'llm-pi-ai',
-      settingsPath: ['providers', 'openai-codex'], auth: { kind: 'oauth' }, active: false,
+      settingsPath: ['providers', 'openai-codex'], auth: { kind: 'oauth' }, active: true,
     }] })
+    expect(expectOk(await api.llm.models(request({})))).toEqual({
+      groups: [{
+        id: 'openai-codex', name: 'OpenAI Codex', models: [{ id: 'gpt-5.4', name: 'gpt-5.4' }],
+      }],
+      failures: [],
+    })
     expect(expectOk(await api.llm.oauthStatus(request({ provider: 'openai-codex' })))).toEqual({
       connection: { provider: 'openai-codex', status: 'connecting' },
     })

@@ -2962,7 +2962,7 @@ function createFixtureWorld(options: FixtureOptions): FixtureWorld {
         providers: [
           { provider: 'deepseek-official', displayName: 'DeepSeek', settingsNs: 'llm-deepseek', settingsPath: [], active: true, auth: { kind: 'api-key' } },
           { provider: 'openai', displayName: 'openai', settingsNs: 'llm-pi-ai', settingsPath: ['providers', 'openai'], active: true, auth: { kind: 'api-key' }, declared: false },
-          { provider: 'openai-codex', displayName: 'OpenAI Codex', settingsNs: 'llm-pi-ai', settingsPath: ['providers', 'openai-codex'], active: openaiCodexConnection === 'connected', auth: { kind: 'oauth' }, declared: false },
+          { provider: 'openai-codex', displayName: 'OpenAI Codex', settingsNs: 'llm-pi-ai', settingsPath: ['providers', 'openai-codex'], active: true, auth: { kind: 'oauth' }, declared: false },
           { provider: 'anthropic', displayName: 'anthropic', settingsNs: 'llm-pi-ai', settingsPath: ['providers', 'anthropic'], active: false, auth: { kind: 'api-key' }, declared: false },
           // One hand-declared route, so a surface reading this fixture meets
           // the tagged shape rather than only the shipped one.

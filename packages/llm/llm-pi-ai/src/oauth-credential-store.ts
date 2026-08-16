@@ -214,7 +214,7 @@ export class OpenAICodexCredentialStore implements CredentialStore {
   }
 
   /**
-   * Bind a new login generation before provider interaction begins.
+   * Bind a new login generation and remove any credential from an earlier authority.
    * @param previousGeneration - generation that authorized the lease claim.
    * @param generation - generation assigned to the new lease holder.
    * @returns a store facade whose writes fail after revocation or takeover.
@@ -230,7 +230,7 @@ export class OpenAICodexCredentialStore implements CredentialStore {
       const record = decodeRecord(current) ?? initialRecord()
       if (record.generation > previousGeneration) throw storageFailure()
       return Promise.resolve({
-        value: encodeRecord({ ...record, generation }),
+        value: encodeRecord({ version: 2, generation }),
         result: undefined,
         visibility: 'private',
       })

@@ -104,16 +104,35 @@ describe.skipIf(MODE === 'record')('web e2e: Codex OAuth reaches normal model se
     const verificationLink = dialog.getByRole('link', { name: 'Open verification page', exact: true })
     expect(await verificationLink.getAttribute('href')).toBe('https://auth.openai.com/codex/device')
     const deviceCode = await captureStableAria(page, '[role="dialog"]', scaffold.workspaceCwd)
+    // Registering the profile makes its public model topology stable before
+    // private OAuth state changes; the loopback-only connection view still
+    // decides whether the Models card treats it as usable.
+    await expect.poll(
+      async () => (await models(initialSession)).groups.some(group => group.id === 'openai-codex'),
+      { timeout: 10_000 },
+    ).toBe(true)
+    await expect.poll(
+      () => oauthEventPayloads.filter(payload => payload.includes('llm/adapters-updated')).length,
+      { timeout: 10_000 },
+    ).toBeGreaterThan(0)
+    const topologyUpdatesBeforeCompletion = oauthEventPayloads
+      .filter(payload => payload.includes('llm/adapters-updated')).length
 
-    let connectedFromTopology = ''
-    await scaffold.completeOAuthLogin('openai-codex', async () => {
-      // The OAuth state remains loopback-only. Registering the connected route
-      // emits the public topology invalidation that causes the Models page to
-      // read its own local OAuth status.
-      await dialog.getByText('Connected', { exact: true }).waitFor({ timeout: 10_000 })
-      expect((await models(initialSession)).groups.some(group => group.id === 'openai-codex')).toBe(true)
-      connectedFromTopology = await captureStableAria(page, '[role="dialog"]', scaffold.workspaceCwd)
-    })
+    let connectedFromLifecycle = ''
+    let completionTopologyUpdates = 0
+    const stopTopologyWatch = scaffold.ctx.on('llm/adapters-updated', () => { completionTopologyUpdates += 1 })
+    try {
+      await scaffold.completeOAuthLogin('openai-codex', async () => {
+        // The OAuth state remains loopback-only. The card's local status refresh
+        // observes the terminal connection without changing public topology.
+        await dialog.getByText('Connected', { exact: true }).waitFor({ timeout: 10_000 })
+        expect((await models(initialSession)).groups.some(group => group.id === 'openai-codex')).toBe(true)
+        connectedFromLifecycle = await captureStableAria(page, '[role="dialog"]', scaffold.workspaceCwd)
+      })
+    } finally {
+      stopTopologyWatch()
+    }
+    expect(completionTopologyUpdates).toBe(0)
     await expect.poll(
       async () => (await models(initialSession)).groups.some(group => group.id === 'openai-codex'),
       { timeout: 10_000 },
@@ -243,7 +262,7 @@ describe.skipIf(MODE === 'record')('web e2e: Codex OAuth reaches normal model se
     const flow = [
       stage('Disconnected Models card', missing),
       stage('Fixed device code', deviceCode),
-      stage('Connected through the provider topology update', connectedFromTopology),
+      stage('Connected through the loopback lifecycle refresh', connectedFromLifecycle),
       stage('Connected Codex catalog in the normal picker', picker),
       stage('Current session Codex selection', currentSelection),
       stage('Provider-neutral model failure', providerFailure),
@@ -260,10 +279,8 @@ describe.skipIf(MODE === 'record')('web e2e: Codex OAuth reaches normal model se
     const rpcPayload = (await Promise.all(oauthRpcPayloads)).join('\n')
     expect(rpcPayload).toContain('ABCD-EFGH')
     expect(rpcPayload).toContain('openai-codex')
-    await expect.poll(
-      () => oauthEventPayloads.some(payload => payload.includes('llm/adapters-updated')),
-      { timeout: 10_000 },
-    ).toBe(true)
+    expect(oauthEventPayloads.filter(payload => payload.includes('llm/adapters-updated')))
+      .toHaveLength(topologyUpdatesBeforeCompletion)
     expect(oauthEventPayloads.some(payload => payload.includes('llm/oauth-connection-updated'))).toBe(false)
     const browserPayload = `${rpcPayload}\n${oauthEventPayloads.join('\n')}`
     expect(browserPayload).toContain('"status":"connected"')

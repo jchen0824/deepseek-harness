@@ -64,7 +64,6 @@ import type {
   AdapterRegistrationHandle,
   DirectoryRegistrationHandle,
   LlmConfigurableProvider,
-  LlmOAuthConnectionStatus,
   LlmProviderAuth,
 } from '@deepseek-ai/dsh-llm'
 import { deepEqualJson, installSettingsSection, settingsNamespace } from '@deepseek-ai/dsh-settings'
@@ -104,16 +103,14 @@ const NS = settingsNamespace('llm-pi-ai')
 /**
  * The registry captures these per route; a change here must re-register.
  * Sorted by provider so a settings document that merely reorders its keys is
- * not mistaken for a route change.
+ * not mistaken for a route change. OAuth status is deliberately absent: route
+ * membership reaches public model catalogs, while connection state remains a
+ * loopback-only lifecycle fact.
  */
 function registrationFacts(
   profiles: ReadonlyMap<string, ResolvedPiAiProviderProfile>,
-  oauthStatus: LlmOAuthConnectionStatus,
 ): unknown {
   return [...profiles.entries()]
-    .filter(([provider, profile]) => provider !== 'openai-codex'
-      || profile.apiKeyEnv !== undefined
-      || oauthStatus === 'connected')
     // `displayName` rides along because the registry hands it to every selector
     // through `providerInfo()`: a rename that did not re-register would leave
     // the old label showing until some unrelated fact happened to change.
@@ -239,21 +236,13 @@ export function apply(ctx: Context, config: Config): void {
     for (const profile of resolved.values()) models.setProvider(profile.piProvider)
     return models
   }
-  let oauthStatus: LlmOAuthConnectionStatus = 'missing'
   let oauthLifecycleActive = true
-  let ensureRegistrationFacts: () => void = () => {}
   const oauthController = new OpenAICodexOAuthController({
     credentials: () => ctx.get('credentials'),
     credentialStore,
     models: controllerModels,
     loginLeaseTtlMs: () => resolveOAuthConfig(current().oauth).loginLeaseTtlMs,
     emitConnectionUpdated: (connection) => {
-      oauthStatus = connection.status
-      try {
-        ensureRegistrationFacts()
-      } catch {
-        ctx.logger.error('llm-pi-ai: keeping the previously registered routes after an OAuth state update')
-      }
       ctx.llm.emitOAuthConnectionUpdated(connection)
     },
   })
@@ -312,9 +301,9 @@ export function apply(ctx: Context, config: Config): void {
   // settings section supplies profiles, and routes drop when it empties.
   let registration: AdapterRegistrationHandle | undefined
   let registeredFacts: unknown
-  ensureRegistrationFacts = (): void => {
+  const ensureRegistrationFacts = (): void => {
     const resolved = profiles()
-    const facts = registrationFacts(resolved, oauthStatus)
+    const facts = registrationFacts(resolved)
     if (deepEqualJson(facts, registeredFacts)) return
     // The registry captures the route set and each route's retry policy at
     // registration, so a change to either must re-register. The swap is
@@ -322,11 +311,7 @@ export function apply(ctx: Context, config: Config): void {
     // conflicting route leaves the previous routes serving requests, and
     // `registeredFacts` only advances once the registry actually holds the
     // new set — so returning to a working configuration always re-applies.
-    const routes = [...resolved]
-      .filter(([provider, profile]) => provider !== 'openai-codex'
-        || profile.apiKeyEnv !== undefined
-        || oauthStatus === 'connected')
-      .map(([provider]) => provider)
+    const routes = [...resolved.keys()]
     if (registration === undefined) {
       // Dormant bare mount: nothing is registered until a section supplies
       // profiles, and an empty section keeps it that way.
@@ -407,15 +392,7 @@ export function apply(ctx: Context, config: Config): void {
     }
   }, 'llm-pi-ai: private OAuth credential invalidation')
   ctx.llm.registerOAuthController(oauthController)
-  initialization = oauthController.initialize().then((connection) => {
-    if (!oauthLifecycleActive) return
-    oauthStatus = connection.status
-    try {
-      ensureRegistrationFacts()
-    } catch {
-      ctx.logger.error('llm-pi-ai: keeping the previously registered routes after OAuth initialization')
-    }
-  }, () => {
+  initialization = oauthController.initialize().then(() => undefined, () => {
     if (oauthLifecycleActive) {
       ctx.logger.error('llm-pi-ai: OpenAI Codex authentication state could not be initialized')
     }
